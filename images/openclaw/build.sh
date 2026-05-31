@@ -34,6 +34,7 @@ require_lock_value() {
 }
 
 command -v docker >/dev/null 2>&1 || die "docker CLI is required"
+docker version >/dev/null 2>&1 || die "docker CLI is installed but cannot reach a usable Docker engine"
 [ -x "$fetch_script" ] || die "fetch script is not executable: $fetch_script"
 
 repo_url="$(require_lock_value OPENCLAW_REPO_URL)"
