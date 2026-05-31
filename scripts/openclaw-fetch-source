@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+lock_file="$repo_root/images/openclaw/openclaw.lock"
+
+die() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+lock_value() {
+  local key="$1"
+  awk -F= -v wanted="$key" '
+    $0 ~ /^[[:space:]]*#/ { next }
+    $0 !~ /=/ { next }
+    $1 == wanted {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "$lock_file"
+}
+
+require_lock_value() {
+  local key="$1"
+  local value
+  value="$(lock_value "$key")"
+  [ -n "$value" ] || die "missing $key in $lock_file"
+  printf '%s' "$value"
+}
+
+[ -f "$lock_file" ] || die "missing lock file: $lock_file"
+command -v git >/dev/null 2>&1 || die "git is required"
+
+repo_url="$(require_lock_value OPENCLAW_REPO_URL)"
+commit="$(require_lock_value OPENCLAW_COMMIT)"
+
+case "$commit" in
+  *[!0-9a-fA-F]*|'') die "OPENCLAW_COMMIT must be a full 40-character hex SHA" ;;
+esac
+
+[ "${#commit}" -eq 40 ] || die "OPENCLAW_COMMIT must be exactly 40 hex characters"
+
+cache_root="$repo_root/.cache/openclaw/source"
+source_dir="$cache_root/$commit"
+
+mkdir -p "$source_dir"
+
+if [ ! -d "$source_dir/.git" ]; then
+  git -C "$source_dir" init
+fi
+
+if git -C "$source_dir" remote get-url origin >/dev/null 2>&1; then
+  git -C "$source_dir" remote set-url origin "$repo_url"
+else
+  git -C "$source_dir" remote add origin "$repo_url"
+fi
+
+git -C "$source_dir" fetch --depth=1 --no-tags origin "$commit"
+git -C "$source_dir" checkout --detach "$commit"
+
+head_sha="$(git -C "$source_dir" rev-parse HEAD)"
+[ "$head_sha" = "$commit" ] || die "fetched HEAD mismatch: expected $commit, got $head_sha"
+
+printf 'Verified OpenClaw source: %s\n' "$head_sha"
+printf 'Source directory: %s\n' "$source_dir"

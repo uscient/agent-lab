@@ -21,6 +21,7 @@ runtime/
 logs/
 state/
 cache/
+.cache/openclaw/
 models/
 browser-profiles/
 agent-state/
