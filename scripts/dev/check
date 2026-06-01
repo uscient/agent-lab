@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+scope="${1:-default}"
+mode="${2:-quick}"
+
+./scripts/dev/guard-diff "$scope"
+./scripts/dev/test "$mode"
+git diff --check
+git status --short

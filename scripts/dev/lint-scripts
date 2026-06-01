@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+fail=0
+
+mapfile -t scripts < <(
+  {
+    find scripts -type f 2>/dev/null || true
+    git ls-files '*.sh' 2>/dev/null || true
+  } | sort -u
+)
+
+if test "${#scripts[@]}" -eq 0; then
+  echo "No scripts found."
+  exit 0
+fi
+
+echo "== bash -n =="
+for f in "${scripts[@]}"; do
+  test -f "$f" || continue
+  if head -n 1 "$f" | grep -Eq 'bash|/sh' || [[ "$f" == *.sh ]] || [[ "$f" == scripts/* ]]; then
+    echo "$f"
+    bash -n "$f" || fail=1
+  fi
+done
+
+if command -v shellcheck >/dev/null 2>&1; then
+  echo
+  echo "== shellcheck =="
+  shellcheck "${scripts[@]}" || fail=1
+else
+  echo
+  echo "SKIP shellcheck not installed"
+fi
+
+test "$fail" -eq 0 || die "script lint failed"
+echo "PASS lint-scripts"

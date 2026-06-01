@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+mode="${1:-quick}"
+fail=0
+
+run() {
+  echo
+  echo "== $* =="
+  "$@" || fail=1
+}
+
+# Shell scripts are always relevant when present.
+if test -d scripts; then
+  run ./scripts/dev/lint-scripts
+fi
+
+# Go
+if test -f go.mod; then
+  if has_cmd go; then
+    run go test ./...
+  else
+    echo "SKIP go test: go missing"
+  fi
+fi
+
+# Node / JS / TS
+if test -f package.json; then
+  pm=""
+  if test -f pnpm-lock.yaml && has_cmd pnpm; then pm="pnpm"; fi
+  if test -z "$pm" && test -f yarn.lock && has_cmd yarn; then pm="yarn"; fi
+  if test -z "$pm" && test -f package-lock.json && has_cmd npm; then pm="npm"; fi
+  if test -z "$pm" && has_cmd npm; then pm="npm"; fi
+
+  if test -n "$pm" && has_cmd node; then
+    if node -e "p=require('./package.json'); process.exit(p.scripts && p.scripts.lint ? 0 : 1)" 2>/dev/null; then
+      run "$pm" run lint
+    fi
+    if node -e "p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)" 2>/dev/null; then
+      run "$pm" test
+    fi
+  else
+    echo "SKIP node tests: package manager or node missing"
+  fi
+fi
+
+# Python
+if test -f pyproject.toml || test -f requirements.txt || test -d tests; then
+  if has_cmd python3 && python3 -c 'import pytest' >/dev/null 2>&1; then
+    run python3 -m pytest
+  else
+    echo "SKIP pytest: python3/pytest missing"
+  fi
+fi
+
+# PHP / Composer
+if test -f composer.json; then
+  if has_cmd composer; then
+    run composer validate --strict
+    if composer run-script --list 2>/dev/null | grep -Eq '(^|[[:space:]])test($|[[:space:]])'; then
+      run composer test
+    fi
+  else
+    echo "SKIP composer checks: composer missing"
+  fi
+fi
+
+# Rust
+if test -f Cargo.toml; then
+  if has_cmd cargo; then
+    run cargo test
+  else
+    echo "SKIP cargo test: cargo missing"
+  fi
+fi
+
+# Optional full mode
+if test "$mode" = "full"; then
+  if ls compose.yaml compose.yml docker-compose.yaml docker-compose.yml >/dev/null 2>&1 && has_cmd docker; then
+    if docker compose version >/dev/null 2>&1; then
+      run docker compose config --quiet
+    else
+      echo "SKIP docker compose config: docker compose plugin missing"
+    fi
+  fi
+fi
+
+test "$fail" -eq 0 || die "tests/checks failed"
+echo
+echo "PASS test $mode"

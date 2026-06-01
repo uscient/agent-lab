@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+scope="${1:-default}"
+fail=0
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+changed_files > "$tmp"
+
+echo "== guard-diff scope: $scope =="
+
+echo "-- changed files --"
+cat "$tmp"
+
+echo
+echo "-- forbidden path checks --"
+
+# Always-forbidden defaults for agent workflows.
+default_patterns=(
+  '(^|/)\.env($|[.])'
+  '(^|/)secrets?(/|$)'
+  '\.(pem|key|p12|pfx)$'
+  '(^|/)\.ssh(/|$)'
+  '(^|/)\.gnupg(/|$)'
+  '(^|/)node_modules(/|$)'
+  '(^|/)vendor(/|$)'
+  '(^|/)\.venv(/|$)'
+  '(^|/)\.cache(/|$)'
+)
+
+for pat in "${default_patterns[@]}"; do
+  if grep -E "$pat" "$tmp" >/dev/null; then
+    echo "FAIL forbidden path pattern: $pat"
+    grep -E "$pat" "$tmp" || true
+    fail=1
+  fi
+done
+
+# Optional repo-specific guard files:
+# .devguard/forbid-default.txt
+# .devguard/forbid-M2.txt
+for gf in ".devguard/forbid-default.txt" ".devguard/forbid-${scope}.txt"; do
+  if test -f "$gf"; then
+    while IFS= read -r pat; do
+      test -z "$pat" && continue
+      case "$pat" in \#*) continue ;; esac
+      if grep -E "$pat" "$tmp" >/dev/null; then
+        echo "FAIL repo guard $gf pattern: $pat"
+        grep -E "$pat" "$tmp" || true
+        fail=1
+      fi
+    done < "$gf"
+  fi
+done
+
+echo
+echo "-- large changed files > 5 MiB --"
+while IFS= read -r f; do
+  test -f "$f" || continue
+  size="$(wc -c < "$f" | tr -d ' ')"
+  if test "$size" -gt 5242880; then
+    echo "FAIL large changed file: $f ($size bytes)"
+    fail=1
+  fi
+done < "$tmp"
+
+echo
+echo "-- lightweight secret scan on changed text files --"
+secret_regex='(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{20,}|-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
+
+while IFS= read -r f; do
+  test -f "$f" || continue
+  if file "$f" 2>/dev/null | grep -qiE 'text|json|yaml|script|markdown|xml|empty'; then
+    if grep -InE "$secret_regex" "$f" >/dev/null 2>&1; then
+      echo "FAIL possible high-confidence secret in: $f"
+      grep -InE "$secret_regex" "$f" || true
+      fail=1
+    fi
+  fi
+done < "$tmp"
+
+echo
+echo "-- whitespace check --"
+if ! git diff --check; then
+  fail=1
+fi
+
+test "$fail" -eq 0 || die "guard-diff failed"
+echo "PASS guard-diff"

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+echo "== changed files =="
+changed_files
+
+echo
+echo "== diff stat =="
+git diff --stat HEAD -- || true
+
+echo
+echo "== name-status =="
+git diff --name-status HEAD -- || true
+git ls-files --others --exclude-standard | sed 's/^/??\t/' || true

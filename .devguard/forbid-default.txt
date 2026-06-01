@@ -1,0 +1,7 @@
+# Optional repo-specific forbidden changed paths.
+# Regexes are matched against changed file paths.
+#
+# Examples:
+# ^compose.*\.ya?ml$
+# ^profiles/
+# ^config/production/

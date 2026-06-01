@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+title="${*:-Development handoff}"
+dir="$(cache_dir)/handoffs"
+mkdir -p "$dir"
+out="$dir/$(timestamp)-handoff.md"
+
+{
+  echo "# $title"
+  echo
+  echo "## Metadata"
+  echo "- generated: $(date -Is)"
+  echo "- root: $(pwd)"
+  echo "- branch: $(git branch --show-current 2>/dev/null || true)"
+  echo "- commit: $(git rev-parse HEAD 2>/dev/null || true)"
+  echo
+
+  echo "## Status"
+  echo '```text'
+  git status --short
+  echo '```'
+  echo
+
+  echo "## Diff stat"
+  echo '```text'
+  git diff --stat HEAD -- || true
+  echo '```'
+  echo
+
+  echo "## Changed files"
+  echo '```text'
+  changed_files || true
+  echo '```'
+  echo
+
+  echo "## Recent evidence logs"
+  if test -d .cache/dev/evidence; then
+    find .cache/dev/evidence -type f -name '*.log' | sort | tail -5
+  else
+    echo "None."
+  fi
+  echo
+
+  echo "## Final checks to run"
+  echo '```bash'
+  echo './scripts/dev/check default quick'
+  echo 'git diff --check'
+  echo 'git status --short'
+  echo '```'
+} > "$out"
+
+printf '%s\n' "$out"

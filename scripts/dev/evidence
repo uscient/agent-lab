@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+test "$#" -gt 0 || die "usage: scripts/dev/evidence <command> [args...]"
+
+dir="$(cache_dir)/evidence"
+mkdir -p "$dir"
+out="$dir/$(timestamp).log"
+
+{
+  echo "# Evidence"
+  echo "generated: $(date -Is)"
+  echo "root: $(pwd)"
+  echo "branch: $(git branch --show-current 2>/dev/null || true)"
+  echo "commit: $(git rev-parse HEAD 2>/dev/null || true)"
+  printf 'command:'
+  printf ' %q' "$@"
+  echo
+  echo
+} | tee "$out"
+
+set +e
+"$@" 2>&1 | tee -a "$out"
+code="${PIPESTATUS[0]}"
+set -e
+
+{
+  echo
+  echo "exit_code: $code"
+} | tee -a "$out"
+
+echo "$out"
+exit "$code"

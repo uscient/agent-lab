@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+out="$(cache_dir)/brief.md"
+
+{
+  echo "# Dev Brief"
+  echo
+  echo "- generated: $(date -Is)"
+  echo "- root: $(pwd)"
+  echo "- branch: $(git branch --show-current 2>/dev/null || true)"
+  echo "- commit: $(git rev-parse HEAD 2>/dev/null || true)"
+  echo
+
+  echo "## Remotes"
+  git remote -v 2>/dev/null | redact_remote_urls || true
+  echo
+
+  echo "## Status"
+  git status --short
+  echo
+
+  echo "## Diff stat"
+  git diff --stat HEAD -- 2>/dev/null || true
+  echo
+
+  echo "## Changed files"
+  changed_files || true
+  echo
+
+  echo "## Project markers"
+  for f in AGENTS.md CLAUDE.md README.md package.json pnpm-lock.yaml go.mod pyproject.toml composer.json Cargo.toml Makefile Dockerfile compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    test -e "$f" && echo "- $f"
+  done
+  echo
+
+  echo "## Top-level map"
+  find . -maxdepth 3 \
+    \( -path './.git' -o -path './.cache' -o -path './node_modules' -o -path './vendor' -o -path './.venv' \) -prune -o \
+    -print | sed 's#^\./##' | sort | head -300
+} > "$out"
+
+printf '%s\n' "$out"

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+note "repo"
+printf 'root: %s\n' "$(pwd)"
+printf 'branch: %s\n' "$(git branch --show-current 2>/dev/null || true)"
+printf 'commit: %s\n' "$(git rev-parse --short HEAD 2>/dev/null || true)"
+
+note "required basics"
+for cmd in git bash sed awk grep find xargs; do
+  if has_cmd "$cmd"; then
+    printf 'OK   %s -> %s\n' "$cmd" "$(command -v "$cmd")"
+  else
+    printf 'MISS %s\n' "$cmd"
+  fi
+done
+
+note "optional dev tools"
+for cmd in shellcheck docker docker-compose go node npm pnpm yarn python3 pytest php composer cargo make syft grype trivy; do
+  if has_cmd "$cmd"; then
+    printf 'OK   %s -> %s\n' "$cmd" "$(command -v "$cmd")"
+  else
+    printf 'SKIP %s\n' "$cmd"
+  fi
+done
+
+note "project markers"
+for f in AGENTS.md CLAUDE.md README.md package.json pnpm-lock.yaml package-lock.json yarn.lock go.mod pyproject.toml requirements.txt composer.json Cargo.toml Makefile Dockerfile compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+  test -e "$f" && printf 'FOUND %s\n' "$f"
+done
+
+note "git status"
+git status --short
