@@ -1,0 +1,4 @@
+# xAI Grok Build (official `grok`). AGENTS.md + CLAUDE.md read natively.
+# Default to Plan mode (/plan blocks writes); keep approvals manual.
+[ui]
+permission_mode = "manual"   # do NOT use "always-approve"
