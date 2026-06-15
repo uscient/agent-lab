@@ -9,6 +9,7 @@ PROJECT_NAME="agent-lab"
 COMPOSE_FILES=(
   "${REPO_ROOT}/compose.yaml"
   "${REPO_ROOT}/compose.egress.yaml"
+  "${REPO_ROOT}/compose.agent.yaml"
 )
 
 agent_lab_compose_args=(

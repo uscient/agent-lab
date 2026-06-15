@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runs the runtime agent-containment test (tests/agent/cases.sh) inside a real agent
+# container via the blessed scripts/agent path. Requires a Docker daemon; the allow pass
+# also needs outbound internet to the registry.
+#
+# It mounts tests/agent at /workspace (so cases.sh is reachable inside the container) and
+# loads a sentinel secret to prove file->env loading. The named-volume HOME is avoided
+# (ephemeral) so nothing persists.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/common"
+
+agent_lab_require_env_file
+
+# Sentinel secret (proves file->env). Created only if absent; removed on exit if we made it.
+secrets_dir="${REPO_ROOT}/secrets"
+mkdir -p "$secrets_dir"
+secret_file="${secrets_dir}/AGENT_LAB_TEST_SECRET"
+created_secret=0
+if [ ! -e "$secret_file" ]; then
+  printf 'sentinel-ok' > "$secret_file"
+  created_secret=1
+fi
+cleanup() { [ "$created_secret" -eq 1 ] && rm -f "$secret_file"; }
+trap cleanup EXIT
+
+# Run the agent as the host user so the bind-mounted /workspace is writable.
+export AGENT_LAB_PROJECT_DIR="${REPO_ROOT}/tests/agent"
+export AGENT_LAB_EPHEMERAL_HOME=1
+AGENT_LAB_AGENT_UID="$(id -u)"; AGENT_LAB_AGENT_GID="$(id -g)"
+export AGENT_LAB_AGENT_UID AGENT_LAB_AGENT_GID
+
+printf '== agent containment: deny-by-default (base recipe) ==\n'
+AGENT_LAB_ALLOWLIST_RECIPES=base \
+  "${REPO_ROOT}/scripts/agent" -- bash /workspace/cases.sh deny
+
+printf '== agent containment: allowlisted egress (node-dev recipe) ==\n'
+# Squid loads the allowlist at startup; recipe changes need a stack restart (see scripts/agent).
+"${REPO_ROOT}/scripts/agent" down
+AGENT_LAB_ALLOWLIST_RECIPES=base,node-dev \
+  "${REPO_ROOT}/scripts/agent" -- bash /workspace/cases.sh allow
+
+printf 'agent-test complete\n'

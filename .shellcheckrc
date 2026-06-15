@@ -1,0 +1,12 @@
+# Repo-wide ShellCheck config. Disables info-level findings that the project's established,
+# deliberate patterns trigger, so `scripts/dev/lint-scripts` stays green across all scripts
+# (existing and new) without editing each one:
+#
+#   SC1091  Sourced `common`/libs are located at runtime via a computed path; ShellCheck
+#           cannot follow the dynamic path. Those files are linted separately as their own
+#           inputs, so following is unnecessary.
+#   SC2015  The `A && B || C` shorthand (e.g. `... || true` guards) is used intentionally.
+#   SC2016  Single-quoted regex / ACL patterns (e.g. in scripts/doctor) must NOT expand.
+#
+# Warnings and errors are still reported.
+disable=SC1091,SC2015,SC2016

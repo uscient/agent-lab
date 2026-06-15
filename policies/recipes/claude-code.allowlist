@@ -1,0 +1,4 @@
+# claude-code: Anthropic API. The full control-plane domain set is NOT fabricated here.
+# Capture the rest with scripts/dev/harvest-allowlist after a real run, then add reviewed lines.
+# TODO: harvest additional claude-code control-plane domains.
+api.anthropic.com

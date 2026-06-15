@@ -2,7 +2,7 @@
 
 `agent-lab` is a private Docker Compose containment lab for experimenting with autonomous agent workloads behind explicit network, filesystem, credential, and egress controls.
 
-It is not a general AI application stack, a public SaaS control plane, or an unrestricted agent launcher. The v0 slice only implements the containment substrate: an internal agent network, controlled DNS, a Squid egress proxy, and acceptance tests.
+It is not a general AI application stack, a public SaaS control plane, or an unrestricted agent launcher. The v0 slice implements the containment substrate — an internal agent network, controlled DNS, a Squid egress proxy, and acceptance tests — plus a bring-your-own-agent profile (`scripts/agent`) that runs any agent image on your project behind those controls.
 
 ## Default Posture
 
@@ -36,6 +36,56 @@ Stop the stack:
 ```
 
 `./scripts/down --volumes` also removes named volumes, including the `audit` log volume.
+
+## Bring Your Own Agent
+
+`scripts/agent` runs any agent image against your project, secure-by-default: read-only rootfs, attached only to the internal `agents` network, no Docker socket, no host home mount, all capabilities dropped, and deny-by-default egress.
+
+```bash
+cp .env.example .env.local
+# Point at your project (optional; defaults to an ephemeral workspace volume):
+#   AGENT_LAB_PROJECT_DIR=/abs/path/to/your/repo
+./scripts/agent -- bash      # interactive shell in the sandbox (devbox built on first use)
+./scripts/agent --clean      # stop and remove the named volumes
+```
+
+You adapt the lab through exactly four seams; everything else is locked:
+
+| Seam | How | Effect |
+| --- | --- | --- |
+| Agent image | `AGENT_LAB_AGENT_IMAGE` | which image runs (default: locally-built `agent-lab/devbox:local`) |
+| Project | `AGENT_LAB_PROJECT_DIR` | one host dir mounted RW at `/workspace` (guarded at preflight) |
+| Secrets | files under `secrets/` | loaded into the agent's env at runtime, never into config or `docker inspect` |
+| Egress | `AGENT_LAB_ALLOWLIST_RECIPES` | which `policies/recipes/*.allowlist` fragments compose into Squid |
+
+Adaptability comes from these narrow, guard-railed openings, never from loosened defaults. Unsafe choices — mounting `$HOME`, a system path, or a directory holding `.ssh`/`.aws`/an `.npmrc` auth token — are refused at preflight, not silently honored.
+
+### Egress is opt-in (deny-by-default)
+
+The `base` recipe is empty, so with no recipes the agent reaches **nothing** — including its own API. Add recipes to open specific domains:
+
+```bash
+AGENT_LAB_ALLOWLIST_RECIPES=base,node-dev ./scripts/agent -- npm install
+```
+
+Shipped recipes: `base` (empty), `node-dev`, `python-dev`, `claude-code`, `codex`. The `claude-code`/`codex` recipes carry only the published API host; discover the rest of an agent's real domains from a run instead of guessing:
+
+```bash
+scripts/dev/harvest-allowlist > /tmp/candidates.txt   # review-only; never auto-applied
+```
+
+Then copy the lines you trust into a recipe. Recipe changes take effect on the next `./scripts/agent` run (Squid loads the allowlist at startup; run `./scripts/agent down` first if the proxy is already up).
+
+### Bringing a third-party image into compliance
+
+The agent image must load file-based secrets via the baked-in entrypoint. Make any image compliant in one command, preserving its original entrypoint/command:
+
+```bash
+scripts/wrap-image ghcr.io/example/agent:latest
+AGENT_LAB_AGENT_IMAGE=agent-lab/agent:wrapped ./scripts/agent
+```
+
+`images/devbox/Dockerfile` is the canonical compliant example. Agent state/cache lives in the `agent-home` named volume by default and may hold login tokens; set `AGENT_LAB_EPHEMERAL_HOME=1` to map `/home/agent` to tmpfs so nothing persists. See `THREAT_MODEL.md` for the full writable-surface taxonomy.
 
 ## Profiles
 

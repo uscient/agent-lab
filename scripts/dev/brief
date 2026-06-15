@@ -31,7 +31,7 @@ out="$(cache_dir)/brief.md"
   echo
 
   echo "## Project markers"
-  for f in AGENTS.md CLAUDE.md README.md package.json pnpm-lock.yaml go.mod pyproject.toml composer.json Cargo.toml Makefile Dockerfile compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+  for f in README.md THREAT_MODEL.md SECURITY.md package.json pnpm-lock.yaml go.mod pyproject.toml composer.json Cargo.toml Makefile Dockerfile compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
     test -e "$f" && echo "- $f"
   done
   echo

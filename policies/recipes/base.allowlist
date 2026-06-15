@@ -1,0 +1,5 @@
+# base recipe: intentionally EMPTY (comments only).
+#
+# With only `base`, the generated allowlist contains zero domains, so Squid denies every
+# destination -- the agent reaches nothing, including its own API. Egress is opt-in: add
+# recipes via AGENT_LAB_ALLOWLIST_RECIPES (e.g. "base,node-dev") to open specific domains.

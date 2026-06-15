@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Blessed front door: run a bring-your-own agent on your project, secure-by-default.
+# Four seams adapt the lab (image / project / secrets / egress); everything else is locked.
+# scripts/agent is the single source of config authority: it loads, validates, and EXPORTS
+# the effective BYOA config (shell env > strictly-parsed env-file > default) before guarding
+# anything or invoking Compose, so a value set only in .env.local cannot bypass the guard.
+# See README.md (quickstart + seams) and THREAT_MODEL.md.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/common"
+# shellcheck source=scripts/lib/guard.sh
+source "${REPO_ROOT}/scripts/lib/guard.sh"
+# shellcheck source=scripts/lib/allowlist.sh
+source "${REPO_ROOT}/scripts/lib/allowlist.sh"
+# shellcheck source=scripts/lib/config.sh
+source "${REPO_ROOT}/scripts/lib/config.sh"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  scripts/agent [-- CMD...]   Run the agent (default: the image's own CMD).
+  scripts/agent --check       Preflight only: load + validate config, guard, build allowlist; no Docker run.
+  scripts/agent down          Stop the agent stack (keeps named volumes).
+  scripts/agent --clean       Stop the stack AND remove named volumes (workspace, home, audit).
+  scripts/agent -h | --help   Show this help.
+
+Seams (set in .env.local or the environment):
+  AGENT_LAB_AGENT_IMAGE        Agent/dev image (default: locally-built agent-lab/devbox:local).
+  AGENT_LAB_PROJECT_DIR        Host dir mounted RW at /workspace (guarded; default: ephemeral volume).
+  AGENT_LAB_SECRETS_DIR        Host dir mounted RO at /run/agent-secrets (guarded; default: ./secrets).
+  AGENT_LAB_ALLOWLIST_RECIPES  Comma-separated egress recipes (default: base = deny all).
+  AGENT_LAB_EPHEMERAL_HOME=1   Map /home/agent to tmpfs (no token/cache persistence).
+EOF
+}
+
+mode="run"
+agent_cmd=()
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --check) mode="check"; shift ;;
+  down) mode="down"; shift ;;
+  --clean) mode="clean"; shift ;;
+  --) shift; if [ "$#" -gt 0 ]; then agent_cmd=("$@"); fi; set -- ;;
+  "") : ;;
+  *) printf 'Unknown argument: %s\n' "$1" >&2; usage; exit 1 ;;
+esac
+if [ "$mode" != "run" ] && [ "$#" -gt 0 ]; then
+  printf 'Unexpected extra arguments after %s\n' "$mode" >&2; usage; exit 1
+fi
+
+# Honor an env-file override (tests / preflight); it is strictly parsed, never sourced.
+ENV_FILE="${AGENT_LAB_ENV_FILE:-$ENV_FILE}"
+agent_lab_require_env_file
+
+# Build a self-contained compose invocation for the given HOME overlay.
+compose=()
+build_compose() {
+  compose=(
+    docker compose
+    --project-name "$PROJECT_NAME"
+    --env-file "$ENV_FILE"
+    -f "${REPO_ROOT}/compose.yaml"
+    -f "${REPO_ROOT}/compose.egress.yaml"
+    -f "${REPO_ROOT}/compose.agent.yaml"
+    -f "$1"
+  )
+}
+run_compose() {
+  (cd "$REPO_ROOT" && "${compose[@]}" "$@")
+}
+
+# Teardown needs no BYOA config or guards (a misconfigured stack must still be tearable-down).
+case "$mode" in
+  down)
+    build_compose "${REPO_ROOT}/compose.agent.persist.yaml"
+    run_compose --profile core --profile egress --profile agent down
+    exit 0 ;;
+  clean)
+    build_compose "${REPO_ROOT}/compose.agent.persist.yaml"
+    printf 'Tearing down and REMOVING named volumes (agent-workspace, agent-home, audit).\n' >&2
+    run_compose --profile core --profile egress --profile agent down --volumes
+    exit 0 ;;
+esac
+
+# --- run / check: config authority + preflight guards ---
+
+# Compute + export the effective, validated config (shell env > strict env-file > default).
+# A rejected (metacharacter-bearing) env-file value aborts here, before any guard or Compose op.
+agent_lab_load_byoa_config "$ENV_FILE" || exit 1
+
+checks_failed=0
+agent_lab_guard_project_dir "${AGENT_LAB_PROJECT_DIR}" || checks_failed=1
+agent_lab_guard_secrets_dir "${AGENT_LAB_SECRETS_DIR}" || checks_failed=1
+agent_lab_validate_uid_gid || checks_failed=1
+# Compose the egress allowlist from the effective recipes (also validates recipe names).
+agent_lab_build_allowlist || checks_failed=1
+
+if [ "$mode" = "check" ]; then
+  printf 'EFFECTIVE AGENT_LAB_AGENT_IMAGE=%s\n'        "${AGENT_LAB_AGENT_IMAGE}"
+  printf 'EFFECTIVE AGENT_LAB_PROJECT_DIR=%s\n'        "${AGENT_LAB_PROJECT_DIR}"
+  printf 'EFFECTIVE AGENT_LAB_SECRETS_DIR=%s\n'        "${AGENT_LAB_SECRETS_DIR}"
+  printf 'EFFECTIVE AGENT_LAB_EPHEMERAL_HOME=%s\n'     "${AGENT_LAB_EPHEMERAL_HOME}"
+  printf 'EFFECTIVE AGENT_LAB_ALLOWLIST_RECIPES=%s\n'  "${AGENT_LAB_ALLOWLIST_RECIPES}"
+  printf 'EFFECTIVE AGENT_LAB_AGENT_UID=%s\n'          "${AGENT_LAB_AGENT_UID}"
+  printf 'EFFECTIVE AGENT_LAB_AGENT_GID=%s\n'          "${AGENT_LAB_AGENT_GID}"
+  if [ "$checks_failed" -eq 0 ]; then printf 'PASS preflight\n'; exit 0; fi
+  printf 'FAIL preflight\n' >&2; exit 1
+fi
+
+[ "$checks_failed" -eq 0 ] || exit 1
+
+# Ensure the read-only secrets bind has a target (effective, already-vetted dir).
+(cd "$REPO_ROOT" && mkdir -p "${AGENT_LAB_SECRETS_DIR}")
+
+# Pick the HOME overlay from the effective ephemeral flag.
+if [ "${AGENT_LAB_EPHEMERAL_HOME}" = "1" ]; then
+  overlay="${REPO_ROOT}/compose.agent.ephemeral.yaml"
+else
+  overlay="${REPO_ROOT}/compose.agent.persist.yaml"
+fi
+build_compose "$overlay"
+
+# Seam: agent image. Build the default devbox locally when no BYO image is set.
+if [ -z "${AGENT_LAB_AGENT_IMAGE}" ] || [ "${AGENT_LAB_AGENT_IMAGE}" = "agent-lab/devbox:local" ]; then
+  if ! docker image inspect agent-lab/devbox:local >/dev/null 2>&1; then
+    printf 'Building default devbox image agent-lab/devbox:local\n'
+    docker build -t agent-lab/devbox:local -f "${REPO_ROOT}/images/devbox/Dockerfile" "$REPO_ROOT"
+  fi
+fi
+
+# Start the containment substrate: CoreDNS + Squid. Squid loads the allowlist at startup,
+# so changing recipes needs `scripts/agent down` first to take effect.
+run_compose --profile core --profile egress up -d --wait dns egress-proxy
+
+# Run the agent. Guard the bash 3.2 empty-array expansion before "${agent_cmd[@]}".
+if [ "${#agent_cmd[@]}" -gt 0 ]; then
+  run_compose --profile agent run --rm agent "${agent_cmd[@]}"
+else
+  run_compose --profile agent run --rm agent
+fi

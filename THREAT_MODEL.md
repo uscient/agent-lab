@@ -34,6 +34,18 @@ These are trusted components, not perfect components. Bugs or misconfiguration i
 - Squid enforces a minimal domain allowlist, denies private/link-local/loopback/metadata ranges, denies unsafe ports, and defaults to deny.
 - No Docker socket, host home mounts, privileged containers, host networking, or public ports are used in v0.
 
+## Agent Profile
+
+The `agent` profile (`scripts/agent`) runs a bring-your-own agent under the same boundary as the test container, plus per-run hardening: read-only rootfs, `cap_drop: ALL`, `no-new-privileges`, non-root user, a `pids_limit`, and attachment to the internal `agents` network only. It exposes four guard-railed seams (image, project dir, secrets, egress recipes); unsafe project mounts are refused at preflight by `scripts/lib/guard.sh`, and those hard refusals are non-overridable.
+
+Writable surfaces are explicit and fall into three classes:
+
+- Secrets — files under `secrets/`, bind-mounted read-only and loaded into the agent's environment at runtime by the baked-in entrypoint. They never appear in compose `environment:`, `--env-file`, or `docker inspect`.
+- Agent state / cache — `/home/agent`, a persistent `agent-home` named volume by default. This volume can become credential-bearing (OAuth/login tokens an agent writes after sign-in) and is the main reason to prefer `AGENT_LAB_EPHEMERAL_HOME=1`, which maps it to tmpfs so nothing persists.
+- Service / workspace data — `/workspace` (the project dir or a named volume) and `/tmp` (tmpfs). The rootfs itself stays read-only.
+
+Egress remains deny-by-default: the `base` recipe is empty, so an agent with no recipe reaches nothing, including its own API. Recipes are additive allowlist fragments; Squid still denies private ranges, raw IPs, and unsafe ports ahead of the allow rule, and matches the CONNECT host, not the TLS SNI (an M3 TODO).
+
 ## Residual Risks
 
 - This is practical Docker containment, not VM isolation. A host kernel or container-runtime escape defeats this design.
@@ -43,7 +55,7 @@ These are trusted components, not perfect components. Bugs or misconfiguration i
 - If Docker IPv6 is enabled host-wide, IPv6 must be re-audited. The v0 `agents` network is intended to be IPv4 only.
 - DNS-over-HTTPS can reintroduce external DNS if a DoH endpoint is allowlisted.
 - Squid and CoreDNS are part of the trust base.
-- Upstream images are pinned by non-`latest` tags, not digests, in this v0 patch because no digest was verified during implementation.
+- Upstream infrastructure images (CoreDNS, Squid) are pinned by non-`latest` tags, not digests; digest-pinning them remains a TODO. The OpenClaw image already digest-pins its bases, and `images/devbox/Dockerfile` carries a digest-pin TODO for `debian:bookworm-slim`.
 
 ## Out of Scope
 

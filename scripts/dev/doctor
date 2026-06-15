@@ -27,7 +27,7 @@ for cmd in shellcheck docker docker-compose go node npm pnpm yarn python3 pytest
 done
 
 note "project markers"
-for f in AGENTS.md CLAUDE.md README.md package.json pnpm-lock.yaml package-lock.json yarn.lock go.mod pyproject.toml requirements.txt composer.json Cargo.toml Makefile Dockerfile compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+for f in README.md THREAT_MODEL.md SECURITY.md package.json pnpm-lock.yaml package-lock.json yarn.lock go.mod pyproject.toml requirements.txt composer.json Cargo.toml Makefile Dockerfile compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
   test -e "$f" && printf 'FOUND %s\n' "$f"
 done
 

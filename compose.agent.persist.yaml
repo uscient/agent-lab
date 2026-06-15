@@ -1,0 +1,10 @@
+services:
+  # Default HOME overlay: persist agent state/cache (tokens, logins, caches) in a named
+  # volume across runs. This volume may become credential-bearing (OAuth/login tokens);
+  # see THREAT_MODEL.md. Use the ephemeral overlay instead to avoid persistence.
+  agent:
+    volumes:
+      - agent-home:/home/agent
+
+volumes:
+  agent-home:
