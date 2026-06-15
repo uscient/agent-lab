@@ -1,0 +1,40 @@
+services:
+  # Bring-your-own agent. Secure-by-default: read-only rootfs, attaches to the internal
+  # `agents` network only (no `egress`), no Docker socket, no host home mount, all caps
+  # dropped. Egress is opt-in and flows through Squid via the proxy env vars below.
+  #
+  # This base intentionally does NOT mount /home/agent. The persist/ephemeral overlays each
+  # add exactly one home mount; mounting it here too would collide (duplicate mount point).
+  agent:
+    profiles:
+      - agent
+    image: ${AGENT_LAB_AGENT_IMAGE:-agent-lab/devbox:local}
+    networks:
+      - agents
+    dns:
+      - ${AGENT_LAB_DNS_IP:-172.30.0.10}
+    working_dir: /workspace
+    user: "${AGENT_LAB_AGENT_UID:-1000}:${AGENT_LAB_AGENT_GID:-1000}"
+    environment:
+      HOME: /home/agent
+      HTTP_PROXY: ${HTTP_PROXY:-http://172.30.0.20:3128}
+      HTTPS_PROXY: ${HTTPS_PROXY:-http://172.30.0.20:3128}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1,172.30.0.0/24}
+      AGENT_LAB_SECRETS_MOUNT: /run/agent-secrets
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ${AGENT_LAB_PROJECT_DIR:-agent-workspace}:/workspace
+      - ${AGENT_LAB_SECRETS_DIR:-./secrets}:/run/agent-secrets:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: ${AGENT_LAB_AGENT_MEM:-4g}
+    cpus: ${AGENT_LAB_AGENT_CPUS:-2}
+    restart: "no"
+
+volumes:
+  agent-workspace:

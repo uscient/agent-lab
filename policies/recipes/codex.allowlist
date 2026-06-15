@@ -1,0 +1,4 @@
+# codex: OpenAI API. The full control-plane domain set is NOT fabricated here.
+# Capture the rest with scripts/dev/harvest-allowlist after a real run, then add reviewed lines.
+# TODO: harvest additional codex control-plane domains.
+api.openai.com

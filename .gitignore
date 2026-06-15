@@ -5,6 +5,7 @@
 !.env.*.example
 *.local
 secrets/
+!secrets/.gitkeep
 *.pem
 *.key
 *.crt
@@ -21,7 +22,7 @@ runtime/
 logs/
 state/
 cache/
-.cache/openclaw/
+.cache/
 models/
 browser-profiles/
 agent-state/

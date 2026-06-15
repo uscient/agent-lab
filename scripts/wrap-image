@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Make a third-party image agent-lab-compliant by baking in tools/agent-entrypoint.sh
+# (file-based secret loading) while preserving the image's original behavior. The original
+# ENTRYPOINT+CMD are combined into the wrapper's CMD, so our entrypoint's `exec "$@"`
+# reproduces the original command with secret-loading prepended.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/common"
+
+usage() {
+  printf 'Usage: %s BASE_IMAGE [WRAPPED_TAG]\n' "$0" >&2
+  printf '  Default tag: agent-lab/<base-name>:wrapped\n' >&2
+  printf '  Then run it: AGENT_LAB_AGENT_IMAGE=<tag> scripts/agent\n' >&2
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") usage; exit 1 ;;
+esac
+
+base="$1"
+wrapped="${2:-}"
+
+command -v docker >/dev/null 2>&1 || { printf 'FAIL docker is required\n' >&2; exit 1; }
+
+# Default wrapped tag from the base image's bare name (strip registry path, :tag, @digest).
+if [ -z "$wrapped" ]; then
+  name="$base"
+  name="${name%@*}"     # drop @digest
+  name="${name##*/}"    # drop registry/path
+  name="${name%:*}"     # drop :tag
+  wrapped="agent-lab/${name}:wrapped"
+fi
+
+# Pull the base image if it is not already present locally.
+if ! docker image inspect "$base" >/dev/null 2>&1; then
+  printf 'Pulling %s\n' "$base"
+  docker pull "$base"
+fi
+
+orig_entrypoint="$(docker inspect -f '{{json .Config.Entrypoint}}' "$base")"
+orig_cmd="$(docker inspect -f '{{json .Config.Cmd}}' "$base")"
+orig_user="$(docker inspect -f '{{.Config.User}}' "$base")"
+
+# Merge two compact JSON arrays (or "null") into one, with pure shell -- no jq/python.
+merge_json_arrays() {
+  local a="$1" b="$2"
+  [ "$a" = null ] && a='[]'; [ "$b" = null ] && b='[]'
+  if   [ "$a" = '[]' ] && [ "$b" = '[]' ]; then printf '[]'
+  elif [ "$a" = '[]' ]; then printf '%s' "$b"
+  elif [ "$b" = '[]' ]; then printf '%s' "$a"
+  else printf '%s,%s' "${a%]}" "${b#[}"; fi   # "[x]" + "[y]" -> "[x,y]"
+}
+
+combined="$(merge_json_arrays "$orig_entrypoint" "$orig_cmd")"
+
+printf 'Base image:          %s\n' "$base"
+printf 'Original ENTRYPOINT: %s\n' "$orig_entrypoint"
+printf 'Original CMD:        %s\n' "$orig_cmd"
+printf 'Original USER:       %s\n' "${orig_user:-<root>}"
+printf 'Combined CMD:        %s\n' "$combined"
+
+if [ "$combined" = '[]' ]; then
+  printf 'WARN base declares neither ENTRYPOINT nor CMD; supply a command at runtime:\n' >&2
+  printf 'WARN   scripts/agent -- <cmd>\n' >&2
+fi
+
+# Temp Dockerfile. Build context is the repo root so `COPY tools/...` resolves.
+tmp_df="$(mktemp "${TMPDIR:-/tmp}/agent-lab-wrap.XXXXXX")"
+cleanup() { rm -f "$tmp_df"; }
+trap cleanup EXIT
+
+{
+  printf 'FROM %s\n' "$base"
+  printf 'USER root\n'
+  printf 'COPY tools/agent-entrypoint.sh /usr/local/bin/agent-entrypoint\n'
+  printf 'RUN chmod 0755 /usr/local/bin/agent-entrypoint\n'
+  [ -n "$orig_user" ] && printf 'USER %s\n' "$orig_user"
+  printf 'ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]\n'
+  printf 'CMD %s\n' "$combined"
+} > "$tmp_df"
+
+printf 'Building %s\n' "$wrapped"
+docker build -t "$wrapped" -f "$tmp_df" "$REPO_ROOT"
+
+printf 'PASS wrapped image ready: %s\n' "$wrapped"

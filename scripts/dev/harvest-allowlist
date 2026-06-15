@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Turn Squid's access log into a REVIEW-ONLY candidate allowlist recipe. Never auto-applies.
+# Reads the log from the running egress-proxy and prints candidates to stdout; pipe to a file
+# and hand-curate before copying trusted lines into policies/recipes/<name>.allowlist:
+#   scripts/dev/harvest-allowlist > /tmp/candidates.txt
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/../common"
+
+agent_lab_require_env_file
+
+if ! log="$(agent_lab_compose --profile egress exec -T egress-proxy cat /var/log/squid/access.log 2>/dev/null)"; then
+  printf 'FAIL could not read Squid access log from egress-proxy.\n' >&2
+  printf 'Hint: start egress first (./scripts/up egress, or run an agent), then retry.\n' >&2
+  exit 1
+fi
+
+printf '%s\n' "$log" | awk -v today="$(date -u +%Y-%m-%d)" '
+  BEGIN {
+    print "# Squid egress harvest -- candidate allowlist recipe (REVIEW ONLY; never auto-applied)."
+    print "# Generated: " today
+    print "# NOTE: only proxy-mediated attempts appear here. Raw direct (non-proxy) attempts are"
+    print "# route-blocked by the internal network and are NOT logged in v0."
+    print "#"
+  }
+  {
+    url=$7; code=$4; host=url
+    i=index(url,"://"); if(i>0) host=substr(url,i+3)
+    s=index(host,"/"); if(s>0) host=substr(host,1,s-1)
+    c=index(host,":"); if(c>0) host=substr(host,1,c-1)
+    if(host=="" || host=="-") next
+    if(code ~ /DENIED/ || code ~ /\/403$/) d[host]++; else a[host]++
+  }
+  END {
+    print "# --- DENIED (agent wanted these; keep the ones you trust) ---"
+    for(h in d) printf "%s\t# denied %dx\n", h, d[h]
+    print "#"
+    print "# --- ALLOWED (already reachable; reference) ---"
+    for(h in a) if(!(h in d)) printf "# %s\t# allowed %dx\n", h, a[h]
+  }
+'

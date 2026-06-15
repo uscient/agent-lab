@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Blessed front door: run a bring-your-own agent on your project, secure-by-default.
+# Four seams adapt the lab (image / project / secrets / egress); everything else is locked.
+# See README.md (quickstart + seams) and THREAT_MODEL.md.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/common"
+# shellcheck source=scripts/lib/guard.sh
+source "${REPO_ROOT}/scripts/lib/guard.sh"
+# shellcheck source=scripts/lib/allowlist.sh
+source "${REPO_ROOT}/scripts/lib/allowlist.sh"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  scripts/agent [-- CMD...]   Run the agent (default: the image's own CMD).
+  scripts/agent down          Stop the agent stack (keeps named volumes).
+  scripts/agent --clean       Stop the stack AND remove named volumes (workspace, home, audit).
+  scripts/agent -h | --help   Show this help.
+
+Seams (set in .env.local or the environment):
+  AGENT_LAB_AGENT_IMAGE        Agent/dev image (default: locally-built agent-lab/devbox:local).
+  AGENT_LAB_PROJECT_DIR        Host dir mounted RW at /workspace (guarded; default: ephemeral volume).
+  AGENT_LAB_ALLOWLIST_RECIPES  Comma-separated egress recipes (default: base = deny all).
+  AGENT_LAB_EPHEMERAL_HOME=1   Map /home/agent to tmpfs (no token/cache persistence).
+  secrets/                     One file per secret, loaded into env at runtime (read-only).
+EOF
+}
+
+mode="run"
+agent_cmd=()
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  down) mode="down"; shift ;;
+  --clean) mode="clean"; shift ;;
+  --) shift; if [ "$#" -gt 0 ]; then agent_cmd=("$@"); fi; set -- ;;
+  "") : ;;
+  *) printf 'Unknown argument: %s\n' "$1" >&2; usage; exit 1 ;;
+esac
+if [ "$mode" != "run" ] && [ "$#" -gt 0 ]; then
+  printf 'Unexpected extra arguments after %s\n' "$mode" >&2; usage; exit 1
+fi
+
+agent_lab_require_env_file
+
+# Pick the HOME overlay: tmpfs when ephemeral, else a persistent named volume.
+if [ "${AGENT_LAB_EPHEMERAL_HOME:-0}" = "1" ]; then
+  overlay="${REPO_ROOT}/compose.agent.ephemeral.yaml"
+else
+  overlay="${REPO_ROOT}/compose.agent.persist.yaml"
+fi
+
+# Self-contained compose invocation: base + egress + agent + the chosen overlay.
+compose=(
+  docker compose
+  --project-name "$PROJECT_NAME"
+  --env-file "$ENV_FILE"
+  -f "${REPO_ROOT}/compose.yaml"
+  -f "${REPO_ROOT}/compose.egress.yaml"
+  -f "${REPO_ROOT}/compose.agent.yaml"
+  -f "$overlay"
+)
+run_compose() {
+  (cd "$REPO_ROOT" && "${compose[@]}" "$@")
+}
+
+case "$mode" in
+  down)
+    run_compose --profile core --profile egress --profile agent down
+    exit 0
+    ;;
+  clean)
+    printf 'Tearing down and REMOVING named volumes (agent-workspace, agent-home, audit).\n' >&2
+    run_compose --profile core --profile egress --profile agent down --volumes
+    exit 0
+    ;;
+esac
+
+# --- mode: run ---
+
+# Seam: project dir. Hard refusals (HOME, system paths, credential stores) are non-overridable.
+if ! agent_lab_guard_project_dir "${AGENT_LAB_PROJECT_DIR:-}"; then
+  exit 1
+fi
+
+# Ensure the read-only secrets bind has a target (file-per-secret; the dir is gitignored).
+secrets_dir="${AGENT_LAB_SECRETS_DIR:-./secrets}"
+(cd "$REPO_ROOT" && mkdir -p "$secrets_dir")
+
+# Seam: egress. Compose the allowlist from recipes and export AGENT_LAB_EGRESS_ALLOWLIST.
+# A shell export beats the same key in --env-file, so the generated path wins. An empty
+# (base) allowlist means Squid denies everything: egress is opt-in.
+agent_lab_build_allowlist
+
+# Seam: agent image. Build the default devbox locally when no BYO image is set.
+image="${AGENT_LAB_AGENT_IMAGE:-}"
+if [ -z "$image" ] || [ "$image" = "agent-lab/devbox:local" ]; then
+  if ! docker image inspect agent-lab/devbox:local >/dev/null 2>&1; then
+    printf 'Building default devbox image agent-lab/devbox:local\n'
+    docker build -t agent-lab/devbox:local -f "${REPO_ROOT}/images/devbox/Dockerfile" "$REPO_ROOT"
+  fi
+fi
+
+# Start the containment substrate: CoreDNS + Squid. Squid is the only egress path; it loads
+# the allowlist at startup, so changing recipes needs `scripts/agent down` first to take effect.
+run_compose --profile core --profile egress up -d dns egress-proxy
+
+# Run the agent. Guard the bash 3.2 empty-array expansion before "${agent_cmd[@]}".
+if [ "${#agent_cmd[@]}" -gt 0 ]; then
+  run_compose --profile agent run --rm agent "${agent_cmd[@]}"
+else
+  run_compose --profile agent run --rm agent
+fi

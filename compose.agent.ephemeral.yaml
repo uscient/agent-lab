@@ -1,0 +1,9 @@
+services:
+  # Ephemeral HOME overlay (AGENT_LAB_EPHEMERAL_HOME=1): map /home/agent to tmpfs so no
+  # tokens or caches persist after the container exits. mode=1777 is required: a bare tmpfs
+  # mount is owned root:root and inherits the image dir's 0755, which would leave HOME
+  # read-only for the agent (uid 1000). 1777 mirrors /tmp so the agent can write its caches.
+  # Compose concatenates tmpfs entries, so this adds /home/agent alongside the base /tmp.
+  agent:
+    tmpfs:
+      - /home/agent:mode=1777

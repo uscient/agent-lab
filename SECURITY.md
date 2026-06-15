@@ -8,6 +8,8 @@ Never commit real secrets. This includes API keys, tokens, private keys, SSH key
 
 Only `.env.example` belongs in source, and it must contain non-secret placeholders or safe defaults. Future real credentials should be files under `secrets/`, mounted read-only per service. Do not place real secrets in environment variables; env leaks through Docker inspection and process metadata.
 
+Concretely: `docker inspect` exposes a container's `Config.Env`, which includes image `ENV`, compose `environment:`, and `--env-file` values — so a secret passed any of those ways is visible to anyone who can inspect the container. The `agent` profile instead bind-mounts `secrets/` read-only and the baked-in entrypoint (`tools/agent-entrypoint.sh`) reads each file and exports it at runtime. Runtime-exported variables do not appear in `docker inspect`. The residual exposure is `/proc` inside the container — i.e. the agent that already holds the key.
+
 ## Hard Stops
 
 Stop work and report before continuing if tracked source contains or introduces:
