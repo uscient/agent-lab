@@ -5,7 +5,7 @@
 # Tolerant of not-yet-built adapters (SKIP, not FAIL). Run: bash tests/agent/policy-verify.sh
 set -uo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-cd "$root"
+cd "$root" || exit 1
 guard="tools/pretooluse-guard.sh"
 
 P=0 F=0 S=0
@@ -93,7 +93,7 @@ ok=1; for f in doctrine/*.md; do
   case "$l" in "TL;DR:"*) ;; *) ok=0; echo "  $f missing TL;DR";; esac
 done
 [ "$ok" = 1 ] && pass "all doctrine lead with TL;DR" || fail "a doctrine file lacks TL;DR"
-idx=$(grep -cE '^- `doctrine/.*\.md`' AGENTS.md); files=$(ls doctrine/*.md | wc -l)
+idx=$(grep -cE '^- `doctrine/.*\.md`' AGENTS.md); files=$(find doctrine -maxdepth 1 -name '*.md' | wc -l)
 [ "$idx" -eq "$files" ] && pass "AGENTS.md doctrine index 1:1 ($idx)" || fail "doctrine index $idx != $files files"
 
 printf '\nSUMMARY pass=%s fail=%s skip=%s\n' "$P" "$F" "$S"
