@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/session-bootstrap.sh\" grok" }
+        ]
+      }
+    ]
+  }
+}

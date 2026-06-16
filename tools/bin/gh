@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# PATH shim for `gh` — blocks PR/release/remote-write subcommands at the argv level; everything else
+# passes through to the real gh. Defense-in-depth; containment is the real boundary.
+# See doctrine/git-workflow.md.
+set -uo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+selfdir="$(dirname "$self")"
+real=""
+while IFS= read -r cand; do
+  rcand="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+  [ "$rcand" = "$self" ] && continue
+  [ "$(dirname "$rcand")" = "$selfdir" ] && continue
+  real="$cand"; break
+done < <(type -aP gh 2>/dev/null)
+if [ -z "$real" ]; then
+  for c in /usr/bin/gh /usr/local/bin/gh; do [ -x "$c" ] && { real="$c"; break; }; done
+fi
+[ -z "$real" ] && { echo "agent-lab gh-shim: cannot locate the real gh" >&2; exit 127; }
+
+block() { echo "BLOCKED by agent-lab policy: $1 (see doctrine/git-workflow.md)" >&2; exit 2; }
+
+case "${1:-}" in
+  pr) block "opening or mutating a PR via gh is forbidden — the human owns the PR" ;;
+  release) block "gh release is forbidden (remote write)" ;;
+  api)
+    for a in "$@"; do
+      case "$a" in */pulls | */pulls/* | *pulls*) block "gh api to a pulls endpoint is forbidden" ;; esac
+    done ;;
+esac
+
+exec "$real" "$@"

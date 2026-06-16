@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# PATH shim for `git` — enforces the dev git-policy at the ARGV level, so it catches evasions a
+# raw-string regex can't: `git -C . push`, `g=push; git $g`, subprocess(['git','push']), aliases.
+# Everything non-dangerous passes straight through to the real git. Defense-in-depth — containment
+# (the sandbox/network posture), not this shim, is the real boundary. See doctrine/git-workflow.md.
+# Install: prepend tools/bin to PATH for the dev session (see docs/agent-config.md). NOT baked into
+# Agent Lab's contained-workload runtime (scripts/agent) — that is data plane, governed by containment.
+set -uo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+selfdir="$(dirname "$self")"
+real=""
+while IFS= read -r cand; do
+  rcand="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+  [ "$rcand" = "$self" ] && continue
+  [ "$(dirname "$rcand")" = "$selfdir" ] && continue
+  real="$cand"; break
+done < <(type -aP git 2>/dev/null)
+if [ -z "$real" ]; then
+  for c in /usr/bin/git /usr/local/bin/git /bin/git; do [ -x "$c" ] && { real="$c"; break; }; done
+fi
+[ -z "$real" ] && { echo "agent-lab git-shim: cannot locate the real git" >&2; exit 127; }
+
+block() { echo "BLOCKED by agent-lab policy: $1 (see doctrine/git-workflow.md)" >&2; exit 2; }
+
+# Locate the subcommand, skipping git's global options (some carry a value).
+args=("$@"); n=${#args[@]}; i=0; sub=""
+while [ "$i" -lt "$n" ]; do
+  a="${args[$i]}"
+  case "$a" in
+    -C | -c | --git-dir | --work-tree | --namespace | --super-prefix | --exec-path | --config-env)
+      i=$((i + 2)); continue ;;
+    --git-dir=* | --work-tree=* | --namespace=* | --exec-path=* | -c*) i=$((i + 1)); continue ;;
+    -*) i=$((i + 1)); continue ;;
+    *) sub="$a"; break ;;
+  esac
+done
+
+case "$sub" in
+  push) block "git push is forbidden — the human owns the remote and the merge gate" ;;
+  pull) block "git pull is forbidden — fetch (where available) + local merge of a LOCAL ref instead" ;;
+  merge | rebase)
+    j=$((i + 1))
+    while [ "$j" -lt "$n" ]; do
+      case "${args[$j]}" in
+        origin/* | upstream/* | refs/remotes/*)
+          block "git $sub from a remote-tracking ref is forbidden (it is the 2nd half of a pull)" ;;
+      esac
+      j=$((j + 1))
+    done ;;
+  remote)
+    case "${args[$((i + 1))]:-}" in
+      add | set-url | remove | rm | rename | prune) block "git remote mutation is forbidden" ;;
+    esac ;;
+esac
+
+exec "$real" "$@"

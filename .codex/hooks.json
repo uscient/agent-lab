@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
+        ]
+      },
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/session-bootstrap.sh\" codex" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/codex-permission-request.sh\"" }
+        ]
+      }
+    ]
+  }
+}

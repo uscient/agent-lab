@@ -1,0 +1,46 @@
+# policy/allow.commands — the autonomy allow-set (command prefixes; # comments; one per line).
+# Consumed by tools/render-adapters.sh to generate each tool's native allow rules. The guard is
+# DENY-oriented (it blocks deny/carveout/containment and lets everything else through), so this
+# file does not gate the guard — it defines what the adapters auto-approve for no-prompt autonomy.
+# Doctrine: doctrine/git-workflow.md (git), doctrine/containment.md (capabilities).
+
+# --- repo work commands (the real Agent Lab stack: bash + docker-compose) ---
+./scripts/dev/
+./scripts/
+./tools/validate.sh
+./tools/containment-lint.sh
+bash tests/
+shellcheck
+bash -n
+docker compose
+
+# --- local git (commit-friendly; remote integrity denied in deny.patterns) ---
+git add
+git commit
+git fetch
+git switch
+git checkout
+git branch
+git stash
+git restore
+git status
+git diff
+git log
+git show
+git merge
+git rebase
+
+# --- standard read/inspect tools ---
+cat
+ls
+grep
+rg
+find
+awk
+jq
+head
+tail
+wc
+file
+sort
+diff

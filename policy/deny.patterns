@@ -1,0 +1,34 @@
+# policy/deny.patterns — hard remote-integrity denials (extended regex; one per line; # comments)
+# Read by tools/pretooluse-guard.sh (Bash matcher) and tools/render-adapters.sh.
+# Doctrine: doctrine/git-workflow.md. These are DEFENSE-IN-DEPTH, not the security boundary
+# (the sandbox/containment posture is — see doctrine/containment.md).
+#
+# The git<->subcommand separator is [^[:alnum:]_]+ (not just whitespace) so the common quoted/
+# bracketed argv forms are caught too (e.g. subprocess(["git","push"])). The leading anchor
+# (^|[^[:alnum:]_])git prevents matching words that merely end in "git" (e.g. "legit push").
+# Known, accepted limitation: a literal "git push"/"git pull" substring inside a commit -m message
+# will also match (safe side: it blocks). Prefer the Edit tool for docs that discuss these verbs.
+
+# --- push (every form: --force/-f/--mirror/--delete/push origin ...) ---
+(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+push([^[:alnum:]_]|$)
+
+# --- pull (mutates local via merge/rebase) ---
+(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+pull([^[:alnum:]_]|$)
+
+# --- remote merge/rebase = the 2nd half of a pull -------------------------------------------
+# Deny so fetch+merge can't reconstruct pull. LOCAL-branch merges/rebases are NOT matched here
+# (no origin//upstream//refs/remotes/ token) and remain allowed.
+(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+merge([[:space:]]+[^[:space:]]+)*[[:space:]]+(origin|upstream)/
+(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+merge([[:space:]]+[^[:space:]]+)*[[:space:]]+refs/remotes/
+(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+rebase([[:space:]]+[^[:space:]]+)*[[:space:]]+(origin|upstream)/
+(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+rebase([[:space:]]+[^[:space:]]+)*[[:space:]]+refs/remotes/
+# add other remote short-names here if you use them (e.g. a remote named 'fork'): fork/
+
+# --- PR / remote-writing forge CLIs ---
+gh[[:space:]]+pr([[:space:]]|$)
+gh[[:space:]]+api[[:space:]].*pulls
+gh[[:space:]]+release([[:space:]]|$)
+glab[[:space:]]+mr([[:space:]]|$)
+
+# --- remote-config mutation ---
+(^|[^[:alnum:]_])git[[:space:]]+remote[[:space:]]+(add|set-url|remove|rm|rename|prune)

@@ -1,0 +1,19 @@
+# policy/protected.paths — read-only / maintenance-only paths (the rails).
+# Read by tools/pretooluse-guard.sh: Edit/Write to these, or shell mutation of them, is DENIED
+# unless AGENT_LAB_MAINTENANCE=1 (an explicit, separately-approved maintenance task).
+# Doctrine: doctrine/meta.md. Entries ending in / are directory prefixes; others are file paths.
+# Paths are matched anywhere in the string (absolute or repo-relative), at a / boundary.
+
+AGENTS.md
+doctrine/
+policy/
+tools/pretooluse-guard.sh
+tools/session-bootstrap.sh
+tools/render-adapters.sh
+tools/codex-permission-request.sh
+tools/bin/
+.claude/
+.codex/
+.grok/
+.cursor/
+.devguard/

@@ -1,0 +1,26 @@
+# policy/carveout.patterns — destructive / integrity carve-out (denied under autonomy).
+# Read by tools/pretooluse-guard.sh. Doctrine: doctrine/destructive-ops.md.
+# This is the THINNEST enforcement layer (raw-string regex, no credential wall, shim covers only
+# git/gh). It reliably stops accidents and casual evasion under autonomy (its D6 job); it is NOT
+# adversary-proof — a hostile agent is contained by the sandbox, not by these patterns.
+
+# --- history rewrite / irreversible git ---
+(^|[^[:alnum:]_])git[[:space:]]+reset[[:space:]]+--hard
+(^|[^[:alnum:]_])git[[:space:]]+clean[[:space:]]+-[a-z]*f
+(^|[^[:alnum:]_])git[[:space:]]+(filter-branch|filter-repo)
+(^|[^[:alnum:]_])git[[:space:]]+rebase[[:space:]]+([^[:space:]]+[[:space:]]+)*(-i|--interactive)
+(^|[^[:alnum:]_])git[[:space:]]+reflog[[:space:]]+expire
+(^|[^[:alnum:]_])git[[:space:]]+gc([[:space:]]+[^[:space:]]+)*[[:space:]]+--prune
+(^|[^[:alnum:]_])git[[:space:]]+branch[[:space:]]+-D
+# mass working-tree discard ('git checkout -- .' / 'git restore .')
+(^|[^[:alnum:]_])git[[:space:]]+checkout[[:space:]]+--[[:space:]]+\.([[:space:]]|$)
+(^|[^[:alnum:]_])git[[:space:]]+restore[[:space:]]+(--[a-z]+[[:space:]]+)*\.([[:space:]]|$)
+
+# --- broad filesystem destruction / perms ---
+(^|[[:space:]])rm[[:space:]]+(-[a-zA-Z]*[rR]|--recursive)
+(^|[[:space:]])chmod[[:space:]]+(-R|--recursive|[0-7]*7{2,}([[:space:]]|$))
+(^|[[:space:]])chown[[:space:]]+(-R|--recursive)
+
+# --- privilege / in-place edit (existing hard-stops) ---
+(^|[[:space:]])sudo([[:space:]]|$)
+(^|[[:space:]])sed[[:space:]]+-i
