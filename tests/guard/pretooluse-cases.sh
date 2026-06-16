@@ -5,7 +5,8 @@
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-guard="$repo_root/tools/pretooluse-guard.sh"
+# GUARD_OVERRIDE lets maintenance verify a candidate guard (e.g. tmp/guard-new.sh) before swap-in.
+guard="${GUARD_OVERRIDE:-$repo_root/tools/pretooluse-guard.sh}"
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -102,6 +103,31 @@ echo "== shell mutation of rails (maintenance-gated) =="
 expect_cmd block "append to AGENTS.md"        'echo x >> AGENTS.md'
 expect_cmd block "tee into policy"            'echo x | tee policy/deny.patterns'
 expect_cmd allow "read AGENTS.md (cat)"       'cat AGENTS.md'
+
+echo "== false-positive fixes: now ALLOWED (data / non-write redirects) =="
+expect_cmd allow "ls rail, stderr->null"       'ls ~/.codex 2>/dev/null'
+expect_cmd allow "cat rail, stderr->null"      'cat .claude/settings.json 2>/dev/null'
+expect_cmd allow "git status 2>&1"             'git status 2>&1'
+expect_cmd allow "cat .env, stderr->null"      'cat .env 2>/dev/null'
+expect_cmd allow "msg mentions rail+verb"      'git commit -m "update doctrine/ and the guard"'
+expect_cmd allow "msg mentions git push"       'git commit -m "block git push in the guard"'
+expect_cmd allow "msg mentions pull"           'git commit -m "fix pull handling"'
+expect_cmd allow "msg single-quoted rail"      "git commit -m 'tidy doctrine/ and the guard'"
+expect_cmd allow "--message long form"         'git commit --message "discuss tee and rm in policy/"'
+
+echo "== false-positive fixes: MUST STILL DENY (executable / substitution / real writes) =="
+expect_cmd block "sh -c push (not a msg flag)" 'sh -c "git push"'
+expect_cmd block "bash -c push"                "bash -c 'git push'"
+expect_cmd block "eval push"                   'eval "git push"'
+expect_cmd block "cmd-subst push in -m"        'git commit -m "$(git push)"'
+expect_cmd block "backtick push in -m"         'git commit -m "`git push`"'
+expect_cmd block "cmd-subst rail-write in -m"  'git commit -m "$(echo x > doctrine/y)"'
+expect_cmd block "real rail redirect write"    'echo x > doctrine/foo.md'
+expect_cmd block "real rail append write"      'echo x >> AGENTS.md'
+expect_cmd block "tee rail (piped)"            'echo x | tee .claude/settings.json'
+expect_cmd block "sed -i rail"                 'sed -i s/a/b/ policy/deny.patterns'
+expect_cmd block "stderr redirected INTO rail" 'run 2> doctrine/err.log'
+expect_cmd block "real rm after stripped msg"  'git commit -m "tidy"; rm doctrine/x'
 
 printf '\nSUMMARY failures=%s\n' "$failures"
 [ "$failures" -eq 0 ]

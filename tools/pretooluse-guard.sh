@@ -84,37 +84,60 @@ esac
 # ---------------------------------------------------------------------------
 hay="${cmd:-$input}"
 
+# scan = hay with safe message-flag DATA removed. The quoted literal argument of -m / --message / -F
+# is message text, not an operation, so it must not be matched as one. Strip it ONLY when it is a
+# plain quoted literal with no command substitution / expansion ($(  `  ${ ) — so anything that can
+# execute stays fully matched. -c (e.g. `sh -c "git push"`) is NOT a message flag and is never stripped.
+scan="$hay"
+scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*'[^'\$\`]*'/\1 /g")"
+scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*\"[^\"\$\`]*\"/\1 /g")"
+
+q="[\"']"                    # an optional quote in front of a redirect target
+fw='(^|[^0-9&])>>?([^&]|$)'  # a FILE-write redirect (> or >>), excluding fd forms (2>, N>, >&N, &>)
+
 # 1) remote integrity: push / pull / remote merge-rebase / PR / remote-config
-match_any "$hay" "$pol/deny.patterns" \
+match_any "$scan" "$pol/deny.patterns" \
   && block "remote git operation (push / pull / remote merge or rebase / PR / remote-config) is forbidden — the human owns the remote and the merge gate" "git-workflow.md"
 
 # 2) destructive / integrity carve-out
-match_any "$hay" "$pol/carveout.patterns" \
+match_any "$scan" "$pol/carveout.patterns" \
   && block "destructive/integrity operation is forbidden under autonomy — ask the human first" "destructive-ops.md"
 
 # 3) containment hard-stops (always on; not maintenance-gated) — kept verbatim from the substrate
-printf '%s' "$hay" | grep -Eq 'docker\.sock' \
+printf '%s' "$scan" | grep -Eq 'docker\.sock' \
   && block "mounting the Docker socket is forbidden (host-escape surface)" "containment.md"
-printf '%s' "$hay" | grep -Eq '(--privileged|privileged[[:space:]]*:[[:space:]]*true)' \
+printf '%s' "$scan" | grep -Eq '(--privileged|privileged[[:space:]]*:[[:space:]]*true)' \
   && block "privileged containers are forbidden" "containment.md"
-printf '%s' "$hay" | grep -Eq '(--network[=[:space:]]host|--net[=[:space:]]host|network_mode[[:space:]]*:[[:space:]]*.?host)' \
+printf '%s' "$scan" | grep -Eq '(--network[=[:space:]]host|--net[=[:space:]]host|network_mode[[:space:]]*:[[:space:]]*.?host)' \
   && block "host networking is forbidden (breaks default-deny)" "containment.md"
-if printf '%s' "$hay" | grep -Eq '(\.env([^a-zA-Z]|$)|secrets/|\.pem|\.key|\.kdbx)'; then
-  printf '%s' "$hay" | grep -Eq '(>>?|[[:space:]]tee[[:space:]]|sed[[:space:]]+-i|[[:space:]]cp[[:space:]]|[[:space:]]mv[[:space:]]|truncate)' \
-    && block "writing to .env / secrets / key material via shell is forbidden" "containment.md"
+# secret/key material: block a FILE-write redirect, a redirect whose TARGET is a secret, or a
+# mutating command acting on one. A stderr-only redirect (`2>/dev/null`) is not a write, and reads
+# are not blocked here (Read-deny is enforced by the per-tool adapters).
+if printf '%s' "$scan" | grep -Eq '(\.env([^a-zA-Z]|$)|secrets/|\.pem|\.key|\.kdbx)'; then
+  if printf '%s' "$scan" | grep -Eq "$fw" \
+    || printf '%s' "$scan" | grep -Eq ">>?[[:space:]]*${q}?(\.env|secrets/|[^[:space:]]*\.(pem|key|kdbx))" \
+    || printf '%s' "$scan" | grep -Eq '(^|[[:space:]])(tee|cp|mv|truncate)[[:space:]]|sed[[:space:]]+-i'; then
+    block "writing to .env / secrets / key material via shell is forbidden" "containment.md"
+  fi
 fi
 
-# 4) control-plane / guardrail integrity (maintenance-gated): shell mutation of the rails
+# 4) control-plane / guardrail integrity (maintenance-gated): shell MUTATION of the rails.
+#    A "mutation" is a FILE-write redirect while a rail is referenced, a redirect whose TARGET is a
+#    rail, or a mutating command (tee/rm/mv/cp/truncate/install/sed -i) with a rail referenced. A bare
+#    stderr redirect next to a rail token (e.g. `cat .claude/x 2>/dev/null`) is a read, not a mutation.
 if [ "$maint" != 1 ]; then
   alt="$(protected_alternation)"
-  if [ -n "$alt" ] && printf '%s' "$hay" | grep -Eq "($alt)"; then
-    printf '%s' "$hay" | grep -Eq '(>>?|[[:space:]]tee[[:space:]]|sed[[:space:]]+-i|[[:space:]]rm[[:space:]]|[[:space:]]mv[[:space:]]|[[:space:]]cp[[:space:]]|truncate|[[:space:]]install[[:space:]])' \
-      && block "mutating a protected rail (config / doctrine / guard / policy) via shell is a maintenance-only action — set AGENT_LAB_MAINTENANCE=1" "meta.md"
+  if [ -n "$alt" ] && printf '%s' "$scan" | grep -Eq "($alt)"; then
+    if printf '%s' "$scan" | grep -Eq "$fw" \
+      || printf '%s' "$scan" | grep -Eq ">>?[[:space:]]*${q}?($alt)" \
+      || printf '%s' "$scan" | grep -Eq '(^|[[:space:]])(tee|rm|mv|cp|truncate|install)[[:space:]]|sed[[:space:]]+-i'; then
+      block "mutating a protected rail (config / doctrine / guard / policy) via shell is a maintenance-only action — set AGENT_LAB_MAINTENANCE=1" "meta.md"
+    fi
   fi
 fi
 
 # 5) branch backstop: never commit on master/main (covers a skipped SessionStart bootstrap)
-if printf '%s' "$hay" | grep -Eq '(^|[^[:alnum:]_])git[[:space:]]+commit([[:space:]]|$)'; then
+if printf '%s' "$scan" | grep -Eq '(^|[^[:alnum:]_])git[[:space:]]+commit([[:space:]]|$)'; then
   br="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
   case "$br" in
     master | main) block "refusing to commit on '$br' — create an agent/<tool>/<slug> branch first (SessionStart normally does this)" "git-workflow.md" ;;
