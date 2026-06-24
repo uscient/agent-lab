@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security Vulnerability Report
+    url: https://github.com/uscient/agent-lab/blob/master/SECURITY.md
+    about: Please report security issues privately via the channel described in SECURITY.md. Do not open a public issue.
+  - name: ❓ Usage questions or help running the lab
+    url: https://github.com/uscient/agent-lab#readme
+    about: This repo is published for reference. Refer to the README, docs/, and code comments. We do not provide public user support or triage.
+  - name: 📖 Project documentation
+    url: https://github.com/uscient/agent-lab
+    about: Start with the README. Most answers are already in the repo.

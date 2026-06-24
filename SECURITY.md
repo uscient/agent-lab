@@ -30,7 +30,7 @@ Stop work and report before continuing if tracked source contains or introduces:
 
 Agent and test containers must attach only to the internal `agents` network. Only `egress-proxy` may attach to both `agents` and `egress`.
 
-No service publishes public ports in v0. Future operator-facing ports must bind to `127.0.0.1` unless explicitly approved.
+No service publishes public ports. Any operator-facing ports must bind to `127.0.0.1` unless explicitly approved.
 
 The Docker socket must never be mounted into an agent container. Host home directories, SSH directories, cloud-drive roots, browser profiles, and password-manager data must never be mounted into agent containers.
 
@@ -40,4 +40,8 @@ Domain allowlisting controls where traffic can go. It does not control what an a
 
 ## Vulnerability Reporting
 
-This is a private lab. Report suspected boundary bypasses, secret exposure, or dangerous defaults to the repository owner through the private project channel used for this repository.
+**This is a closed project.** Do not open public GitHub issues for security matters.
+
+Report suspected boundary bypasses, secret exposure, or dangerous defaults to the repository owner through the private project channel used for this repository.
+
+See also the contributing policy in the repository for details on external vs. internal participation.

@@ -1,7 +1,7 @@
 # policy/carveout.patterns — destructive / integrity carve-out (denied under autonomy).
 # Read by tools/pretooluse-guard.sh. Doctrine: doctrine/destructive-ops.md.
 # This is the THINNEST enforcement layer (raw-string regex, no credential wall, shim covers only
-# git/gh). It reliably stops accidents and casual evasion under autonomy (its D6 job); it is NOT
+# git/gh). It reliably stops accidents and casual evasion under autonomy; it is NOT
 # adversary-proof — a hostile agent is contained by the sandbox, not by these patterns.
 
 # --- history rewrite / irreversible git ---

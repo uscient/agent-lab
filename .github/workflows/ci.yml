@@ -1,0 +1,42 @@
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Lint
+        run: ./scripts/dev/lint-scripts
+
+      - name: Check + validate
+        run: |
+          ./scripts/dev/check default full
+          ./tools/validate.sh
+
+      - name: Build devbox
+        run: |
+          docker buildx build \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --load \
+            -t agent-lab/devbox:local \
+            -f images/devbox/Dockerfile .

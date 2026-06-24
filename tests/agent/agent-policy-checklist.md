@@ -1,4 +1,4 @@
-# Agent policy verification checklist (D8)
+# Agent policy verification checklist
 
 Two layers:
 - **Tool-agnostic [probe]:** `bash tests/agent/policy-verify.sh` (guard, shims, token budget,
@@ -49,5 +49,5 @@ printf '{"tool_input":{"command":"git push origin HEAD"}}' | tools/pretooluse-gu
 ```
 
 ## Notes / known exceptions
-- **Codex `git fetch` (#6) is N/A by design** (network-off); refresh remote outside the session (see `docs/agent-config.md`). Pending scope-D4 sign-off.
+- **Codex `git fetch` (#6) is N/A by design** (network-off); refresh remote outside the session (see `docs/agent-config.md`).
 - The string-matching guard is **defense-in-depth**; argv-level shims (`tools/bin`) cover variable-indirection evasions; **containment is the real boundary**.

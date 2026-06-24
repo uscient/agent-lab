@@ -131,7 +131,7 @@ else
   pass ".env.local has no obvious secret-looking assignments"
 fi
 
-if (cd "$REPO_ROOT" && git grep -I -n -E '([A-Z0-9_]*(TOKEN|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*[[:space:]]*[:=][[:space:]]*["'\'']?[A-Za-z0-9_./+=-]{16,}|BEGIN (RSA |OPENSSH |EC |DSA |)PRIVATE KEY)' -- . ':!PLAN.md' >/dev/null); then
+if (cd "$REPO_ROOT" && git grep -I -n -E '([A-Z0-9_]*(TOKEN|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*[[:space:]]*[:=][[:space:]]*["'\'']?[A-Za-z0-9_./+=-]{16,}|BEGIN (RSA |OPENSSH |EC |DSA |)PRIVATE KEY)' -- . >/dev/null); then
   fail "tracked source contains obvious secret-looking assignments or private keys"
 else
   pass "no obvious tracked secret patterns"

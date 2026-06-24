@@ -14,7 +14,7 @@
 #
 # Codex notes: execpolicy is TOKEN-prefix, so path-prefixes (./scripts/dev/) and remote refs
 # (origin/*) cannot be expressed as rules — the guard enforces those; workspace-write auto-runs
-# in-workspace commands. 'git fetch' is omitted for Codex (network-off by design, v1).
+# in-workspace commands. 'git fetch' is omitted for Codex (network-off by design).
 #
 # Idempotent. Run as a maintenance task:  AGENT_LAB_MAINTENANCE=1 tools/render-adapters.sh
 set -euo pipefail
@@ -86,12 +86,12 @@ emit_codex() {
     echo "# Codex execpolicy: allow local git + forbid remote git/PR. The PreToolUse guard"
     echo "# (tools/pretooluse-guard.sh) is the AUTHORITATIVE denier; these are belt-and-suspenders."
     echo "# Token-based: path-prefixes and origin/* refs are guard-enforced, not expressible here."
-    echo "# CODEX_V1: 'git fetch' intentionally omitted — workspace-write sandbox is network-off."
+    echo "# 'git fetch' intentionally omitted — workspace-write sandbox is network-off."
     echo
     echo "# -- allow: local git (clean token prefixes only; workspace-write auto-runs the rest) --"
     for c in "${ALLOW[@]}"; do
       case "$c" in
-        "git fetch") echo "# CODEX_V1: [\"git\",\"fetch\"] N/A — network-off" ;;
+        "git fetch") echo "# [\"git\",\"fetch\"] N/A — network-off" ;;
         git\ *) printf 'prefix_rule(pattern = [%s], decision = "allow", justification = "agent-lab local-git set")\n' "$(toks "$c")" ;;
         shellcheck) printf 'prefix_rule(pattern = ["shellcheck"], decision = "allow", justification = "agent-lab lint")\n' ;;
       esac

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-# M1 self-build scaffold for OpenClaw.
+# Self-build scaffold for OpenClaw.
 # Build context must be the verified source directory produced by
 # scripts/openclaw-fetch-source. Do not clone moving branches in this Dockerfile.
 
@@ -120,21 +120,21 @@ ARG OPENCLAW_BUNDLED_PLUGIN_DIR
 ARG OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST
 
 LABEL org.opencontainers.image.title="agent-lab OpenClaw" \
-  org.opencontainers.image.description="Self-built OpenClaw runtime scaffold for agent-lab locked v0 hardening" \
+  org.opencontainers.image.description="Self-built OpenClaw runtime scaffold for agent-lab locked hardening" \
   org.opencontainers.image.source="${OPENCLAW_SOURCE_REPO}" \
   org.opencontainers.image.revision="${OPENCLAW_SOURCE_COMMIT}" \
   org.opencontainers.image.base.name="docker.io/library/node:24-bookworm-slim" \
   org.opencontainers.image.base.digest="${OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST}" \
   agent-lab.profile="openclaw" \
-  agent-lab.capability-posture="locked-v0-build-scaffold" \
+  agent-lab.capability-posture="locked-build-scaffold" \
   agent-lab.openclaw.sandbox="disabled" \
   agent-lab.openclaw.browser="not-installed" \
   agent-lab.openclaw.docker-cli="not-installed"
 
 WORKDIR /app
 
-# Keep the first runtime close to upstream. Package reduction is an M2+ task
-# after locked-mode behavior is proven. This intentionally does not install
+# Keep the first runtime close to upstream. Package reduction is deferred
+# until locked-mode behavior is proven. This intentionally does not install
 # Docker CLI, Chromium, Playwright browser binaries, or OpenClaw sandbox support.
 RUN --mount=type=cache,id=agent-lab-openclaw-apt-cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=agent-lab-openclaw-apt-lists,target=/var/lib/apt,sharing=locked \
@@ -195,7 +195,7 @@ ENV HOME=/home/node \
 
 USER node
 
-# M2/M3 must verify this probe remains valid after locked config/preflight is added.
+# Later work must verify this probe remains valid after locked config/preflight is added.
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 

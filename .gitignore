@@ -51,3 +51,7 @@ node_modules/
 # Docker compose override files may contain local paths or secrets
 compose.override.yaml
 compose.*.override.yaml
+
+# Temp location for machine account token (used for xor-machine auth while commits appear as xormania)
+# Will be deleted after setup. Never commit tokens.
+/tmp/ignore/

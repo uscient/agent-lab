@@ -140,7 +140,7 @@ run_allowlisted() {
   expect_success "Docker socket is absent" docker_socket_absent
   expect_success "root filesystem write fails" root_filesystem_read_only
   expect_success "explicit tmpfs path is writable" tmp_is_writable
-  todo "SNI mismatch protection is M3: Squid CONNECT host allowlisting is enforced, TLS SNI peek/splice is not enabled"
+  todo "SNI mismatch protection not implemented: Squid CONNECT host allowlisting is enforced, TLS SNI peek/splice is not enabled"
 }
 
 run_fail_closed() {
