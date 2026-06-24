@@ -10,7 +10,7 @@ Files:
 Example:
 
 ```bash
-./scripts/dev/guard-diff M2
+./scripts/dev/guard-diff release
 ```
 
-Then `.devguard/forbid-M2.txt` is applied in addition to defaults.
+Then `.devguard/forbid-release.txt` is applied in addition to defaults.

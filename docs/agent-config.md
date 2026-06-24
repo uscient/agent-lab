@@ -1,4 +1,4 @@
-# Agent configuration — setup & maintenance (D7)
+# Agent configuration — setup & maintenance
 
 How the three coding agents that **develop Agent Lab** (Claude Code, Codex, Grok) are configured to
 work autonomously inside a hard boundary: commit locally, never push/PR, never weaken containment.
@@ -71,13 +71,13 @@ native `deny`; protected-path read-only enforcement is left to the guard's `Edit
 
 | Tool | Setup |
 |---|---|
-| **Claude Code** | No trust step. `.claude/settings.json` is auto-loaded (delete the legacy `.claude/settings.local.json`). |
+| **Claude Code** | No trust step. `.claude/settings.json` is auto-loaded. |
 | **Codex** | Trust the project so `.codex/` (config, hooks, rules) loads — Codex ignores an untrusted project's `.codex/`. Verify with a guard-fired check (a deliberately-bad command must print the guard's BLOCKED message). |
-| **Grok** | Trust project hooks, or `.grok/hooks/` are **silently skipped** (D4 would falsely pass). Use `grok inspect` to confirm hooks/config were discovered, then run the guard-fired check. |
+| **Grok** | Trust project hooks, or `.grok/hooks/` are **silently skipped** (and a policy check would falsely pass). Use `grok inspect` to confirm hooks/config were discovered, then run the guard-fired check. |
 
-### Codex network-off runbook (intentional D4 deviation — pending scope sign-off)
+### Codex network-off runbook (intentional design decision)
 
-Codex v1 runs `sandbox_mode = "workspace-write"` with `network_access = false`. That blocks push
+Codex runs `sandbox_mode = "workspace-write"` with `network_access = false`. That blocks push
 (good) **and** `git fetch`. So **`git fetch` is not available inside a Codex session — by design.**
 Refresh remote state *outside* Codex **before** the session starts:
 
@@ -86,9 +86,8 @@ git fetch origin          # human / CI / wrapper, before launching codex
 codex …                   # works against the freshly-fetched local refs
 ```
 
-Do **not** add a network-on Codex profile to "fix" fetch in v1 — enabling network would remove the
-sandbox layer from the push denial. (This deviates from scope D4's "fetch allowed" line and needs the
-human's sign-off.)
+Do **not** add a network-on Codex profile to "fix" fetch — enabling network would remove the
+sandbox layer from the push denial. Keeping fetch outside the session is the deliberate trade-off.
 
 ## Forbidden flags (never use these as the autonomy mechanism)
 
@@ -125,9 +124,3 @@ may be doing unrelated work; the dev git-policy does not apply inside them.
   `AGENT_LAB_PROJECT_DIR` at the repo root (RW) with a coding-agent image — caller configuration,
   not a baked runtime role. The repo-scoped configs travel with the repo, so an agent editing Agent
   Lab inherits the dev policy wherever it runs.
-
-## Superseded
-
-`OVERLAY-README.md` documents the **old** overlay posture (never-commit, plan-mode default) that this
-overhaul inverts (commits are now allowed; autonomy is broad inside the boundary). Treat it as
-**superseded** by this document; remove it once no workflow references it.

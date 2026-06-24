@@ -2,7 +2,7 @@
 
 CoreDNS is the resolver pinned into agent/test containers on the internal `agents` network.
 
-The v0 Corefile:
+The Corefile:
 
 - Listens on port 53 inside the `agents` network.
 - Logs queries to container stdout.
@@ -13,4 +13,4 @@ The v0 Corefile:
 
 External name resolution for allowed outbound requests is done by Squid on the `egress` network. Agent/test containers should not receive arbitrary external A or AAAA records.
 
-CoreDNS does not write query logs into the `audit` volume in v0 because the stock CoreDNS log plugin writes to stdout. Squid proxy logs are stored in `audit`.
+CoreDNS does not write query logs into the `audit` volume because the stock CoreDNS log plugin writes to stdout. Squid proxy logs are stored in `audit`.

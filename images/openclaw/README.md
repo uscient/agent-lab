@@ -1,14 +1,14 @@
 # OpenClaw Image Scaffold
 
-This directory is the M1 source-pin and self-build scaffold for OpenClaw.
+This directory is the source-pin and self-build scaffold for OpenClaw.
 
 ## Strategy
 
 `agent-lab` builds its OpenClaw image from a verified pinned upstream source commit. The upstream GHCR image is useful reference material, but it is not a trust anchor for this integration.
 
-M1 does not run OpenClaw, does not create a Compose runtime profile, does not onboard, and does not add model/provider access or secrets.
+This scaffold does not run OpenClaw, does not create a Compose runtime profile, does not onboard, and does not add model/provider access or secrets.
 
-The v0 image preserves upstream runtime assumptions until a later milestone proves safe overrides:
+The image preserves upstream runtime assumptions until safe overrides are proven:
 
 - user: `node`, uid `1000`
 - config: `/home/node/.openclaw`
@@ -18,9 +18,9 @@ The v0 image preserves upstream runtime assumptions until a later milestone prov
 
 ## Hard Boundaries For Future Runtime Work
 
-The locked v0 runtime must have no Docker socket, no host home mounts, no broad host binds, no public bind, no `host.docker.internal`, no browser binaries, no Docker CLI, no messaging channels, no MCP servers, no plugin or skill install surface, no exec/shell/process tools, and no secrets in Compose environment.
+The locked runtime must have no Docker socket, no host home mounts, no broad host binds, no public bind, no `host.docker.internal`, no browser binaries, no Docker CLI, no messaging channels, no MCP servers, no plugin or skill install surface, no exec/shell/process tools, and no secrets in Compose environment.
 
-OpenClaw sandboxing stays disabled in v0 because the Docker backend requires Docker socket access.
+OpenClaw sandboxing stays disabled because the Docker backend requires Docker socket access.
 
 ## Source Fetch Workflow
 
@@ -38,8 +38,8 @@ Build the local development image without running it:
 ./images/openclaw/build.sh
 ```
 
-## Next Milestones
+## Planned Work
 
-- M2: build verification, image inspection, SBOM, and vulnerability scan.
-- M3: schema-verified locked capability config and fail-closed preflight.
-- M4: hardened Compose gateway profile on a dedicated internal network.
+- Build verification, image inspection, SBOM, and vulnerability scan.
+- Schema-verified locked capability config and fail-closed preflight.
+- Hardened Compose gateway profile on a dedicated internal network.

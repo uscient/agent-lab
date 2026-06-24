@@ -1,8 +1,8 @@
 # Squid Egress Proxy
 
-Squid is the only v0 service attached to both the internal `agents` network and the internet-capable `egress` network.
+Squid is the only service attached to both the internal `agents` network and the internet-capable `egress` network.
 
-The v0 policy:
+The policy:
 
 - Listens on port `3128` inside Docker networks only.
 - Allows clients only from `172.30.0.0/24`.
@@ -17,9 +17,9 @@ The v0 policy:
 
 ## TLS/SNI Status
 
-TLS SNI peek/splice is not implemented in v0. Squid currently enforces the CONNECT hostname/domain allowlist before tunneling HTTPS, but it does not inspect the TLS ClientHello SNI.
+TLS SNI peek/splice is not implemented. Squid currently enforces the CONNECT hostname/domain allowlist before tunneling HTTPS, but it does not inspect the TLS ClientHello SNI.
 
-This means v0 has not proven protection against a crafted client that CONNECTs to an allowed hostname while sending a different SNI value inside TLS. That is an M3 TODO and must be validated before claiming SNI mismatch protection.
+This means the lab has not proven protection against a crafted client that CONNECTs to an allowed hostname while sending a different SNI value inside TLS. That remains a TODO and must be validated before claiming SNI mismatch protection.
 
 ## Hardening Status
 

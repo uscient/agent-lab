@@ -21,7 +21,7 @@ printf '%s\n' "$log" | awk -v today="$(date -u +%Y-%m-%d)" '
     print "# Squid egress harvest -- candidate allowlist recipe (REVIEW ONLY; never auto-applied)."
     print "# Generated: " today
     print "# NOTE: only proxy-mediated attempts appear here. Raw direct (non-proxy) attempts are"
-    print "# route-blocked by the internal network and are NOT logged in v0."
+    print "# route-blocked by the internal network and are NOT logged."
     print "#"
   }
   {

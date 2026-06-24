@@ -37,6 +37,6 @@ After allowlisted mode is verified, the script stops `egress-proxy` and reruns a
 
 ## Not Yet Proven
 
-SNI mismatch protection is not implemented in v0. The test output includes a `NOT_IMPLEMENTED` line for this case so it is visible rather than silently skipped. M3 should add validated Squid peek/splice behavior or a different proven SNI control.
+SNI mismatch protection is not implemented. The test output includes a `NOT_IMPLEMENTED` line for this case so it is visible rather than silently skipped. A future change should add validated Squid peek/splice behavior or a different proven SNI control.
 
-Raw direct egress attempts are blocked by the internal network but are not logged in v0. Only proxy-mediated attempts are logged by Squid.
+Raw direct egress attempts are blocked by the internal network but are not logged. Only proxy-mediated attempts are logged by Squid.

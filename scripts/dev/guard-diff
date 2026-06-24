@@ -41,7 +41,7 @@ done
 
 # Optional repo-specific guard files:
 # .devguard/forbid-default.txt
-# .devguard/forbid-M2.txt
+# .devguard/forbid-release.txt
 for gf in ".devguard/forbid-default.txt" ".devguard/forbid-${scope}.txt"; do
   if test -f "$gf"; then
     while IFS= read -r pat; do
