@@ -13,6 +13,36 @@ attempt=0
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
+query_internal_a() {
+  local name="$1"
+  docker exec "$probe" dig +comments +noquestion +answer +time=1 +tries=1 \
+    "@${LAB_DNS_IP}" "$name" A 2>&1 || true
+}
+
+dns_a_answers() {
+  awk '
+    $4 == "A" {
+      answers = answers (answers == "" ? "" : ",") $5
+    }
+    END {
+      print answers
+    }
+  '
+}
+
+report_internal_dns_mismatch() {
+  local name="$1" expected="$2" output="$3"
+  local answers header
+  answers="$(printf '%s\n' "$output" | dns_a_answers)"
+  header="$(
+    printf '%s\n' "$output" |
+      grep -m 1 -E '(^;; ->>HEADER<<-|communications error|no servers could be reached)' ||
+      true
+  )"
+  printf 'INFO DNS response name=%s expected=%s answers=%s header=%s\n' \
+    "$name" "$expected" "${answers:-<none>}" "${header:-<no DNS response header>}"
+}
+
 if ! docker_test_agent "base" true >/dev/null; then
   docker_test_infra "could not start DNS fixture substrate"
   exit 125
@@ -36,30 +66,40 @@ else
   fail "effective resolver file uses the configured Docker/CoreDNS path"
 fi
 
-internal_dns="$(
-  docker exec "$probe" dig +short "@${LAB_DNS_IP}" dns.agent-lab.local A |
-    grep -Ev '^$' || true
-)"
-internal_proxy="$(
-  docker exec "$probe" dig +short "@${LAB_DNS_IP}" egress-proxy.agent-lab.local A |
-    grep -Ev '^$' || true
-)"
+internal_dns_out="$(query_internal_a dns.agent-lab.local)"
+internal_proxy_out="$(query_internal_a egress-proxy.agent-lab.local)"
+internal_dns="$(printf '%s\n' "$internal_dns_out" | dns_a_answers)"
+internal_proxy="$(printf '%s\n' "$internal_proxy_out" | dns_a_answers)"
 if [ "$internal_dns" = "$LAB_DNS_IP" ] && [ "$internal_proxy" = "$LAB_PROXY_IP" ]; then
   pass "exact internal A records resolve to their configured addresses"
 else
   fail "exact internal A records resolve to their configured addresses"
+  if [ "$internal_dns" != "$LAB_DNS_IP" ]; then
+    report_internal_dns_mismatch \
+      dns.agent-lab.local "$LAB_DNS_IP" "$internal_dns_out"
+  fi
+  if [ "$internal_proxy" != "$LAB_PROXY_IP" ]; then
+    report_internal_dns_mismatch \
+      egress-proxy.agent-lab.local "$LAB_PROXY_IP" "$internal_proxy_out"
+  fi
 fi
 
 assert_nxdomain() {
   local name="$1"
   shift
-  local output
+  local header output
   output="$(docker exec "$probe" dig +comments +noquestion +time=2 +tries=1 "$@" 2>&1)" ||
     true
   if agent_lab_dns_result_is_nxdomain "$output"; then
     pass "$name"
   else
     fail "$name"
+    header="$(
+      printf '%s\n' "$output" |
+        grep -m 1 -E '(^;; ->>HEADER<<-|communications error|no servers could be reached)' ||
+        true
+    )"
+    printf 'INFO DNS response: %s\n' "${header:-<no DNS response header>}"
   fi
 }
 
@@ -149,11 +189,10 @@ fi
 docker start "$dns_id" >/dev/null
 attempt=0
 restored=""
+restored_out=""
 while [ "$attempt" -lt 30 ]; do
-  restored="$(
-    docker exec "$probe" dig +short +time=1 +tries=1 \
-      "@${LAB_DNS_IP}" dns.agent-lab.local A 2>/dev/null || true
-  )"
+  restored_out="$(query_internal_a dns.agent-lab.local)"
+  restored="$(printf '%s\n' "$restored_out" | dns_a_answers)"
   [ "$restored" = "$LAB_DNS_IP" ] && break
   sleep 1
   attempt=$((attempt + 1))
@@ -161,6 +200,8 @@ done
 if [ "$restored" = "$LAB_DNS_IP" ]; then
   pass "CoreDNS restores its exact internal record after restart"
 else
+  report_internal_dns_mismatch \
+    dns.agent-lab.local "$LAB_DNS_IP" "$restored_out"
   docker_test_infra "CoreDNS did not recover after stopped-resolver check"
   exit 125
 fi

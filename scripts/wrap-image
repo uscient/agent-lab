@@ -118,9 +118,7 @@ chmod 0755 "$entrypoint_file"
 } > "$dockerfile"
 {
   printf '*\n'
-  printf '!Dockerfile\n'
   printf '!agent-entrypoint.sh\n'
-  printf '!.dockerignore\n'
 } > "$dockerignore"
 
 printf 'Building %s\n' "$wrapped"

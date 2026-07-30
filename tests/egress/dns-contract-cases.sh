@@ -29,6 +29,41 @@ check_result() {
   fi
 }
 
+coredns_server_block() {
+  local zone="$1" corefile="$2"
+  awk -v target="$zone" '
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      if (!capture && depth == 0 && line == target " {") {
+        capture = 1
+        found = 1
+      }
+      if (capture) {
+        print
+      }
+
+      braces = $0
+      sub(/#.*/, "", braces)
+      opening = gsub(/\{/, "", braces)
+      braces = $0
+      sub(/#.*/, "", braces)
+      closing = gsub(/\}/, "", braces)
+      depth += opening - closing
+
+      if (capture && depth == 0) {
+        exit
+      }
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$corefile"
+}
+
 exact_nxdomain=';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1
 ;; flags: qr aa rd; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0'
 servfail=';; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 2
@@ -49,11 +84,26 @@ else
   pass "blocking egress checks do not accept generic SERVFAIL"
 fi
 
-if grep -Fq 'template IN A AAAA' "$repo_root/dns/coredns/Corefile" &&
-   grep -Fq 'rcode NXDOMAIN' "$repo_root/dns/coredns/Corefile"; then
-  pass "CoreDNS declares the external A and AAAA result explicitly"
+corefile="$repo_root/dns/coredns/Corefile"
+internal_block="$(coredns_server_block agent-lab.local:53 "$corefile" || true)"
+external_block="$(coredns_server_block .:53 "$corefile" || true)"
+if [ "$(grep -Fxc 'agent-lab.local:53 {' "$corefile")" -eq 1 ] &&
+   [ "$(grep -Fxc '.:53 {' "$corefile")" -eq 1 ] &&
+   printf '%s\n' "$internal_block" | grep -Fq '    hosts {' &&
+   printf '%s\n' "$internal_block" |
+     grep -Fq '        172.30.0.10 dns.agent-lab.local' &&
+   printf '%s\n' "$internal_block" |
+     grep -Fq '        172.30.0.20 egress-proxy.agent-lab.local' &&
+   ! printf '%s\n' "$internal_block" | grep -Fq 'template IN' &&
+   [ "$(printf '%s\n' "$external_block" | grep -Fxc '    template IN A {')" -eq 1 ] &&
+   [ "$(printf '%s\n' "$external_block" | grep -Fxc '    template IN AAAA {')" -eq 1 ] &&
+   [ "$(printf '%s\n' "$external_block" |
+     grep -Fxc '        rcode NXDOMAIN')" -eq 2 ] &&
+   ! printf '%s\n' "$external_block" | grep -Fq '    hosts {' &&
+   ! grep -Eq '^[[:space:]]*(fallthrough|forward)([[:space:]]|$)' "$corefile"; then
+  pass "CoreDNS isolates internal records from catch-all NXDOMAIN templates"
 else
-  fail "CoreDNS declares the external A and AAAA result explicitly"
+  fail "CoreDNS isolates internal records from catch-all NXDOMAIN templates"
 fi
 
 if [ -f "$repo_root/tests/security/docker.manifest" ] &&

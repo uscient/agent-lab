@@ -63,6 +63,26 @@ require_pinned_actions() {
   fi
 }
 
+job_has_fail_closed_tee() {
+  local job="$1"
+  job_block "$ci" "$job" | awk '
+    /set -o pipefail/ {
+      pipefail_enabled=1
+    }
+    /\| tee / {
+      pipelines++
+      if (!pipefail_enabled) {
+        exit 1
+      }
+    }
+    END {
+      if (pipelines != 1) {
+        exit 1
+      }
+    }
+  '
+}
+
 for workflow in "$ci" "$codeql"; do
   if [ -f "$workflow" ]; then
     pass "${workflow#"$repo_root/"} exists"
@@ -140,6 +160,31 @@ require_job_text docker '    name: Docker security' \
 require_job_text docker '    timeout-minutes: 45' "Docker job has a bounded runtime"
 require_job_text docker './scripts/dev/docker-gate' \
   "Docker job exposes the canonical local replay command"
+require_job_text docker 'docker/build-push-action@' \
+  "Docker job uses the supported BuildKit cache integration"
+require_job_text docker 'cache-from: type=gha,scope=devbox' \
+  "Docker job restores the explicitly scoped devbox cache"
+require_job_text docker 'cache-to: type=gha,mode=max,scope=devbox' \
+  "Docker job persists the explicitly scoped devbox cache"
+require_job_text docker 'AGENT_LAB_DEVBOX_PREBUILT: 1' \
+  "Docker gate verifies the image built by the cache-aware step"
+if ! job_block "$ci" docker | grep -Eq 'run_gate=false|reused-pr-merge'; then
+  pass "required Docker CI never self-skips without runtime evidence"
+else
+  fail "required Docker CI never self-skips without runtime evidence"
+fi
+if ! job_block "$ci" docker | grep -Fqi 'openclaw'; then
+  pass "required Docker CI never builds OpenClaw"
+else
+  fail "required Docker CI never builds OpenClaw"
+fi
+if job_has_fail_closed_tee fast &&
+   job_has_fail_closed_tee static &&
+   job_has_fail_closed_tee docker; then
+  pass "every logged gate propagates failures through tee"
+else
+  fail "every logged gate propagates failures through tee"
+fi
 
 require_job_text required-gates '    name: Required gates' \
   "aggregate job has a stable branch-protection name"
