@@ -1,176 +1,214 @@
-# Serena development integration
+# Using Serena to develop Agent Lab
 
-Serena is a repository-scoped semantic development tool for Agent Lab. It is not a workload
-dependency, an authority system, or canonical project state. `AGENTS.md`, source, and the normal
-repository checks remain authoritative.
+Serena gives coding agents symbol-aware navigation, bounded semantic editing, and Bash
+language-server diagnostics while they develop this repository. It is a contained control-plane
+helper, not a service used by workloads launched through `scripts/agent`.
 
-## Placement and pinned toolchain
+## The 30-second version
 
-`scripts/serena-mcp` starts a one-shot `compose.serena.yaml` service rather than running the host
-Serena installation or reusing the general `agent` service. The dedicated placement is necessary:
-the general service mounts workload secrets and configurable home state, while Serena needs only
-the current source tree and language-server processes.
+Remember these five facts:
 
-The runtime has:
+- the Serena project is `agent-lab-dev`;
+- Serena sees this repository at `/workspace`;
+- semantic analysis covers `.sh` and `.bash` files;
+- build the contained toolchain once with `./scripts/dev/serena-build`;
+- at the start of a coding session, activate `/workspace` explicitly and prove readiness with a
+  live symbol query.
 
-- logical project `agent-lab-dev`;
-- project root `/workspace`, bound RW from this repository;
-- private temporary RW storage over `/workspace/.serena/cache`;
-- empty or read-only overlays for Git metadata, local environment/state paths, and protected rails;
-- private, non-recursive binds plus a fail-closed child-mount and nested-`.git` preflight;
-- `network_mode: none`;
-- read-only root filesystem and tmpfs-only global Serena state;
-- no host home, secret, credential, token, Docker socket, proxy, or port;
-- non-root UID/GID, all capabilities dropped, no-new-privileges, and resource limits.
-
-The image installs the clean tree at Serena commit
-`6c1c9653700cbe644cb5a5b026b77db2f4071c36` (`1.6.2.dev0`). It prewarms
-`bash-language-server` 5.6.0 and ShellCheck 0.10.0 in Serena's exact managed layout during the
-image build. Build-time package/source access is therefore separate from the no-network runtime.
-`SERENA_USAGE_REPORTING=false` and disabled dashboard/GUI flags prevent optional outbound features
-from being attempted.
-
-The Serena source commit and direct Bash-language-server/ShellCheck versions are exact pins.
-ShellCheck is additionally checksum-verified by Serena. The npm installation is version-pinned but
-does not use an Agent Lab lockfile for its transitive dependency resolution, so the complete image
-dependency graph must not be described as content-pinned.
-
-The Serena project was created with the supported workflow:
-
-```bash
-SERENA_HOME="$(mktemp -d)" serena project create . \
-  --name agent-lab-dev \
-  --ls bash
-```
-
-The tracked `.serena/project.yml` selects Bash, UTF-8, the LSP backend, and the single workspace
-root `.`. It respects Git ignores and adds no external workspace folders. At runtime a private
-ephemeral mount covers `.serena/cache`, so symbol caches do not persist into the host checkout; the
-machine-local override is also ignored. Source and tests are not over-ignored.
-
-The stdlib-only `tests/serena/mcp-smoke.py` program is host-side test orchestration, not an Agent Lab
-runtime or workload language. It is deliberately outside the Bash-only Serena semantic scope rather
-than adding a second language server solely for the integration harness. Serena therefore does not
-semantically analyze that Python file; use ordinary editing plus its AST/static checks. This and the
-extensionless Bash limitation below are explicit remaining limitations.
-
-## Setup and client registration
-
-Build the image explicitly before starting a client:
-
-```bash
-./scripts/dev/serena-build
-```
-
-The launcher never builds or pulls during MCP startup. If the image is absent or does not carry the
-pinned source label, it fails with an actionable message. Project registrations are:
-
-| Client | Repository config | Context |
-|---|---|---|
-| Claude Code | `.mcp.json` | `claude-code` |
-| Codex | `.codex/config.toml` | `codex` |
-| Grok | generated `.grok/config.toml` | `grok` |
-
-Every registration calls `scripts/serena-mcp` without `--project` and without
-`--project-from-cwd`. That distinction is deliberate: preselecting a project removes recovery tools
-from single-project client contexts in the pinned Serena version. Registrations remove ambient
-`BASH_ENV` and `ENV` before invoking a non-login, no-profile Bash, so host startup files cannot run
-ahead of the contained launcher.
-
-## Normal agent workflow
-
-Before substantial semantic work:
-
-1. Call `get_current_config`.
-2. On a fresh session in the pinned version, expect an `isError` result containing
-   `No active project`; this is the recoverable pre-activation state, not configuration evidence.
-3. If no project is active, call `activate_project` with `/workspace`.
-4. Call `get_current_config` again and confirm project `agent-lab-dev`, context, and LSP backend.
-5. Treat the activation response as evidence for root `/workspace`, language Bash, and UTF-8.
-6. Run a live, uncached `get_symbols_overview`, `find_declaration`, or similar operation before
-   claiming language-server
-   readiness.
-
-For code exploration and change impact:
-
-1. Start with `get_symbols_overview` or a targeted `find_symbol`.
-2. Retrieve only the bodies needed for the task.
-3. Use `find_declaration` and `find_referencing_symbols` to traverse relationships.
-4. Prefer the usable bounded semantic editors: `replace_symbol_body`, `insert_before_symbol`, or
-   `insert_after_symbol` when the requested change matches a reliable symbol boundary. Broad
-   content replacement, rename, and safe-delete tools are deliberately made inactive by project
-   policy after activation. Because recoverable startup exposes the MCP schema before a project is
-   active, clients may still list those names; calls are rejected as inactive once `/workspace` is
-   active.
-5. Use ordinary text search and file editing for prose, configuration, generated data, partial
-   textual changes, or files without a reliable symbol boundary.
-6. Reinspect affected symbols and call `get_diagnostics_for_file` after edits.
-7. Run normal tests, lint, build, and containment checks independently.
-
-Serena's Bash matcher recognizes `.sh` and `.bash`, not this repository's extensionless Bash
-entrypoints. Use ordinary tools for those files and say why. An empty symbol/reference result is
-not proof of absence: first verify activation, `/workspace`, Bash selection, ignore handling,
-language-server readiness, and logs. Do not conceal a Serena failure by silently falling back or
-claim semantic verification after only text search.
-
-The pinned version has no `check_onboarding_performed` tool. Inspect the activation response and
-call `list_memories`. No project memories are currently persisted because the repository guidance
-already supplies canonical architecture and commands. If future onboarding is useful, activate
-`/workspace` first and keep memories factual, project-specific, and free of secrets, tokens,
-container IDs, and host-only paths.
-
-## Distinct health states
-
-| State | Required evidence |
-|---|---|
-| MCP connected | `initialize` and `tools/list` succeed through `scripts/serena-mcp` |
-| Project visible | `activate_project("/workspace")` resolves the tracked project |
-| Project active | activation names `agent-lab-dev`; follow-up configuration confirms it |
-| Language server launched | runtime process evidence shows `bash-language-server` |
-| Language server ready | an uncached per-run fixture overview and live declaration request succeed |
-| Semantic extraction working | `agent_lab_validate_config` is returned from `scripts/lib/config.sh` |
-| Relationships working | `agent_lab_validate_boolean` resolves to referencing symbol `agent_lab_validate_config` |
-| Semantic editing working | a disposable fixture symbol is replaced, retrieved, and remains free of Error diagnostics |
-| Diagnostics working | a controlled invalid `.sh` fixture returns Error codes `SC1072` and `SC1073` |
-| Repository verification working | an existing Agent Lab test runs independently |
-
-These states must not be collapsed into “Serena works.” MCP startup and project configuration do
-not prove language-server readiness.
-
-## Deterministic smoke
-
-Run:
+One-time setup:
 
 ```bash
 ./scripts/dev/serena-build
 ./scripts/dev/serena-smoke
 ```
 
-The smoke parses and executes the exact command and arguments from each repository client
-registration while its process working directory is nested at `tests/serena`; this prevents a
-repo-root working directory from masking registration path errors. It then speaks newline-delimited
-MCP JSON-RPC for Codex, Claude, and Grok contexts, initializes MCP, lists required tools, and performs
-`get_current_config` (expected pre-activation `isError`) → `activate_project("/workspace")` →
-`get_current_config`. Each context calls `list_memories`, creates a unique valid Bash fixture, and
-requires an uncached symbol overview plus a live definition traversal before inspecting real Agent
-Lab source. The Codex pass additionally:
+At the start of each agent session, use Serena tools in this order:
 
-- replaces one complete symbol in the disposable fixture, retrieves the edited body, and checks it
-  for Error diagnostics;
-- extracts `agent_lab_validate_config`;
-- resolves the declaration of `agent_lab_validate_boolean`;
-- finds `agent_lab_validate_config` as its same-file referencing symbol;
-- creates and removes a controlled invalid Bash fixture and requires parsed `Error` diagnostics
-  `SC1072` and `SC1073`;
-- verifies the live `bash-language-server` process and container hardening;
-- records current memory/onboarding state for every context.
+```text
+get_current_config
+activate_project(project="/workspace")       # when the project is absent or wrong
+get_current_config
+get_symbols_overview(relative_path="scripts/lib/config.sh")
+```
 
-It then runs `tests/agent/config-guard.sh` independently of Serena. Any missing stage exits nonzero
-and prints the failed RPC result plus recent Serena/container logs. A successful handshake followed
-by a failed semantic operation is a failed smoke. Disposable fixtures are removed only after their
-MCP server has stopped.
+The final operation matters. A connected MCP server and an active project do not prove that the
+Bash language server is ready.
 
-Run the full repository gates separately:
+## Mental model
+
+```text
+Claude / Codex / Grok
+        │ repository MCP registration
+        ▼
+scripts/serena-mcp
+        │ one-shot Docker Compose service
+        ▼
+no-network Serena container ── Bash language server
+        │
+        └── /workspace = this Agent Lab checkout
+
+scripts/agent ── contained experimental workload (a separate path)
+```
+
+Serena can read and edit the project source at `/workspace`. Git metadata, local environment and
+agent-state paths, and protected rails are hidden or overlaid read-only. Its project cache is a
+private temporary mount, and its global state is tmpfs-only. It receives no host home directory,
+credentials, secrets, Docker socket, proxy configuration, port, or network access.
+
+That separation is deliberate. Serena helps an agent develop Agent Lab without becoming an Agent
+Lab runtime dependency, authority system, or source of truth. Repository files, `AGENTS.md`, and
+the normal checks remain authoritative.
+
+## One-time setup
+
+From the repository root, build the pinned development image:
+
+```bash
+./scripts/dev/serena-build
+```
+
+The launcher never builds or pulls at MCP startup. If the image is absent or stale, it exits with a
+message directing you back to this command. Once the image exists, start or reload a supported
+client from this checkout so it reads the repository-scoped registration. See
+[Development-client configuration](agent-config.md) for client discovery and Codex project-trust
+details.
+
+| Client | Registration | Serena context |
+|---|---|---|
+| Claude Code | `.mcp.json` | `claude-code` |
+| Codex | `.codex/config.toml` | `codex` |
+| Grok | generated `.grok/config.toml` | `grok` |
+
+Then verify the complete integration:
+
+```bash
+./scripts/dev/serena-smoke
+```
+
+The smoke is required after setup, after changing the integration, and when troubleshooting. It is
+not a command that must run before every ordinary coding session.
+
+Do not use Serena's user-global setup commands for this repository. Do not add `--project` or
+`--project-from-cwd` to a registration: the clients intentionally start without a fixed project so
+the explicit activation recovery path remains available.
+
+## Start every coding session
+
+1. Call `get_current_config`.
+2. A fresh session may return an `isError` result containing `No active project`. This is an
+   expected, recoverable state.
+3. If no project is active, or the active project/root is wrong, call `activate_project` with
+   `/workspace`.
+4. Call `get_current_config` again. Confirm project `agent-lab-dev`, the client context, and the LSP
+   backend.
+5. Confirm that activation reports root `/workspace`, language Bash, and UTF-8.
+6. Run an uncached, live semantic operation on a relevant `.sh` or `.bash` file before relying on
+   symbol or diagnostic results.
+
+Here is a reusable instruction for an agent:
+
+> Use Serena for semantic work in Agent Lab. First inspect the current configuration, activate
+> `/workspace` if needed, and confirm `agent-lab-dev`. Prove language-server readiness with a live
+> symbol operation. Traverse definitions and references before editing, reinspect and run
+> diagnostics afterward, then run the normal repository checks separately. If Serena fails, report
+> the failure before falling back to ordinary tools.
+
+## A real Agent Lab example
+
+Suppose a task may affect configuration validation in `scripts/lib/config.sh`.
+
+1. Get a symbol overview of `scripts/lib/config.sh`.
+2. Find `agent_lab_validate_boolean` and retrieve its body only if needed.
+3. Find symbols that reference `agent_lab_validate_boolean`.
+4. Confirm that `agent_lab_validate_config` contains the call before changing behavior.
+5. If the change matches a complete function boundary, use a bounded semantic edit.
+6. Retrieve the edited symbol again and request diagnostics for `scripts/lib/config.sh`.
+7. Run the relevant tests and repository gates independently.
+
+The representative Serena calls are:
+
+```text
+get_symbols_overview(relative_path="scripts/lib/config.sh")
+find_symbol(
+  name_path_pattern="agent_lab_validate_boolean",
+  relative_path="scripts/lib/config.sh"
+)
+find_referencing_symbols(
+  name_path="agent_lab_validate_boolean",
+  relative_path="scripts/lib/config.sh"
+)
+get_diagnostics_for_file(relative_path="scripts/lib/config.sh")
+```
+
+In the current source, the reference query should identify
+`agent_lab_validate_config`. That stable relationship is also exercised by the smoke test.
+
+## When to use Serena
+
+| Task | Preferred tool |
+|---|---|
+| Survey symbols in a `.sh` or `.bash` file | Serena symbol overview |
+| Find a known function or retrieve its body | Serena symbol lookup |
+| Follow a call to its definition or find callers | Serena declaration/reference tools |
+| Replace or insert at a reliable function boundary | Serena bounded semantic editors |
+| Check Bash language-server findings after an edit | Serena file diagnostics |
+| Search prose, YAML, TOML, Compose, or generated data | ordinary text search |
+| Edit documentation, configuration, or part of a line | ordinary file editing |
+| Work on an extensionless Bash entrypoint | ordinary search and editing |
+| Verify behavior | repository tests, lint, build, and containment gates |
+
+Start with a symbol overview or targeted lookup rather than reading the whole repository. Retrieve
+only the bodies needed for the task, and inspect references before changing shared behavior.
+
+Use `replace_symbol_body`, `insert_before_symbol`, and `insert_after_symbol` only when the requested
+change aligns with a reliable symbol boundary. Project policy deliberately makes broad content
+replacement, rename, and safe-delete inactive after activation. A client may list those tools before
+activation because the recoverable startup schema is broader; calls are rejected once `/workspace`
+is active.
+
+Serena supplements ordinary search and the repository checks. It replaces neither.
+
+## What a healthy integration proves
+
+Keep these states separate:
+
+| State | Required evidence |
+|---|---|
+| MCP connected | initialization and tool listing succeed through `scripts/serena-mcp` |
+| Project visible | `activate_project("/workspace")` resolves the tracked project |
+| Project active | activation names `agent-lab-dev`; follow-up configuration confirms it |
+| Language server launched | runtime evidence shows `bash-language-server` |
+| Language server ready | an uncached per-run fixture overview and a live declaration request complete |
+| Symbols working | `agent_lab_validate_config` is extracted from `scripts/lib/config.sh` |
+| Relationships working | `agent_lab_validate_boolean` has referencing symbol `agent_lab_validate_config` |
+| Semantic editing working | a disposable fixture symbol is edited, retrieved, and has no Error diagnostics |
+| Diagnostics working | a controlled invalid fixture produces Error-level `SC1072` and `SC1073` |
+| Repository verification working | an existing Agent Lab test passes independently of Serena |
+
+“The Serena server started” proves only the first row.
+
+## Verification commands
+
+Run the deterministic end-to-end smoke with Docker available:
+
+```bash
+./scripts/dev/serena-build
+./scripts/dev/serena-smoke
+```
+
+For each registered client, the smoke starts from a nested working directory, checks the expected
+pre-activation state, activates `/workspace`, confirms the project, performs an uncached symbol
+operation, and traverses a live declaration. The Codex pass also checks the real
+`agent_lab_validate_boolean` relationship, a bounded edit on a disposable fixture, controlled
+ShellCheck diagnostics, the live language-server process, and container hardening. It finishes by
+running `tests/agent/config-guard.sh` outside Serena.
+
+MCP-stage failures exit nonzero with the failed response and recent Serena/container logs. Docker,
+image, or containment preflight failures can occur before MCP starts; exit 125 identifies
+infrastructure or preflight failure, not a semantic result. A successful handshake followed by a
+failed semantic operation is a failed smoke.
+
+Run the normal repository gates separately:
 
 ```bash
 ./scripts/dev/check default quick
@@ -178,20 +216,93 @@ Run the full repository gates separately:
 ./scripts/dev/docker-gate
 ```
 
-## Troubleshooting order
+## If it fails
 
-If a semantic query is unexpectedly empty or fails:
+| Symptom | Check and recovery |
+|---|---|
+| Serena tools are absent | Confirm the tracked client registration, then reload or restart the client from this checkout. |
+| Image missing or stale | Run `./scripts/dev/serena-build`; startup never downloads or builds. |
+| `No active project` | Call `activate_project("/workspace")`, then inspect configuration again. |
+| Wrong project or root | Activate `/workspace`; require `agent-lab-dev` before semantic work. |
+| Active project but empty symbol result | Confirm the file is a non-ignored `.sh` or `.bash` under `/workspace`, then prove language-server readiness with another live operation. |
+| Extensionless Bash, Python, prose, or configuration file | This is outside the configured semantic scope; use ordinary tools and say why. |
+| Containment preflight failure | Remove the reported child mount, nested `.git`, sensitive symlink, or nested credential/key/environment path. Use a non-root canonical UID/GID. Do not weaken the preflight. |
+| Semantic or diagnostic operation fails | Run `./scripts/dev/serena-smoke` and use its reported MCP, Serena, and language-server output. |
 
-1. Run `get_current_config`; on a fresh session, recognize the expected `No active project`
-   `isError` state.
-2. Activate `/workspace`, then inspect configuration again.
-3. Confirm the activation response names `/workspace`, Bash, and UTF-8.
-4. Confirm the file is a non-ignored `.sh` or `.bash` file inside `/workspace`.
-5. Run `./scripts/dev/serena-build` and verify the pinned image check succeeds.
-6. Run `./scripts/dev/serena-smoke`; do not add arbitrary sleeps.
-7. Inspect the reported Serena and Bash language-server logs.
-8. Only after these checks decide that no symbol/reference/diagnostic exists.
+For an unexplained empty or failed query, use this order:
 
-No runtime network exception is an acceptable fix. A missing executable or preseeded asset is an
-image-build failure; a wrong root or inactive project is an activation/configuration failure; an
-unsupported extension or relationship is a Serena/Bash-language-server limitation.
+1. inspect the active project and root;
+2. verify that the file is inside `/workspace`;
+3. verify the `.sh` or `.bash` language match;
+4. verify ignore and workspace-folder handling;
+5. verify the pinned image and language-server availability;
+6. wait for a real semantic operation rather than adding an arbitrary sleep;
+7. inspect Serena and Bash language-server logs;
+8. only then conclude that a symbol, relationship, or diagnostic is absent.
+
+Do not add a runtime network exception to fix development tooling. A missing executable or asset is
+an image-build problem; a wrong root is an activation problem; an unsupported file is a documented
+scope limitation.
+
+## Known limitations
+
+- Only Bash is configured. Serena recognizes `.sh` and `.bash`, not Agent Lab's extensionless Bash
+  entrypoints.
+- `tests/serena/mcp-smoke.py` is host-side orchestration, not an Agent Lab runtime language. It stays
+  outside the semantic project rather than adding Python solely for the test harness.
+- Broad content replacement, rename, and safe-delete tools are inactive by project policy.
+- Project symbol caches are ephemeral and do not persist into the host checkout.
+- The direct Serena, Bash-language-server, and ShellCheck versions are pinned. The npm installation
+  is version-pinned but does not use an Agent Lab lockfile for its transitive dependency graph.
+
+An empty result on a supported file is not proof that the symbol does not exist. Follow the recovery
+order above, and never claim semantic verification when only text search was performed.
+
+## Technical reference
+
+The project was created using Serena's supported workflow:
+
+```bash
+SERENA_HOME="$(mktemp -d)" serena project create . \
+  --name agent-lab-dev \
+  --ls bash
+```
+
+The tracked `.serena/project.yml` selects Bash, UTF-8, the LSP backend, Git-ignore handling, and the
+single workspace root `.`. It adds no external workspace folders and does not over-ignore source or
+tests. No project memories are currently persisted; repository guidance is sufficient and remains
+canonical.
+
+`scripts/serena-mcp` starts the one-shot `compose.serena.yaml` service. Every bind is private and
+non-recursive. Startup fails closed on child mounts, visible nested `.git` objects, nested
+credential/key/environment paths, sensitive symlinks, and root or noncanonical UID/GID values.
+Client registrations remove `BASH_ENV` and `ENV` before invoking a non-login, no-profile Bash so
+ambient host startup files cannot run before the contained launcher.
+
+The image contains:
+
+- Serena commit `6c1c9653700cbe644cb5a5b026b77db2f4071c36`
+  (`1.6.2.dev0`);
+- `bash-language-server` 5.6.0;
+- ShellCheck 0.10.0 in Serena's expected managed layout.
+
+Build-time dependency access is separate from the no-network runtime.
+`SERENA_USAGE_REPORTING=false` and disabled dashboard/GUI flags prevent optional outbound features
+from being attempted.
+
+The pinned version has no `check_onboarding_performed` tool. Use the activation response plus
+`list_memories` as the onboarding check. No project memories are tracked or currently present
+because repository guidance is sufficient. If memories are added later, activate `/workspace`
+first, keep them factual and specific to Agent Lab, and never store secrets, tokens, transient
+container IDs, or host-only paths in them.
+
+Related repository guidance:
+
+- [Documentation map](README.md)
+- [Development and verification](development.md)
+- [Architecture](architecture.md)
+- [Agent development rules](../AGENTS.md)
+- [Development-client configuration](agent-config.md)
+- [CI gate mapping](ci.md)
+- [Security policy](../SECURITY.md)
+- [Threat model](../THREAT_MODEL.md)

@@ -2,6 +2,10 @@
 
 This directory is the source-pin and self-build scaffold for OpenClaw.
 
+It is optional future-work scaffolding, not part of the default Agent Lab
+operator path. Start with the [documentation map](../../docs/README.md) for the
+implemented workload flow.
+
 ## Strategy
 
 `agent-lab` builds its OpenClaw image from a verified pinned upstream source commit. The upstream GHCR image is useful reference material, but it is not a trust anchor for this integration.
