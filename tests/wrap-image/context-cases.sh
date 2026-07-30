@@ -12,6 +12,7 @@ mkdir -p "$work/bin"
 docker_log="$work/docker.log"
 captured_context="$work/context.files"
 captured_dockerfile="$work/Dockerfile"
+captured_dockerignore="$work/.dockerignore"
 : > "$docker_log"
 
 cat > "$work/bin/docker" <<'EOF'
@@ -39,6 +40,7 @@ case "${1:-}" in
     done
     find "$context" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "${FAKE_CAPTURED_CONTEXT:?}"
     cp "$dockerfile" "${FAKE_CAPTURED_DOCKERFILE:?}"
+    cp "$context/.dockerignore" "${FAKE_CAPTURED_DOCKERIGNORE:?}"
     ;;
 esac
 EOF
@@ -59,6 +61,7 @@ run_wrap() {
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_CAPTURED_CONTEXT="$captured_context" \
     FAKE_CAPTURED_DOCKERFILE="$captured_dockerfile" \
+    FAKE_CAPTURED_DOCKERIGNORE="$captured_dockerignore" \
     FAKE_ENTRYPOINT="$entrypoint" \
     FAKE_CMD="$cmd" \
     FAKE_USER="$user" \
@@ -83,6 +86,12 @@ if grep -Fq 'COPY agent-entrypoint.sh /usr/local/bin/agent-entrypoint' "$capture
   pass "Dockerfile copies only the isolated entrypoint"
 else
   fail "Dockerfile copies only the isolated entrypoint"
+fi
+expected_dockerignore=$'*\n!agent-entrypoint.sh'
+if [ "$(cat "$captured_dockerignore" 2>/dev/null || true)" = "$expected_dockerignore" ]; then
+  pass "wrapper context excludes its Docker control files from hostile ONBUILD COPY"
+else
+  fail "wrapper context excludes its Docker control files from hostile ONBUILD COPY"
 fi
 if grep -Fq 'ENTRYPOINT ["/usr/local/bin/agent-entrypoint","/bin/tool"]' "$captured_dockerfile" &&
    grep -Fq 'CMD ["serve","--safe"]' "$captured_dockerfile" &&

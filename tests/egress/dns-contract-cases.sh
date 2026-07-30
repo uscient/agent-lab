@@ -49,11 +49,13 @@ else
   pass "blocking egress checks do not accept generic SERVFAIL"
 fi
 
-if grep -Fq 'template IN A AAAA' "$repo_root/dns/coredns/Corefile" &&
-   grep -Fq 'rcode NXDOMAIN' "$repo_root/dns/coredns/Corefile"; then
-  pass "CoreDNS declares the external A and AAAA result explicitly"
+if [ "$(grep -Fxc '    template IN A {' "$repo_root/dns/coredns/Corefile")" -eq 1 ] &&
+   [ "$(grep -Fxc '    template IN AAAA {' "$repo_root/dns/coredns/Corefile")" -eq 1 ] &&
+   [ "$(grep -Fxc '        rcode NXDOMAIN' "$repo_root/dns/coredns/Corefile")" -eq 2 ] &&
+   ! grep -Fq 'template IN A AAAA' "$repo_root/dns/coredns/Corefile"; then
+  pass "CoreDNS declares separate external A and AAAA NXDOMAIN templates"
 else
-  fail "CoreDNS declares the external A and AAAA result explicitly"
+  fail "CoreDNS declares separate external A and AAAA NXDOMAIN templates"
 fi
 
 if [ -f "$repo_root/tests/security/docker.manifest" ] &&
