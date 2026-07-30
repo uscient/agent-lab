@@ -6,10 +6,15 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 work="$(mktemp -d)"
-cleanup() { rm -rf "$work"; }
+secrets_rel=".image-volume-secrets-$$-${RANDOM}"
+secrets_path="$repo_root/$secrets_rel"
+cleanup() {
+  rmdir "$secrets_path" >/dev/null 2>&1 || true
+  rm -rf "$work"
+}
 trap cleanup EXIT
 
-mkdir -p "$work/bin" "$work/secrets"
+mkdir -p "$work/bin"
 env_file="$work/agent.env"
 docker_log="$work/docker.log"
 : > "$env_file"
@@ -22,7 +27,10 @@ printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG:?}"
 case "${1:-} ${2:-}" in
   "image inspect")
     if [ "${3:-}" = "--format" ]; then
-      printf '%s\n' "${FAKE_IMAGE_VOLUMES:-}"
+      case "${4:-}" in
+        '{{.Id}}') printf 'sha256:%064d\n' 0 ;;
+        *) printf '%s\n' "${FAKE_IMAGE_VOLUMES:-}" ;;
+      esac
     fi
     ;;
   "inspect --format")
@@ -49,13 +57,15 @@ fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 run_agent() {
   local volumes="$1" out="$2" rc=0
   : > "$docker_log"
-  PATH="$work/bin:$PATH" \
+  env -i \
+    PATH="$work/bin:/usr/bin:/bin" \
+    HOME="$HOME" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_IMAGE_VOLUMES="$volumes" \
     AGENT_LAB_ENV_FILE="$env_file" \
     AGENT_LAB_AGENT_IMAGE="fixture:test" \
     AGENT_LAB_PROJECT_DIR="" \
-    AGENT_LAB_SECRETS_DIR="$work/secrets" \
+    AGENT_LAB_SECRETS_DIR="./$secrets_rel" \
     AGENT_LAB_ALLOWLIST_RECIPES="base" \
     AGENT_LAB_EPHEMERAL_HOME="1" \
     AGENT_LAB_AGENT_UID="1000" \
@@ -82,6 +92,11 @@ if grep -Fq "compose " "$docker_log"; then
 else
   pass "hostile image rejection happens before Compose"
 fi
+if [ ! -e "$secrets_path" ]; then
+  pass "hostile image rejection happens before secrets materialization"
+else
+  fail "hostile image rejection happens before secrets materialization"
+fi
 
 safe_out="$work/safe.out"
 if run_agent $'/workspace\n/home/agent\n/tmp\n/run/agent-secrets' "$safe_out"; then
@@ -93,6 +108,16 @@ if grep -Fq "compose " "$docker_log"; then
   pass "accepted image reaches Compose"
 else
   fail "accepted image reaches Compose"
+fi
+if [ -d "$secrets_path" ]; then
+  pass "validated image permits planned secrets materialization"
+else
+  fail "validated image permits planned secrets materialization"
+fi
+if grep -Fq -- "--env-file /dev/null" "$docker_log"; then
+  pass "Compose consumes validated exports instead of rereading the raw env file"
+else
+  fail "Compose consumes validated exports instead of rereading the raw env file"
 fi
 
 printf 'SUMMARY failures=%s\n' "$failures"

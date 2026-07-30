@@ -3,15 +3,35 @@
 
 tool awk
 tool bash
+tool basename
 tool cat
+tool chmod
+tool cmp
+tool cp
 tool curl
+tool dirname
 tool docker
+tool find
+tool git
 tool grep
+tool head
+tool id
 tool jq
+tool ln
+tool mkdir
 tool mktemp
+tool mv
+tool readlink
+tool rm
+tool rmdir
 tool sed
+tool sleep
 tool sort
+tool stat
 tool tar
+tool tr
+tool wc
+tool-any sha256sum shasum
 
 suite image-volume tests/docker/image-volume.sh SUMMARY failures=0
 suite wrapper-context-runtime tests/docker/wrapper-context.sh SUMMARY failures=0

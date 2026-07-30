@@ -12,8 +12,16 @@ failures=0
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    shasum -a 256
+  fi
+}
+
 sentinel="fixture-${LAB_MARKER}-${RANDOM}-${RANDOM}"
-sentinel_hash="$(printf '%s' "$sentinel" | sha256sum | awk '{print $1}')"
+sentinel_hash="$(printf '%s' "$sentinel" | sha256_stdin | awk '{print $1}')"
 printf '%s' "$sentinel" > "$LAB_COPY/secrets/RUNTIME_SENTINEL"
 
 launcher_out="$LAB_WORK/agent.out"

@@ -22,7 +22,18 @@ cat > "$work/bin/docker" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG:?}"
 
+fake_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1"
+  else
+    shasum -a 256 "$1"
+  fi
+}
+
 if [ "${1:-} ${2:-}" = "image inspect" ]; then
+  if [ "${3:-}" = "--format" ] && [ "${4:-}" = "{{.Id}}" ]; then
+    printf 'sha256:%064d\n' 0
+  fi
   exit 0
 fi
 
@@ -33,7 +44,7 @@ if [ "${1:-}" = "inspect" ]; then
 fi
 
 if [ "${1:-}" = "exec" ]; then
-  sha256sum "${FAKE_ACTIVE_ALLOWLIST:?}"
+  fake_sha256 "${FAKE_ACTIVE_ALLOWLIST:?}"
   exit 0
 fi
 
@@ -50,7 +61,7 @@ if [ "${1:-}" = "compose" ]; then
          [ "${FAKE_IGNORE_RECREATE:-0}" != "1" ]; then
         hash="${AGENT_LAB_EGRESS_POLICY_SHA256:-}"
         if [ -z "$hash" ]; then
-          hash="$(sha256sum "${AGENT_LAB_EGRESS_ALLOWLIST:?}" | awk '{print $1}')"
+          hash="$(fake_sha256 "${AGENT_LAB_EGRESS_ALLOWLIST:?}" | awk '{print $1}')"
         fi
         printf '%s\n' "$hash" > "$FAKE_ACTIVE_HASH"
         rm -f "${FAKE_ACTIVE_ALLOWLIST:?}"
@@ -72,7 +83,9 @@ fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
 run_agent() {
   local recipes="$1" out="$2" rc=0
-  PATH="$work/bin:$PATH" \
+  env -i \
+    PATH="$work/bin:/usr/bin:/bin" \
+    HOME="$HOME" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_ACTIVE_HASH="$active_hash" \
     FAKE_ACTIVE_ALLOWLIST="$active_allowlist" \

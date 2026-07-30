@@ -24,7 +24,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   scripts/agent [-- CMD...]   Run the agent (default: the image's own CMD).
-  scripts/agent --check       Preflight only: load + validate config, guard, build allowlist; no Docker run.
+  scripts/agent --check       Read-only preflight: validate config, recipes, and canonical mounts.
   scripts/agent down          Stop the agent stack (keeps named volumes).
   scripts/agent --clean       Stop the stack AND remove named volumes (workspace, home, audit).
   scripts/agent -h | --help   Show this help.
@@ -35,6 +35,9 @@ Seams (set in .env.local or the environment):
   AGENT_LAB_SECRETS_DIR        Host dir mounted RO at /run/agent-secrets (guarded; default: ./secrets).
   AGENT_LAB_ALLOWLIST_RECIPES  Comma-separated egress recipes (default: base = deny all).
   AGENT_LAB_EPHEMERAL_HOME=1   Map /home/agent to tmpfs (no token/cache persistence).
+  AGENT_LAB_AGENT_UID/GID      Canonical non-root IDs, range 1..2147483647.
+  AGENT_LAB_AGENT_MEM          64m..65536m or 1g..64g (default: 4g).
+  AGENT_LAB_AGENT_CPUS         Canonical CPU limit, range 0.1..64 (default: 2).
 EOF
 }
 
@@ -53,17 +56,14 @@ if [ "$mode" != "run" ] && [ "$#" -gt 0 ]; then
   printf 'Unexpected extra arguments after %s\n' "$mode" >&2; usage; exit 1
 fi
 
-# Honor an env-file override (tests / preflight); it is strictly parsed, never sourced.
-ENV_FILE="${AGENT_LAB_ENV_FILE:-$ENV_FILE}"
-agent_lab_require_env_file
-
 # Build a self-contained compose invocation for the given HOME overlay.
 compose=()
+COMPOSE_ENV_FILE=/dev/null
 build_compose() {
   compose=(
     docker compose
     --project-name "$PROJECT_NAME"
-    --env-file "$ENV_FILE"
+    --env-file "$COMPOSE_ENV_FILE"
     -f "${REPO_ROOT}/compose.yaml"
     -f "${REPO_ROOT}/compose.egress.yaml"
     -f "${REPO_ROOT}/compose.agent.yaml"
@@ -73,32 +73,58 @@ build_compose() {
 run_compose() {
   (cd "$REPO_ROOT" && "${compose[@]}" "$@")
 }
+run_teardown_compose() {
+  (
+    unset AGENT_LAB_AGENTS_SUBNET AGENT_LAB_EGRESS_SUBNET
+    unset AGENT_LAB_DNS_IP AGENT_LAB_PROXY_IP AGENT_LAB_PROXY_PORT
+    unset HTTP_PROXY HTTPS_PROXY NO_PROXY
+    unset AGENT_LAB_ALLOWED_TEST_DOMAIN AGENT_LAB_DIRECT_TEST_IP
+    unset AGENT_LAB_EGRESS_ALLOWLIST AGENT_LAB_EGRESS_POLICY_SHA256
+    unset AGENT_LAB_AGENT_IMAGE AGENT_LAB_PROJECT_DIR AGENT_LAB_SECRETS_DIR
+    unset AGENT_LAB_EPHEMERAL_HOME AGENT_LAB_ALLOWLIST_RECIPES
+    unset AGENT_LAB_AGENT_UID AGENT_LAB_AGENT_GID
+    unset AGENT_LAB_AGENT_MEM AGENT_LAB_AGENT_CPUS
+    unset COMPOSE_FILE COMPOSE_PROFILES COMPOSE_PROJECT_NAME
+    cd "$REPO_ROOT"
+    "${compose[@]}" "$@"
+  )
+}
 
 # Teardown needs no BYOA config or guards (a misconfigured stack must still be tearable-down).
 case "$mode" in
   down)
+    agent_lab_validate_project_name
     build_compose "${REPO_ROOT}/compose.agent.persist.yaml"
-    run_compose --profile core --profile egress --profile agent down
+    run_teardown_compose --profile core --profile egress --profile agent down
     exit 0 ;;
   clean)
+    agent_lab_validate_project_name
     build_compose "${REPO_ROOT}/compose.agent.persist.yaml"
     printf 'Tearing down and REMOVING named volumes (agent-workspace, agent-home, audit).\n' >&2
-    run_compose --profile core --profile egress --profile agent down --volumes
+    run_teardown_compose --profile core --profile egress --profile agent down --volumes
     exit 0 ;;
 esac
 
 # --- run / check: config authority + preflight guards ---
 
-# Compute + export the effective, validated config (shell env > strict env-file > default).
-# A rejected (metacharacter-bearing) env-file value aborts here, before any guard or Compose op.
-agent_lab_load_byoa_config "$ENV_FILE" || exit 1
+# Honor an env-file override for run/check. It is parsed once as data, never sourced, and
+# never passed to Compose after validation; Compose receives only the validated exports.
+ENV_FILE="${AGENT_LAB_ENV_FILE:-$ENV_FILE}"
+agent_lab_require_env_file
 
-checks_failed=0
-agent_lab_guard_project_dir "${AGENT_LAB_PROJECT_DIR}" || checks_failed=1
-agent_lab_guard_secrets_dir "${AGENT_LAB_SECRETS_DIR}" || checks_failed=1
-agent_lab_validate_uid_gid || checks_failed=1
-# Compose the egress allowlist from the effective recipes (also validates recipe names).
-agent_lab_build_allowlist || checks_failed=1
+# Phase A is read-only. A failure here performs no mkdir/cache operation and no Docker call.
+agent_lab_load_byoa_config "$ENV_FILE" || exit 1
+agent_lab_validate_config || exit 1
+agent_lab_validate_allowlist_recipes || exit 1
+agent_lab_preflight_allowlist_publication || exit 1
+agent_lab_guard_project_dir "${AGENT_LAB_PROJECT_DIR}" || exit 1
+agent_lab_guard_secrets_dir "${AGENT_LAB_SECRETS_DIR}" || exit 1
+agent_lab_guard_mount_relationship || exit 1
+
+planned_project="${AGENT_LAB_PROJECT_DIR}"
+planned_project_identity="${AGENT_LAB_PROJECT_IDENTITY}"
+planned_secrets="${AGENT_LAB_SECRETS_DIR}"
+planned_secrets_identity="${AGENT_LAB_SECRETS_IDENTITY}"
 
 if [ "$mode" = "check" ]; then
   printf 'EFFECTIVE AGENT_LAB_AGENT_IMAGE=%s\n'        "${AGENT_LAB_AGENT_IMAGE}"
@@ -108,14 +134,13 @@ if [ "$mode" = "check" ]; then
   printf 'EFFECTIVE AGENT_LAB_ALLOWLIST_RECIPES=%s\n'  "${AGENT_LAB_ALLOWLIST_RECIPES}"
   printf 'EFFECTIVE AGENT_LAB_AGENT_UID=%s\n'          "${AGENT_LAB_AGENT_UID}"
   printf 'EFFECTIVE AGENT_LAB_AGENT_GID=%s\n'          "${AGENT_LAB_AGENT_GID}"
-  if [ "$checks_failed" -eq 0 ]; then printf 'PASS preflight\n'; exit 0; fi
-  printf 'FAIL preflight\n' >&2; exit 1
+  printf 'EFFECTIVE AGENT_LAB_AGENT_MEM=%s\n'          "${AGENT_LAB_AGENT_MEM}"
+  printf 'EFFECTIVE AGENT_LAB_AGENT_CPUS=%s\n'         "${AGENT_LAB_AGENT_CPUS}"
+  printf 'EFFECTIVE AGENT_LAB_AGENTS_SUBNET=%s\n'      "${AGENT_LAB_AGENTS_SUBNET}"
+  printf 'EFFECTIVE AGENT_LAB_EGRESS_SUBNET=%s\n'      "${AGENT_LAB_EGRESS_SUBNET}"
+  printf 'PASS preflight\n'
+  exit 0
 fi
-
-[ "$checks_failed" -eq 0 ] || exit 1
-
-# Ensure the read-only secrets bind has a target (effective, already-vetted dir).
-(cd "$REPO_ROOT" && mkdir -p "${AGENT_LAB_SECRETS_DIR}")
 
 # Pick the HOME overlay from the effective ephemeral flag.
 if [ "${AGENT_LAB_EPHEMERAL_HOME}" = "1" ]; then
@@ -123,7 +148,6 @@ if [ "${AGENT_LAB_EPHEMERAL_HOME}" = "1" ]; then
 else
   overlay="${REPO_ROOT}/compose.agent.persist.yaml"
 fi
-build_compose "$overlay"
 
 # Seam: agent image. Build the default devbox locally when no BYO image is set.
 agent_image="${AGENT_LAB_AGENT_IMAGE:-agent-lab/devbox:local}"
@@ -137,14 +161,72 @@ elif ! docker image inspect "$agent_image" >/dev/null 2>&1; then
   docker pull "$agent_image"
 fi
 
+# Resolve a mutable tag to the exact immutable image ID that both validation and Compose
+# will consume.
+resolved_image="$(
+  docker image inspect --format '{{.Id}}' "$agent_image"
+)" || {
+  printf 'FAIL cannot resolve agent image identity: %s\n' "$agent_image" >&2
+  exit 1
+}
+if [[ ! "$resolved_image" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  printf 'FAIL Docker returned an invalid agent image identity\n' >&2
+  exit 1
+fi
+
 # Docker creates an anonymous writable mount for every image-declared VOLUME unless a
 # more specific runtime mount replaces it. Reject anything outside our exact mount set
 # before the containment substrate or agent is started.
-agent_lab_validate_image_volumes "$agent_image"
+agent_lab_validate_image_volumes "$resolved_image"
+AGENT_LAB_AGENT_IMAGE="$resolved_image"
+export AGENT_LAB_AGENT_IMAGE
+
+# Phase B materializes only the already-approved paths and policy bytes. Recheck the
+# existing project identity before creating any persistent runtime input.
+if [ -n "$planned_project" ]; then
+  agent_lab_guard_project_dir "$planned_project" || exit 1
+  [ "${AGENT_LAB_PROJECT_DIR}" = "$planned_project" ] &&
+    [ "${AGENT_LAB_PROJECT_IDENTITY}" = "$planned_project_identity" ] || {
+      printf 'FAIL project path identity changed after preflight\n' >&2
+      exit 1
+    }
+fi
+AGENT_LAB_SECRETS_DIR="$planned_secrets"
+export AGENT_LAB_SECRETS_DIR
+agent_lab_materialize_secrets_dir "$planned_secrets" "$planned_secrets_identity" || exit 1
+planned_secrets_identity="${AGENT_LAB_SECRETS_IDENTITY}"
+agent_lab_guard_mount_relationship || exit 1
+agent_lab_publish_validated_allowlist || exit 1
+
+recheck_mount_plan() {
+  if [ -n "$planned_project" ]; then
+    agent_lab_guard_project_dir "$planned_project" || return 1
+    [ "${AGENT_LAB_PROJECT_DIR}" = "$planned_project" ] &&
+      [ "${AGENT_LAB_PROJECT_IDENTITY}" = "$planned_project_identity" ] || {
+        printf 'FAIL project path identity changed before Docker Compose\n' >&2
+        return 1
+      }
+  fi
+  agent_lab_guard_secrets_dir "$planned_secrets" || return 1
+  [ "${AGENT_LAB_SECRETS_DIR}" = "$planned_secrets" ] &&
+    [ "${AGENT_LAB_SECRETS_IDENTITY}" = "$planned_secrets_identity" ] || {
+      printf 'FAIL secrets path identity changed before Docker Compose\n' >&2
+      return 1
+    }
+  agent_lab_guard_mount_relationship || return 1
+}
+
+# Recheck before starting Compose, then again after the potentially slow egress
+# reconciliation and immediately before the agent consumes either host path.
+recheck_mount_plan || exit 1
+
+build_compose "$overlay"
 
 # Start the containment substrate. Squid loads its policy at startup, so the lifecycle
 # helper recreates it when the requested content hash differs and verifies the active label.
 agent_lab_start_verified_egress
+
+recheck_mount_plan || exit 1
 
 # Run the agent. Guard the bash 3.2 empty-array expansion before "${agent_cmd[@]}".
 if [ "${#agent_cmd[@]}" -gt 0 ]; then

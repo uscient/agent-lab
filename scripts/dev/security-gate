@@ -58,6 +58,8 @@ if [ ! -f "$manifest" ]; then
 fi
 
 declare -a required_tools=()
+declare -a required_tool_any_left=()
+declare -a required_tool_any_right=()
 declare -a suite_ids=()
 declare -a suite_paths=()
 declare -a suite_markers=()
@@ -83,6 +85,15 @@ while IFS= read -r line || [ -n "$line" ]; do
         manifest_errors=1
       else
         required_tools+=("$field")
+      fi
+      ;;
+    tool-any)
+      if [ -z "$field" ] || [ -z "$value" ] || [ -n "$marker" ]; then
+        infra "malformed tool-any entry at $manifest:$line_no"
+        manifest_errors=1
+      else
+        required_tool_any_left+=("$field")
+        required_tool_any_right+=("$value")
       fi
       ;;
     suite)
@@ -130,6 +141,15 @@ for tool in "${required_tools[@]}"; do
     preflight_failed=1
   fi
 done
+if [ "${#required_tool_any_left[@]}" -gt 0 ]; then
+  for i in "${!required_tool_any_left[@]}"; do
+    if ! command -v "${required_tool_any_left[$i]}" >/dev/null 2>&1 &&
+       ! command -v "${required_tool_any_right[$i]}" >/dev/null 2>&1; then
+      infra "missing required tool (need one of: ${required_tool_any_left[$i]} ${required_tool_any_right[$i]})"
+      preflight_failed=1
+    fi
+  done
+fi
 
 for i in "${!suite_ids[@]}"; do
   suite_path="${suite_paths[$i]}"

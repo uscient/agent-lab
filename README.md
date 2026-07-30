@@ -52,6 +52,7 @@ Stop the stack:
 cp .env.example .env.local
 # Point at your project (optional; defaults to an ephemeral workspace volume):
 #   AGENT_LAB_PROJECT_DIR=/abs/path/to/your/repo
+./scripts/agent --check       # read-only config/path/recipe preflight
 ./scripts/agent -- bash      # interactive shell in the sandbox (devbox built on first use)
 ./scripts/agent --clean      # stop and remove the named volumes
 ```
@@ -62,10 +63,26 @@ You adapt the lab through exactly four seams; everything else is locked:
 | --- | --- | --- |
 | Agent image | `AGENT_LAB_AGENT_IMAGE` | which image runs (default: locally-built `agent-lab/devbox:local`) |
 | Project | `AGENT_LAB_PROJECT_DIR` | one host dir mounted RW at `/workspace` (guarded at preflight) |
-| Secrets | files under `secrets/` | loaded into the agent's env at runtime, never into config or `docker inspect` |
+| Secrets | `AGENT_LAB_SECRETS_DIR` | files loaded into the agent's env at runtime, never into config or `docker inspect` |
 | Egress | `AGENT_LAB_ALLOWLIST_RECIPES` | which `policies/recipes/*.allowlist` fragments compose into Squid |
 
-Adaptability comes from these narrow, guard-railed openings, never from loosened defaults. Unsafe choices — mounting `$HOME`, a system path, or a directory holding `.ssh`/`.aws`/an `.npmrc` auth token — are refused at preflight, not silently honored.
+Adaptability comes from these narrow, guard-railed openings, never from loosened defaults. Unsafe choices — mounting `$HOME`, a system path, or a directory holding `.ssh`/`.aws`/an `.npmrc` auth token — are refused at preflight, not silently honored. Project and secrets paths are canonicalized before use and must be disjoint, so a read-only secret cannot also appear through the writable workspace.
+
+### Fail-closed runtime configuration
+
+`scripts/agent` parses `.env.local` as data; it never sources it. The accepted file syntax is intentionally narrow: blank lines, column-one comments, and exact unquoted `KEY=VALUE` assignments. Duplicate keys, unknown keys, quotes, `export`, surrounding whitespace, inline comments, CRLF, and shell metacharacters are rejected. A final assignment does not need a trailing newline.
+
+Precedence is exact: a shell-set value, including an explicitly empty one, wins over the env file, which wins over the documented default. Every Compose-consumed network, proxy, identity, resource, and BYO-agent value is validated and exported. Compose then reads `/dev/null` as its env file, so it cannot reinterpret or race the original input.
+
+Important scalar bounds:
+
+- `AGENT_LAB_EPHEMERAL_HOME` is exactly `0` or `1`.
+- UID/GID are canonical decimal values from `1` through `2147483647`.
+- Memory is `64m..65536m` or `1g..64g`, using lowercase integer units.
+- CPU is a canonical number from `0.1` through `64`, with up to three decimal places.
+- Recipe names are comma-separated lowercase kebab names. Recipe entries are canonical lowercase DNS names or leading-dot suffixes; duplicates and wildcard/URL/IP forms are rejected.
+
+`scripts/agent --check` performs this validation plus canonical mount guards without creating the secrets directory, generating `.cache` policy state, inspecting images, or calling Docker. Run mode rechecks path identities immediately before Compose. A concurrent privileged host process can still race path-based Docker APIs; hostile host control remains outside this container-containment boundary.
 
 ### Egress is opt-in (deny-by-default)
 
@@ -81,7 +98,7 @@ Shipped recipes: `base` (empty), `node-dev`, `python-dev`, `claude-code`, `codex
 scripts/dev/harvest-allowlist > /tmp/candidates.txt   # review-only; never auto-applied
 ```
 
-Then copy the lines you trust into a recipe. Recipe changes take effect on the next `./scripts/agent` run (Squid loads the allowlist at startup; run `./scripts/agent down` first if the proxy is already up).
+Then copy the lines you trust into a recipe. Recipe changes take effect on the next `./scripts/agent` run: the generated policy is content-addressed, and the proxy is recreated automatically when its verified policy hash changes.
 
 ### Bringing a third-party image into compliance
 
@@ -118,9 +135,12 @@ Raw direct egress attempts are blocked by the internal Docker network, but they 
 agents subnet: 172.30.0.0/24
 CoreDNS:       172.30.0.10
 Squid:         172.30.0.20:3128
+egress subnet: 198.18.0.0/24
 ```
 
-These values are duplicated in `.env.example`, `compose.yaml`, `compose.egress.yaml`, `dns/coredns/Corefile`, and `gateway/squid/squid.conf` where needed so the generated configuration stays readable.
+The agent subnet, DNS, and proxy values are duplicated in `.env.example` and
+the relevant Compose and service files. The egress subnet is an explicit
+Compose default and is supplied by the deterministic Docker test harness.
 
 ## What This Lab Does Not Prove
 

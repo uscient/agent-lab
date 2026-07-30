@@ -74,6 +74,7 @@ required_tools=(
   bash
   basename
   cat
+  chmod
   cmp
   cp
   dirname
@@ -84,11 +85,16 @@ required_tools=(
   grep
   head
   jq
+  ln
+  mkdir
   mktemp
+  mv
   readlink
+  rmdir
   sed
   shellcheck
   sort
+  stat
   tr
   wc
 )
@@ -99,6 +105,14 @@ for tool in "${required_tools[@]}"; do
     fail "default manifest is missing required tool $tool"
   fi
 done
+if awk '$1 == "tool-any" &&
+        (($2 == "sha256sum" && $3 == "shasum") ||
+         ($2 == "shasum" && $3 == "sha256sum")) { found=1 }
+        END { exit !found }' "$default_manifest"; then
+  pass "default manifest requires a SHA-256 provider"
+else
+  fail "default manifest is missing its SHA-256 provider contract"
+fi
 
 write_script "$work/pass.sh" "PASS fixture" 0
 write_script "$work/empty.sh" "" 0
@@ -124,6 +138,20 @@ tool agent_lab_missing_tool_for_test
 suite fixture-pass $work/pass.sh PASS fixture
 EOF
 expect_rc 125 "missing prerequisite is infrastructure failure" "$work/missing-tool.manifest" "INFRA"
+
+cat > "$work/tool-any-pass.manifest" <<EOF
+tool-any agent_lab_missing_tool_for_test bash
+suite fixture-pass $work/pass.sh PASS fixture
+EOF
+expect_rc 0 "one available alternative satisfies tool-any" \
+  "$work/tool-any-pass.manifest" "SECURITY GATE PASS"
+
+cat > "$work/tool-any-missing.manifest" <<EOF
+tool-any agent_lab_missing_tool_a agent_lab_missing_tool_b
+suite fixture-pass $work/pass.sh PASS fixture
+EOF
+expect_rc 125 "missing tool-any alternatives are infrastructure failure" \
+  "$work/tool-any-missing.manifest" "need one of"
 
 cat > "$work/missing-suite.manifest" <<EOF
 tool bash

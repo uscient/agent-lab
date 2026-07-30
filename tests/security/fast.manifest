@@ -1,12 +1,14 @@
 # Strict Docker-free security gate.
 # Format:
 #   tool  <executable>
+#   tool-any <executable-a> <executable-b>
 #   suite <stable-id> <repo-relative-script> <required completion marker...>
 
 tool awk
 tool bash
 tool basename
 tool cat
+tool chmod
 tool cmp
 tool cp
 tool dirname
@@ -17,13 +19,19 @@ tool git
 tool grep
 tool head
 tool jq
+tool ln
+tool mkdir
 tool mktemp
+tool mv
 tool readlink
+tool rmdir
 tool sed
 tool shellcheck
 tool sort
+tool stat
 tool tr
 tool wc
+tool-any sha256sum shasum
 
 suite lint scripts/dev/lint-scripts PASS lint-scripts
 suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
