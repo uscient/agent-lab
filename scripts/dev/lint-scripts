@@ -4,17 +4,24 @@ source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
 cd_root
 
 fail=0
+scripts=()
 
-mapfile -t scripts < <(
+mapfile -t candidates < <(
   {
-    find scripts -type f 2>/dev/null || true
-    git ls-files '*.sh' 2>/dev/null || true
+    find scripts tools tests -type f 2>/dev/null
+    git ls-files
   } | sort -u
 )
+for f in "${candidates[@]}"; do
+  test -f "$f" || continue
+  if [[ "$f" == *.sh ]] || head -n 1 "$f" | grep -Eq '^#!.*(bash|dash|ksh|zsh|/sh)([[:space:]]|$)'; then
+    scripts+=("$f")
+  fi
+done
 
 if test "${#scripts[@]}" -eq 0; then
-  echo "No scripts found."
-  exit 0
+  echo "INFRA no shell scripts discovered" >&2
+  exit 125
 fi
 
 echo "== bash -n =="
@@ -26,14 +33,14 @@ for f in "${scripts[@]}"; do
   fi
 done
 
-if command -v shellcheck >/dev/null 2>&1; then
-  echo
-  echo "== shellcheck =="
-  shellcheck "${scripts[@]}" || fail=1
-else
-  echo
-  echo "SKIP shellcheck not installed"
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "INFRA shellcheck is required" >&2
+  exit 125
 fi
+
+echo
+echo "== shellcheck =="
+shellcheck "${scripts[@]}" || fail=1
 
 test "$fail" -eq 0 || die "script lint failed"
 echo "PASS lint-scripts"

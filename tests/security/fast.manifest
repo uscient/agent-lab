@@ -1,7 +1,7 @@
 # Strict Docker-free security gate.
 # Format:
 #   tool  <executable>
-#   suite <stable-id> <repo-relative-script>
+#   suite <stable-id> <repo-relative-script> <required completion marker...>
 
 tool awk
 tool bash

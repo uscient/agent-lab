@@ -18,19 +18,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
 
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
-      - name: Lint
-        run: ./scripts/dev/lint-scripts
+      - name: Determine committed diff base
+        id: diff-base
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+            if [[ "$base" =~ ^0+$ ]]; then
+              base="$(git rev-parse HEAD^)"
+            fi
+          fi
+          git rev-parse --verify "${base}^{commit}"
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
 
-      - name: Check + validate
+      - name: Security gate contract tests
+        run: bash tests/dev/security-gate-cases.sh
+
+      - name: Fast gate + static configuration validation
+        env:
+          AGENT_LAB_DIFF_BASE: ${{ steps.diff-base.outputs.base }}
         run: |
           ./scripts/dev/check default full
-          ./tools/validate.sh
 
       - name: Build devbox
         run: |

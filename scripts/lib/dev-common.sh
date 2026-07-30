@@ -38,9 +38,18 @@ timestamp() {
 }
 
 changed_files() {
+  local base="${1:-}"
+  if [ -n "$base" ] && ! git rev-parse --verify "${base}^{commit}" >/dev/null 2>&1; then
+    printf 'INFRA invalid diff base: %s\n' "$base" >&2
+    return 125
+  fi
+
   {
-    git diff --name-only HEAD -- 2>/dev/null || true
-    git ls-files --others --exclude-standard 2>/dev/null || true
+    if [ -n "$base" ]; then
+      git diff --name-only "${base}...HEAD" --
+    fi
+    git diff --name-only HEAD --
+    git ls-files --others --exclude-standard
   } | sort -u
 }
 

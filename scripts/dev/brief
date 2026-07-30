@@ -27,7 +27,7 @@ out="$(cache_dir)/brief.md"
   echo
 
   echo "## Changed files"
-  changed_files || true
+  changed_files "" || true
   echo
 
   echo "## Project markers"

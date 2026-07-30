@@ -32,7 +32,7 @@ out="$dir/$(timestamp)-handoff.md"
 
   echo "## Changed files"
   echo '```text'
-  changed_files || true
+  changed_files "" || true
   echo '```'
   echo
 

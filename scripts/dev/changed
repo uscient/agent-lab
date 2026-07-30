@@ -4,7 +4,7 @@ source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
 cd_root
 
 echo "== changed files =="
-changed_files
+changed_files ""
 
 echo
 echo "== diff stat =="

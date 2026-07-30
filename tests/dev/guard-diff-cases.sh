@@ -71,7 +71,7 @@ expect_pass_with_file \
   "committed.txt"
 
 base="$(git -C "$test_repo" rev-parse HEAD)"
-printf 'AKIA0000000000000000\n' > "$test_repo/credential.txt"
+printf '%s%s\n' 'AKIA00000000' '00000000' > "$test_repo/credential.txt"
 make_commit "fake credential sentinel"
 expect_fail_with \
   "committed fake-secret sentinel is rejected" \
