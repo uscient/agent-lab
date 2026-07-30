@@ -49,15 +49,19 @@ pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
 run_wrap() {
-  local base="$1" out="$2" rc=0
+  local base="$1" out="$2"
+  local entrypoint="${3:-[\"/bin/tool\"]}"
+  local cmd="${4:-[\"serve\",\"--safe\"]}"
+  local user="${5:-1001:1002}"
+  local rc=0
   : > "$docker_log"
   PATH="$work/bin:$PATH" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_CAPTURED_CONTEXT="$captured_context" \
     FAKE_CAPTURED_DOCKERFILE="$captured_dockerfile" \
-    FAKE_ENTRYPOINT='["/bin/tool"]' \
-    FAKE_CMD='["serve","--safe"]' \
-    FAKE_USER='1001:1002' \
+    FAKE_ENTRYPOINT="$entrypoint" \
+    FAKE_CMD="$cmd" \
+    FAKE_USER="$user" \
     "$repo_root/scripts/wrap-image" "$base" "fixture:wrapped" >"$out" 2>&1 || rc=$?
   return "$rc"
 }
@@ -80,16 +84,33 @@ if grep -Fq 'COPY agent-entrypoint.sh /usr/local/bin/agent-entrypoint' "$capture
 else
   fail "Dockerfile copies only the isolated entrypoint"
 fi
-if grep -Fq 'USER 1001:1002' "$captured_dockerfile" &&
-   grep -Fq 'CMD ["/bin/tool","serve","--safe"]' "$captured_dockerfile"; then
-  pass "original user and ENTRYPOINT plus CMD behavior are preserved"
+if grep -Fq 'ENTRYPOINT ["/usr/local/bin/agent-entrypoint","/bin/tool"]' "$captured_dockerfile" &&
+   grep -Fq 'CMD ["serve","--safe"]' "$captured_dockerfile" &&
+   ! grep -Eq '^USER[[:space:]]' "$captured_dockerfile"; then
+  pass "original user, ENTRYPOINT, CMD, and runtime-argument behavior are preserved"
 else
-  fail "original user and ENTRYPOINT plus CMD behavior are preserved"
+  fail "original user, ENTRYPOINT, CMD, and runtime-argument behavior are preserved"
 fi
 if grep -Fq -- "--network=none" "$docker_log"; then
   pass "wrapper build disables build-time networking"
 else
   fail "wrapper build disables build-time networking"
+fi
+
+if run_wrap "fixture:base" "$work/cmd-only.out" "null" '["sh","-c","true"]' "" &&
+   grep -Fq 'ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]' "$captured_dockerfile" &&
+   grep -Fq 'CMD ["sh","-c","true"]' "$captured_dockerfile" &&
+   ! grep -Eq '^USER[[:space:]]' "$captured_dockerfile"; then
+  pass "CMD-only and root-user metadata stay inherited"
+else
+  fail "CMD-only and root-user metadata stay inherited"
+fi
+
+if run_wrap "fixture:base" "$work/null-command.out" "null" "null" "" &&
+   grep -Fq "base declares neither ENTRYPOINT nor CMD" "$work/null-command.out"; then
+  pass "null ENTRYPOINT and CMD require an explicit runtime command"
+else
+  fail "null ENTRYPOINT and CMD require an explicit runtime command"
 fi
 
 : > "$docker_log"
