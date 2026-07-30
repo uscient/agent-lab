@@ -14,3 +14,9 @@ hooks = true
 # Network supports fetch, same-branch push, and PR creation. The guard, repository branch
 # protection, and AGENTS.md keep protected branches, auth, and integration mutations out of scope.
 network_access = true
+
+[mcp_servers.serena]
+startup_timeout_sec = 60
+tool_timeout_sec = 240
+command = "bash"
+args = ["-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=codex"]

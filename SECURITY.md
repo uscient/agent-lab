@@ -28,11 +28,21 @@ Stop work and report before continuing if tracked source contains or introduces:
 
 ## Network Rules
 
-Agent and test containers must attach only to the internal `agents` network. Only `egress-proxy` may attach to both `agents` and `egress`.
+Agent and test containers must attach only to the internal `agents` network. A narrowly scoped
+development helper may instead use `network_mode: none`; Serena does so because MCP and its
+preinstalled language server communicate over stdio and need no network. Only `egress-proxy` may
+attach to both `agents` and `egress`.
 
 No service publishes public ports. Any operator-facing ports must bind to `127.0.0.1` unless explicitly approved.
 
 The Docker socket must never be mounted into an agent container. Host home directories, SSH directories, cloud-drive roots, browser profiles, and password-manager data must never be mounted into agent containers.
+
+The Serena development helper binds the current repository RW at `/workspace`, then overlays Git
+metadata, local environment/state paths, and protected rails with empty or read-only binds. A
+private temporary bind receives only `.serena/cache` writes; global state is tmpfs. It has no Agent
+Lab secrets mount, host home mount, proxy environment, Docker socket, or runtime install path.
+The Serena source and direct language-server/tool versions are fetched at the explicit image build
+and pinned before the no-network runtime is started.
 
 ## Allowlist Limitation
 

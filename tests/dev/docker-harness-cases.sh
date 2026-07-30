@@ -39,6 +39,7 @@ network-boundary tests/docker/network-boundary.sh
 dns-contract tests/docker/dns-contract.sh
 runtime-hardening tests/docker/runtime-hardening.sh
 secret-nondisclosure tests/docker/secret-nondisclosure.sh
+serena-runtime tests/docker/serena-runtime.sh
 EOF
 actual_suites="$work/actual-docker-suites"
 awk '$1 == "suite" { print $2, $3 }' "$docker_manifest" > "$actual_suites"

@@ -1,0 +1,44 @@
+services:
+  serena:
+    profiles:
+      - serena
+    image: ${AGENT_LAB_SERENA_IMAGE:?set by scripts/serena-mcp}
+    pull_policy: never
+    network_mode: none
+    working_dir: /workspace
+    user: "${AGENT_LAB_SERENA_UID:?}:${AGENT_LAB_SERENA_GID:?}"
+    environment:
+      HOME: /tmp/serena-home
+      SERENA_HOME: /tmp/serena
+      SERENA_USAGE_REPORTING: "false"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g
+    volumes:
+      - type: bind
+        source: ${AGENT_LAB_SERENA_PROJECT_DIR:?set by scripts/serena-mcp}
+        target: /workspace
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AGENT_LAB_SERENA_GIT_MASK_SOURCE:?set by scripts/serena-mcp}
+        target: /workspace/.git
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AGENT_LAB_SERENA_CACHE_DIR:?set by scripts/serena-mcp}
+        target: /workspace/.serena/cache
+        read_only: false
+        bind:
+          create_host_path: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    restart: "no"
+    stdin_open: true

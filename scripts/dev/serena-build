@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+serena_repo_root="$(pwd -P)"
+# shellcheck source=scripts/lib/serena.sh
+source "$serena_repo_root/scripts/lib/serena.sh"
+
+infra() {
+  printf 'INFRA %s\n' "$*" >&2
+  exit 125
+}
+
+command -v docker >/dev/null 2>&1 || infra "Docker CLI is unavailable"
+docker info >/dev/null 2>&1 || infra "Docker daemon is unavailable"
+
+docker build \
+  --pull=false \
+  -t "$AGENT_LAB_SERENA_TAG" \
+  -f images/serena/Dockerfile \
+  .
+
+actual_ref="$(
+  docker image inspect \
+    --format '{{index .Config.Labels "org.agent-lab.serena.ref"}}' \
+    "$AGENT_LAB_SERENA_TAG"
+)"
+if [ "$actual_ref" != "$AGENT_LAB_SERENA_REF" ]; then
+  die "built Serena image does not match pinned ref $AGENT_LAB_SERENA_REF"
+fi
+
+docker run \
+  --rm \
+  --network none \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+  "$AGENT_LAB_SERENA_TAG" \
+  --version
+
+printf 'PASS Serena image %s (%s)\n' \
+  "$AGENT_LAB_SERENA_VERSION" "$AGENT_LAB_SERENA_REF"
