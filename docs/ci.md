@@ -5,11 +5,17 @@ pull requests, merge-queue candidates, and pushes to `dev`, `master`, and
 `main`, and exposes one stable branch-protection result:
 **`CI / Required gates`**.
 
+`dev` is the repository's integration and pull-request base. The additional
+`master` and `main` workflow triggers protect those names if they are retained
+as publication or compatibility branches; a trigger does not make either one
+an agent integration target. See [Development and verification](development.md)
+for the branch workflow.
+
 ## Required workers
 
 | Check | Claim | Exact local replay |
 | --- | --- | --- |
-| `CI / Fast` | changed-file guard, shell/unit contracts, and Docker-free security gate | `AGENT_LAB_DIFF_BASE=<SHA from the gate summary> ./scripts/dev/check default quick` |
+| `CI / Fast` | changed-file guard, shell/unit contracts, and Docker-free security gate | `AGENT_LAB_DIFF_BASE=THE_SHA_FROM_GATE_SUMMARY ./scripts/dev/check default quick` |
 | `CI / Static` | strict Compose rendering and static configuration invariants | `./tools/validate.sh --strict` |
 | `CI / Docker security` | deterministic runtime containment evidence | `./scripts/dev/docker-gate` |
 
@@ -60,9 +66,16 @@ write access.
 ## Repository ruleset
 
 After the workflow has emitted its first check, require `CI / Required gates`
-on both `dev` and `master`. Require CodeQL through the repository's code-scanning
-rule. Enable the up-to-date-branch requirement or a merge queue so the tested
+on `dev` and on every retained publication branch (`master` or `main`) that can
+receive changes. Require CodeQL through the repository's code-scanning rule.
+Enable the up-to-date-branch requirement or a merge queue so the tested
 synthetic merge commit includes the current integration branch.
 
 Do not require worker or matrix names individually. The stable aggregate is the
 public contract; its versioned manifest defines the internal required set.
+
+Related references:
+
+- [Documentation map](README.md)
+- [Security verification](../SECURITY.md#security-verification)
+- [Threat model](../THREAT_MODEL.md)

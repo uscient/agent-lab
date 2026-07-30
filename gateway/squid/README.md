@@ -9,11 +9,21 @@ The policy:
 - Allows only ports 80 and 443.
 - Allows `CONNECT` only to port 443.
 - Denies private, loopback, link-local, multicast, reserved, and cloud-metadata ranges listed in `policies/lan.denylist.example`.
-- Allows only domains listed in `policies/egress.allowlist.example`.
+- Allows only domains in the selected allowlist mounted at `/etc/squid/allowlist.txt`.
 - Denies raw IP hostnames where Squid can identify them.
 - Defaults to deny all other requests.
 - Writes `access.log` and `cache.log` to the `audit` volume.
 - Disables caching for agent traffic.
+
+There are two policy inputs:
+
+- direct profile/test operation accepts an interpolated path and defaults to
+  `policies/egress.allowlist.example`;
+- `scripts/agent` validates named recipes, publishes a content-addressed
+  allowlist, and verifies its hash before starting a workload.
+
+Recipes—not an arbitrary direct allowlist—are authoritative for normal agent
+runs. See [Enable narrow egress](../../docs/operations.md#enable-narrow-egress).
 
 ## TLS/SNI Status
 
@@ -24,3 +34,7 @@ This means the lab has not proven protection against a crafted client that CONNE
 ## Hardening Status
 
 The Squid service uses no public ports, no Docker socket, no privileged mode, and no host home mounts. `read_only: true` and aggressive capability dropping are deferred until Squid boot behavior is validated with the chosen image, because over-hardening the proxy into a non-booting service would create a misleading boundary.
+
+See [Agent Lab architecture](../../docs/architecture.md#network-model) and the
+[threat model](../../THREAT_MODEL.md) for system-level claims and residual
+risks.

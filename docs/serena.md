@@ -298,6 +298,9 @@ container IDs, or host-only paths in them.
 
 Related repository guidance:
 
+- [Documentation map](README.md)
+- [Development and verification](development.md)
+- [Architecture](architecture.md)
 - [Agent development rules](../AGENTS.md)
 - [Development-client configuration](agent-config.md)
 - [CI gate mapping](ci.md)

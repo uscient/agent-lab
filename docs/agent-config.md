@@ -4,9 +4,14 @@ How the three coding agents that **develop Agent Lab** (Claude Code, Codex, Grok
 work autonomously inside the `AGENTS.md` boundary: develop on a branch, publish that branch, open a
 PR to `dev`, never merge it themselves, and never weaken containment.
 
+For the normal maintainer workflow and gates, start with
+[Development and verification](development.md). This page is the specialist reference for client
+policy wiring.
+
 > **Framing.** The `PreToolUse` guard is **defense-in-depth** — it makes the safe path automatic and
 > catches mistakes and casual evasion. The **real** boundary is containment (the sandbox,
-> no Docker socket, no host mounts, internal-only network — see `SECURITY.md` / `THREAT_MODEL.md`).
+> no Docker socket, no broad or whole home-directory mounts, internal-only network — see
+> `SECURITY.md` / `THREAT_MODEL.md`).
 > Read every "hard line" here as "defense-in-depth, backed by containment."
 
 ## Architecture — shared core + thin per-tool adapters
@@ -16,18 +21,23 @@ One operating policy, shared enforcement, and three generated thin adapters:
 | Concern | Single source | Consumed by |
 |---|---|---|
 | Operating policy | `AGENTS.md` | auto-discovered by all three tools |
-| Enforcement logic | `tools/pretooluse-guard.sh` + `tools/session-bootstrap.sh` + `policy/*.patterns` | each tool's `PreToolUse` / `SessionStart` hook |
+| Enforcement logic | `tools/pretooluse-guard.sh` + `tools/session-bootstrap.sh` + `policy/*.patterns` | command, file, secret-read, Serena-mutation, and session hooks |
 | Native adapter rule bodies | `policy/allow.commands` + `NATIVE_DENY` in `tools/render-adapters.sh` | `tools/render-adapters.sh` → the three adapters |
 
 ```text
 AGENTS.md  policy/                       # shared core (instruction + enforcement data)
-tools/pretooluse-guard.sh                # the one enforcement brain (PreToolUse: Bash + Edit/Write)
+tools/pretooluse-guard.sh                # PreToolUse: command, read/write, and Serena mutations
 tools/session-bootstrap.sh               # SessionStart: protected branch -> dev-based work branch
 tools/render-adapters.sh                 # generates the adapter rule bodies
 tools/codex-permission-request.sh        # Codex PermissionRequest approver (mirrors policy)
-tools/bin/{git,gh}                        # argv-level PATH shims (deep defense)
+tools/bin/{git,gh}                        # optional argv-level PATH shims
 .claude/settings.json  .codex/{config.toml,hooks.json,rules/}  .grok/{config.toml,hooks/}
 ```
+
+The tracked client configurations wire the hooks and native rules directly. They do not prepend
+`tools/bin` to `PATH`. The Git/GitHub shims are an optional additional layer for a launcher that
+chooses to put them first; do not claim shim coverage unless that PATH setup is verified in the
+actual session.
 
 ## Update a shared rule (the only place to edit)
 
@@ -115,8 +125,9 @@ The shared guard/policy/AGENTS.md are reused unchanged — that is the point of 
 
 This config governs the tools **developing** Agent Lab (control plane). It does **not** govern agents
 run **by** Agent Lab as contained workloads via `scripts/agent` / wrapped images (data plane) — those
-are bounded by *containment* (internal network, Squid egress, no socket/host mounts, mount guards) and
-may be doing unrelated work; the dev git-policy does not apply inside them.
+are bounded by *containment* (internal network, Squid egress, no socket or broad host mounts, guarded
+project/secrets mounts) and may be doing unrelated work; the dev git-policy does not apply inside
+them.
 
 - **Do not** bake the guard, shims, or git-policy into `scripts/agent` or wrapped images. The shims
   (`tools/bin`) and guard live host-side, in the editing path only.
@@ -127,7 +138,8 @@ may be doing unrelated work; the dev git-policy does not apply inside them.
   `AGENT_LAB_PROJECT_DIR` at the repo root (RW) with a coding-agent image — caller configuration,
   not a baked runtime role. Select a secrets directory outside that project tree; the data-plane
   launcher rejects overlapping project/secrets paths. The repo-scoped configs travel with the repo,
-  so an agent editing Agent Lab inherits the dev policy wherever it runs.
+  but the coding client must still trust and load them. Verify a guard-fired denial before claiming
+  the development policy is active.
 
 ### Serena is a contained control-plane helper
 
@@ -146,3 +158,9 @@ Do not use Serena's user-global setup commands for this repo and do not add `--p
 `--project-from-cwd` to the registration. The repository launcher must start recoverably so all
 clients can perform the explicit activation sequence in
 [Using Serena to develop Agent Lab](serena.md).
+
+Related guides:
+
+- [Documentation map](README.md)
+- [Architecture](architecture.md)
+- [CI gate mapping](ci.md)

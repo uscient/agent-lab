@@ -2,6 +2,11 @@
 
 `./scripts/egress-test` runs the acceptance tests from a disposable `egress-test` container attached only to the internal `agents` network.
 
+This is a live operator acceptance smoke. It depends on external network and
+endpoint behavior and is not the deterministic runtime security gate used by
+required CI. Run `./scripts/dev/docker-gate` for that evidence; see
+[Development and verification](../../docs/development.md).
+
 ## No-Internet Mode
 
 Profiles: `core` and `devtools`. `egress-proxy` is stopped.
@@ -40,3 +45,8 @@ After allowlisted mode is verified, the script stops `egress-proxy` and reruns a
 SNI mismatch protection is not implemented. The test output includes a `NOT_IMPLEMENTED` line for this case so it is visible rather than silently skipped. A future change should add validated Squid peek/splice behavior or a different proven SNI control.
 
 Raw direct egress attempts are blocked by the internal network but are not logged. Only proxy-mediated attempts are logged by Squid.
+
+The test profile accepts a direct allowlist path and uses the tracked example
+by default. Normal workloads started through `scripts/agent` use validated,
+content-addressed recipes instead; see
+[Enable narrow egress](../../docs/operations.md#enable-narrow-egress).
