@@ -5,5 +5,12 @@
     hosts {
         172.30.0.10 dns.agent-lab.local
         172.30.0.20 egress-proxy.agent-lab.local
+        fallthrough
+    }
+
+    # Exact external-name contract: A and AAAA return authoritative NXDOMAIN.
+    # There is deliberately no forwarder or fallback resolver.
+    template IN A AAAA {
+        rcode NXDOMAIN
     }
 }
