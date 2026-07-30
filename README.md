@@ -121,28 +121,36 @@ Nothing starts by default. The helper scripts activate profile combinations inte
 
 `./scripts/up egress` automatically includes `core`. `./scripts/up devtools` also includes `core`, so it can be used for no-internet tests without starting Squid.
 
-## Serena development tooling
+## Developing Agent Lab with Serena
 
-Repository-scoped Claude, Codex, and Grok configurations register Serena as a semantic development
-tool. Serena runs through a dedicated one-shot Compose service with no network, a read-only root
-filesystem, and tmpfs-only global state. The source tree is RW at `/workspace`, while Git metadata,
-local environment/state paths, and protected rails are hidden or overlaid read-only; a separate
-private temporary bind receives only `.serena/cache` writes. It never receives the Agent Lab secrets
-mount or host home state. Binds are private and non-recursive, and the launcher fails closed on
-child mounts or nested Git metadata before startup. Serena is not part of workloads started by
-`scripts/agent`.
+Claude, Codex, and Grok can use Serena for symbol-aware Bash navigation, bounded semantic edits, and
+language-server diagnostics while developing this repository. This is development tooling, not
+part of the experimental workloads started by `scripts/agent`.
 
-Build the pinned toolchain once, then run the fail-loud MCP smoke:
+Build the contained toolchain once and verify it:
 
 ```bash
 ./scripts/dev/serena-build
 ./scripts/dev/serena-smoke
 ```
 
-The smoke performs explicit project activation and proves uncached Bash symbols,
-definition/reference navigation, a disposable semantic edit, exact Error diagnostics, and an
-independent Agent Lab check. See [`docs/serena.md`](docs/serena.md) for agent workflow and
-troubleshooting.
+At the start of each coding session, the agent should use this Serena sequence:
+
+```text
+get_current_config
+activate_project(project="/workspace")       # when the project is absent or wrong
+get_current_config
+get_symbols_overview(relative_path="scripts/lib/config.sh")
+```
+
+The project is `agent-lab-dev`, its Serena-visible root is `/workspace`, and semantic analysis covers
+`.sh` and `.bash` files. The final live symbol call proves more than a successful MCP connection or
+project activation.
+
+Serena runs in a dedicated one-shot, no-network Compose service. It receives this checkout but no
+host home, credentials, secrets, Docker socket, proxy, port, or Agent Lab workload state. For the
+daily workflow, a real code example, tool-selection guidance, health evidence, limitations, and
+recovery steps, read [Using Serena to develop Agent Lab](docs/serena.md).
 
 ## Egress Modes
 

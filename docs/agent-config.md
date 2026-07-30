@@ -144,4 +144,5 @@ non-login, no-profile Bash for repository-root discovery.
 
 Do not use Serena's user-global setup commands for this repo and do not add `--project` or
 `--project-from-cwd` to the registration. The repository launcher must start recoverably so all
-clients can perform the explicit activation sequence documented in `docs/serena.md`.
+clients can perform the explicit activation sequence in
+[Using Serena to develop Agent Lab](serena.md).
