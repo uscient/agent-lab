@@ -36,8 +36,7 @@ AGENT_LAB_ALLOWLIST_RECIPES=base \
   "${REPO_ROOT}/scripts/agent" -- bash /workspace/cases.sh deny
 
 printf '== agent containment: allowlisted egress (node-dev recipe) ==\n'
-# Squid loads the allowlist at startup; recipe changes need a stack restart (see scripts/agent).
-"${REPO_ROOT}/scripts/agent" down
+# scripts/agent content-addresses the policy and recreates Squid when its hash changes.
 AGENT_LAB_ALLOWLIST_RECIPES=base,node-dev \
   "${REPO_ROOT}/scripts/agent" -- bash /workspace/cases.sh allow
 

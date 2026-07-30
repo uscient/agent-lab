@@ -1,0 +1,20 @@
+# Repository-root build contexts are deny-by-default. Keep this list aligned with the
+# only two root-context Dockerfiles: images/devbox and tests/egress.
+**
+!.dockerignore
+!images/
+!images/devbox/
+!images/devbox/Dockerfile
+!tests/
+!tests/egress/
+!tests/egress/Dockerfile
+!tests/egress/cases.sh
+!tools/
+!tools/agent-entrypoint.sh
+
+# Explicit defense-in-depth for local and credential-bearing paths.
+secrets
+.env*
+.git
+.cache
+*.log

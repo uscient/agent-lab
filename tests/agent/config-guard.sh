@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Regression for the config-authority fix (High-1): a BYOA value set ONLY in the env-file must
 # be loaded, validated, and guarded by scripts/agent -- never bypassed. Docker-free: `--check`
-# loads/validates/guards and builds the allowlist, but never builds images or brings up a
-# stack. Run: bash tests/agent/config-guard.sh
+# validates configuration, recipes, and canonical paths without creating state or calling
+# Docker. Run: bash tests/agent/config-guard.sh
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 cd "$repo_root"
@@ -15,12 +15,23 @@ fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/secrets"
 
-# These must NOT be in our shell env, so the loader is forced to read them from the env-file.
-unset AGENT_LAB_PROJECT_DIR AGENT_LAB_SECRETS_DIR AGENT_LAB_ALLOWLIST_RECIPES \
-      AGENT_LAB_EPHEMERAL_HOME AGENT_LAB_AGENT_IMAGE AGENT_LAB_AGENT_UID AGENT_LAB_AGENT_GID || true
-
-run_check() { AGENT_LAB_ENV_FILE="$1" ./scripts/agent --check; }
+run_check() {
+  env -i \
+    PATH="/usr/bin:/bin" \
+    HOME="$HOME" \
+    AGENT_LAB_ENV_FILE="$1" \
+    AGENT_LAB_SECRETS_DIR="$work/secrets" \
+    AGENT_LAB_AGENT_IMAGE="fixture:test" \
+    AGENT_LAB_ALLOWLIST_RECIPES="base" \
+    AGENT_LAB_EPHEMERAL_HOME="1" \
+    AGENT_LAB_AGENT_UID="1000" \
+    AGENT_LAB_AGENT_GID="1000" \
+    AGENT_LAB_AGENT_MEM="1g" \
+    AGENT_LAB_AGENT_CPUS="1" \
+    ./scripts/agent --check
+}
 
 no_bringup() { ! printf '%s\n' "$1" | grep -qE '(Creating|Created|Starting|Started|Pulling|Running)'; }
 

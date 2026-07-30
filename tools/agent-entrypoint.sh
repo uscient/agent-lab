@@ -18,9 +18,16 @@ if [ -d "$SECRETS_DIR" ]; then
     name=$(basename "$f")
     case "$name" in *.env) continue ;; .*) continue ;; esac
     case "$name" in
-      ''|[0-9]*|*[!A-Za-z0-9_]*) printf 'agent-entrypoint: skip non-identifier secret file: %s\n' "$name" >&2; continue ;;
+      ''|[0-9]*|*[!A-Za-z0-9_]*)
+        printf 'agent-entrypoint: skip invalid secret filename\n' >&2
+        continue
+        ;;
     esac
-    val=$(cat "$f"); export "$name=$val"
+    # POSIX command substitution strips trailing newlines. Append and then remove a
+    # non-newline sentinel so file content reaches the environment byte-for-byte.
+    val=$(cat "$f"; printf '.')
+    val=${val%.}
+    export "$name=$val"
   done
   for ef in "$SECRETS_DIR"/*.env; do
     [ -f "$ef" ] || continue
@@ -31,7 +38,9 @@ if [ -d "$SECRETS_DIR" ]; then
       ekey=${line%%=*}
       case "$ekey" in 'export '*) ekey=${ekey#export } ;; esac
       case "$ekey" in
-        ''|[0-9]*|*[!A-Za-z0-9_]*) printf 'agent-entrypoint: skip non-identifier in %s: %s\n' "$ef" "$ekey" >&2 ;;
+        ''|[0-9]*|*[!A-Za-z0-9_]*)
+          printf 'agent-entrypoint: skip invalid identifier in env file\n' >&2
+          ;;
         *) export "$ekey=${line#*=}" ;;
       esac
     done < "$ef"

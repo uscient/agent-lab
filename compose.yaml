@@ -29,11 +29,16 @@ networks:
     driver: bridge
     internal: true
     enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config:
         - subnet: ${AGENT_LAB_AGENTS_SUBNET:-172.30.0.0/24}
   egress:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${AGENT_LAB_EGRESS_SUBNET:-198.18.0.0/24}
 
 volumes:
   audit:
