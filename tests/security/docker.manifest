@@ -1,0 +1,16 @@
+# Strict deterministic Docker security gate.
+# Every suite owns a unique Compose project and cleans it up on every exit.
+
+tool awk
+tool bash
+tool cat
+tool curl
+tool docker
+tool grep
+tool jq
+tool mktemp
+tool sed
+tool sort
+tool tar
+
+suite network-boundary tests/docker/network-boundary.sh SUMMARY failures=0

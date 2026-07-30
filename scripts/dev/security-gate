@@ -4,11 +4,12 @@ source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
 cd_root
 
 root="$(repo_root)"
-manifest="$root/tests/security/fast.manifest"
+mode="fast"
+manifest=""
 work=""
 
 usage() {
-  printf 'Usage: %s [fast] [--manifest PATH]\n' "$0" >&2
+  printf 'Usage: %s [fast|docker] [--manifest PATH]\n' "$0" >&2
 }
 
 infra() {
@@ -22,9 +23,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ "${1:-}" = "fast" ]; then
-  shift
-fi
+case "${1:-}" in
+  fast|docker) mode="$1"; shift ;;
+esac
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --manifest)
@@ -43,6 +44,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ -z "$manifest" ]; then
+  manifest="$root/tests/security/${mode}.manifest"
+fi
 case "$manifest" in
   /*) ;;
   *) manifest="$root/$manifest" ;;
@@ -143,6 +147,19 @@ done
 if [ "$preflight_failed" -ne 0 ]; then
   exit 125
 fi
+
+case "$mode" in
+  docker)
+    if ! docker info >/dev/null 2>&1; then
+      infra "Docker daemon is unavailable"
+      exit 125
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+      infra "Docker Compose v2 is unavailable"
+      exit 125
+    fi
+    ;;
+esac
 
 work="$(mktemp -d)"
 passed=0

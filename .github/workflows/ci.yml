@@ -58,3 +58,6 @@ jobs:
             --load \
             -t agent-lab/devbox:local \
             -f images/devbox/Dockerfile .
+
+      - name: Deterministic Docker security gate
+        run: ./scripts/dev/security-gate docker
