@@ -79,6 +79,29 @@ mutate_and_reject "extra-network mutation is detected" \
 mutate_and_reject "published-port mutation is detected" \
   '.[0].HostConfig.PortBindings={"8080/tcp":[{"HostPort":"49152"}]}'
 
+mutate_evidence_and_reject() {
+  local name="$1" key="$2" replacement="$3"
+  local output="$work/process-mutated.env"
+  awk -F= -v key="$key" -v replacement="$replacement" '
+    $1 == key { print key "=" replacement; next }
+    { print }
+  ' "$work/process.env" > "$output"
+  if [ -x "$checker" ] &&
+     "$checker" "$work/secure.json" ephemeral 1000 1000 fixture "$output" \
+       >/dev/null 2>&1; then
+    fail "$name"
+  else
+    pass "$name"
+  fi
+}
+
+mutate_evidence_and_reject "effective-capability mutation is detected" \
+  cap_eff 0000000000002000
+mutate_evidence_and_reject "runtime NNP mutation is detected" no_new_privs 0
+mutate_evidence_and_reject "writable mountinfo root mutation is detected" \
+  root_mount_opts rw,relatime
+mutate_evidence_and_reject "unlimited cgroup mutation is detected" memory_max max
+
 if [ -f "$repo_root/tests/security/docker.manifest" ] &&
    grep -Fq 'suite runtime-hardening tests/docker/runtime-hardening.sh' \
      "$repo_root/tests/security/docker.manifest"; then

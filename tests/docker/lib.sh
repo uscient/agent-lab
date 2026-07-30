@@ -102,13 +102,19 @@ docker_test_compose() {
 docker_test_agent() {
   local recipes="$1"
   shift
+  docker_test_agent_image "agent-lab/devbox:local" "$recipes" "$@"
+}
+
+docker_test_agent_image() {
+  local image="$1" recipes="$2"
+  shift 2
   COMPOSE_PROJECT_NAME="$LAB_PROJECT" \
   AGENT_LAB_ENV_FILE="$LAB_ENV_FILE" \
-  AGENT_LAB_AGENT_IMAGE="agent-lab/devbox:local" \
+  AGENT_LAB_AGENT_IMAGE="$image" \
   AGENT_LAB_PROJECT_DIR="$LAB_COPY/tests/docker/workspace" \
   AGENT_LAB_SECRETS_DIR="$LAB_COPY/secrets" \
   AGENT_LAB_ALLOWLIST_RECIPES="$recipes" \
-  AGENT_LAB_EPHEMERAL_HOME="1" \
+  AGENT_LAB_EPHEMERAL_HOME="${LAB_EPHEMERAL_HOME:-1}" \
   AGENT_LAB_AGENT_UID="$LAB_AGENT_UID" \
   AGENT_LAB_AGENT_GID="$LAB_AGENT_GID" \
   AGENT_LAB_AGENT_MEM="1g" \

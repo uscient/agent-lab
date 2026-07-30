@@ -13,5 +13,8 @@ tool sed
 tool sort
 tool tar
 
+suite image-volume tests/docker/image-volume.sh SUMMARY failures=0
+suite wrapper-context-runtime tests/docker/wrapper-context.sh SUMMARY failures=0
 suite network-boundary tests/docker/network-boundary.sh SUMMARY failures=0
 suite dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
+suite runtime-hardening tests/docker/runtime-hardening.sh SUMMARY failures=0
