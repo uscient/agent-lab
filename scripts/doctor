@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/common"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/lib/secret-scan.sh"
 
 failures=0
 warnings=0
@@ -125,13 +126,13 @@ else
   printf '%s\n' "$tracked_env"
 fi
 
-if [ -f "$ENV_FILE" ] && grep -E '([A-Z0-9_]*(TOKEN|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*[[:space:]]*[:=][[:space:]]*["'\'']?[A-Za-z0-9_./+=-]{16,}|BEGIN (RSA |OPENSSH |EC |DSA |)PRIVATE KEY)' "$ENV_FILE" >/dev/null; then
+if [ -f "$ENV_FILE" ] && grep -E "$AGENT_LAB_SECRET_PATTERN" "$ENV_FILE" >/dev/null; then
   fail ".env.local contains secret-looking assignments; use files under secrets/ instead"
 else
   pass ".env.local has no obvious secret-looking assignments"
 fi
 
-if (cd "$REPO_ROOT" && git grep -I -n -E '([A-Z0-9_]*(TOKEN|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*[[:space:]]*[:=][[:space:]]*["'\'']?[A-Za-z0-9_./+=-]{16,}|BEGIN (RSA |OPENSSH |EC |DSA |)PRIVATE KEY)' -- . >/dev/null); then
+if agent_lab_tracked_source_has_secret_pattern "$REPO_ROOT"; then
   fail "tracked source contains obvious secret-looking assignments or private keys"
 else
   pass "no obvious tracked secret patterns"

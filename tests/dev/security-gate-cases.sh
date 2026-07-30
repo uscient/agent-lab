@@ -67,6 +67,7 @@ allowlist-schema tests/agent/allowlist-cases.sh
 image-volume-policy tests/agent/image-volume-policy-cases.sh
 runtime-inspector tests/agent/runtime-inspector-cases.sh
 secret-parser tests/agent/entrypoint-secret-cases.sh
+doctor-secret-scan tests/agent/doctor-secret-scan-cases.sh
 egress-policy-transition tests/egress/policy-transition-cases.sh
 dns-contract-unit tests/egress/dns-contract-cases.sh
 wrapper-context tests/wrap-image/context-cases.sh
