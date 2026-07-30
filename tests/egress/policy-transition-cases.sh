@@ -128,10 +128,11 @@ fi
 
 : > "$docker_log"
 if run_agent "base" "$work/unchanged.out" &&
-   ! grep -Fq -- "--force-recreate" "$docker_log"; then
-  pass "unchanged policy reuses the verified proxy"
+   ! grep -Fq -- "--force-recreate" "$docker_log" &&
+   ! grep -Fq -- " up -d --wait " "$docker_log"; then
+  pass "unchanged policy reuses the verified substrate without Compose startup"
 else
-  fail "unchanged policy reuses the verified proxy"
+  fail "unchanged policy reuses the verified substrate without Compose startup"
 fi
 
 if run_agent "base,node-dev" "$work/widen.out" &&
