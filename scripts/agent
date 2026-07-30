@@ -15,6 +15,8 @@ source "${REPO_ROOT}/scripts/lib/guard.sh"
 source "${REPO_ROOT}/scripts/lib/allowlist.sh"
 # shellcheck source=scripts/lib/config.sh
 source "${REPO_ROOT}/scripts/lib/config.sh"
+# shellcheck source=scripts/lib/image.sh
+source "${REPO_ROOT}/scripts/lib/image.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -122,12 +124,21 @@ fi
 build_compose "$overlay"
 
 # Seam: agent image. Build the default devbox locally when no BYO image is set.
-if [ -z "${AGENT_LAB_AGENT_IMAGE}" ] || [ "${AGENT_LAB_AGENT_IMAGE}" = "agent-lab/devbox:local" ]; then
+agent_image="${AGENT_LAB_AGENT_IMAGE:-agent-lab/devbox:local}"
+if [ "$agent_image" = "agent-lab/devbox:local" ]; then
   if ! docker image inspect agent-lab/devbox:local >/dev/null 2>&1; then
     printf 'Building default devbox image agent-lab/devbox:local\n'
     docker build -t agent-lab/devbox:local -f "${REPO_ROOT}/images/devbox/Dockerfile" "$REPO_ROOT"
   fi
+elif ! docker image inspect "$agent_image" >/dev/null 2>&1; then
+  printf 'Pulling agent image %s for metadata validation\n' "$agent_image"
+  docker pull "$agent_image"
 fi
+
+# Docker creates an anonymous writable mount for every image-declared VOLUME unless a
+# more specific runtime mount replaces it. Reject anything outside our exact mount set
+# before the containment substrate or agent is started.
+agent_lab_validate_image_volumes "$agent_image"
 
 # Start the containment substrate: CoreDNS + Squid. Squid loads the allowlist at startup,
 # so changing recipes needs `scripts/agent down` first to take effect.
