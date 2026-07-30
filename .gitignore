@@ -31,6 +31,10 @@ agent-state/
 # when written by tools or agents. Keep the dir via .gitkeep but ignore new contents.
 tmp/
 !tmp/.gitkeep
+
+# Local project planning and intake notes
+/proj/
+
 *.sqlite
 *.db
 *.log
