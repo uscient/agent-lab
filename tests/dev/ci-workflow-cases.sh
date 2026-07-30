@@ -108,6 +108,15 @@ require_text "$ci" '  contents: read' "CI has read-only repository permissions"
 require_pinned_actions "$ci"
 require_pinned_actions "$codeql"
 
+if [ "$(grep -Fxc \
+       '          CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci' "$ci")" -eq 3 ] &&
+   ! grep -Fxq \
+     '      CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci' "$ci"; then
+  pass "runner context is scoped to executable steps"
+else
+  fail "runner context is scoped to executable steps"
+fi
+
 require_job_text fast '    name: Fast' "fast job has a stable display name"
 require_job_text fast '    timeout-minutes: 15' "fast job has a bounded runtime"
 require_job_text fast '      diff-base: ${{ steps.diff-base.outputs.base }}' \
