@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+# shellcheck source=scripts/lib/serena.sh
+source "$repo_root/scripts/lib/serena.sh"
+
+usage() {
+  printf 'Usage: %s --context=codex|claude-code|grok\n' "$0" >&2
+}
+
+if [ "$#" -ne 1 ]; then
+  usage
+  exit 2
+fi
+case "$1" in
+  --context=codex) context="codex" ;;
+  --context=claude-code) context="claude-code" ;;
+  --context=grok) context="grok" ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+command -v docker >/dev/null 2>&1 || {
+  printf 'Serena MCP: Docker CLI is unavailable\n' >&2
+  exit 125
+}
+docker info >/dev/null 2>&1 || {
+  printf 'Serena MCP: Docker daemon is unavailable\n' >&2
+  exit 125
+}
+docker compose version >/dev/null 2>&1 || {
+  printf 'Serena MCP: Docker Compose v2 is unavailable\n' >&2
+  exit 125
+}
+
+if ! docker image inspect "$AGENT_LAB_SERENA_TAG" >/dev/null 2>&1; then
+  printf 'Serena MCP image is missing; run ./scripts/dev/serena-build\n' >&2
+  exit 125
+fi
+
+image_id="$(
+  docker image inspect --format '{{.Id}}' "$AGENT_LAB_SERENA_TAG"
+)" || {
+  printf 'Serena MCP: cannot resolve image identity\n' >&2
+  exit 125
+}
+if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  printf 'Serena MCP: Docker returned an invalid image identity\n' >&2
+  exit 125
+fi
+image_ref="$(
+  docker image inspect \
+    --format '{{index .Config.Labels "org.agent-lab.serena.ref"}}' \
+    "$image_id"
+)" || image_ref=""
+if [ "$image_ref" != "$AGENT_LAB_SERENA_REF" ]; then
+  printf 'Serena MCP: image does not match pinned Serena ref %s\n' \
+    "$AGENT_LAB_SERENA_REF" >&2
+  exit 125
+fi
+image_volumes="$(
+  docker image inspect --format '{{json .Config.Volumes}}' "$image_id"
+)" || image_volumes=""
+if [ "$image_volumes" != "null" ]; then
+  printf 'Serena MCP: image declares unexpected writable volumes\n' >&2
+  exit 125
+fi
+
+AGENT_LAB_SERENA_UID="$(id -u)"
+AGENT_LAB_SERENA_GID="$(id -g)"
+agent_lab_serena_validate_identity \
+  "$AGENT_LAB_SERENA_UID" "$AGENT_LAB_SERENA_GID" ||
+  exit $?
+
+mask_state="$(mktemp -d /tmp/agent-lab-serena-mask.XXXXXX)" || {
+  printf 'Serena MCP: cannot create private mount state\n' >&2
+  exit 125
+}
+# shellcheck disable=SC2317 # invoked indirectly by EXIT and signal traps
+cleanup_mount_state() {
+  if [[ "$mask_state" == /tmp/agent-lab-serena-mask.* ]] &&
+     [ -d "$mask_state" ] &&
+     [ ! -L "$mask_state" ]; then
+    find "$mask_state" -xdev -depth -delete >/dev/null 2>&1 || true
+  fi
+}
+# shellcheck disable=SC2317 # invoked indirectly by signal traps
+on_signal() {
+  local signal_status="$1"
+  trap - EXIT
+  cleanup_mount_state
+  exit "$signal_status"
+}
+trap cleanup_mount_state EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+agent_lab_serena_prepare_mounts "$repo_root" "$mask_state" || exit $?
+
+export AGENT_LAB_SERENA_IMAGE="$image_id"
+export AGENT_LAB_SERENA_PROJECT_DIR="$repo_root"
+export AGENT_LAB_SERENA_UID
+export AGENT_LAB_SERENA_GID
+
+compose_project="${COMPOSE_PROJECT_NAME:-agent-lab-serena}"
+
+compose_rc=0
+docker compose \
+  --project-name "$compose_project" \
+  --env-file /dev/null \
+  -f "$repo_root/compose.serena.yaml" \
+  -f "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" \
+  run \
+  --rm \
+  --no-deps \
+  -T \
+  serena \
+  start-mcp-server \
+  --transport stdio \
+  --context "$context" \
+  --enable-web-dashboard false \
+  --open-web-dashboard false \
+  --enable-gui-log-window false \
+  --log-level INFO ||
+  compose_rc=$?
+exit "$compose_rc"

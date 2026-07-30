@@ -71,6 +71,7 @@ egress-policy-transition tests/egress/policy-transition-cases.sh
 dns-contract-unit tests/egress/dns-contract-cases.sh
 wrapper-context tests/wrap-image/context-cases.sh
 adapter-idempotence tests/agent/render-adapters-idempotence.sh
+serena-config tests/serena/config-cases.sh
 policy-probe tests/agent/policy-verify.sh
 containment-static tools/containment-lint.sh
 EOF

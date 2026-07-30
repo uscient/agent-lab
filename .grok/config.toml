@@ -92,3 +92,9 @@ allow = [
   "Read(**)", "Edit(**)", "Write(**)",
 ]
 # <<< END GENERATED <<<
+
+# Serena is project-scoped and starts in a dedicated no-network container.
+# Do not pass --project here: explicit activation must remain recoverable.
+[mcp_servers.serena]
+command = "env"
+args = ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=grok"]

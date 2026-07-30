@@ -51,6 +51,23 @@ blocking Docker gate.
 
 Egress remains deny-by-default: the `base` recipe is empty, so an agent with no recipe reaches nothing, including its own API. Recipes are additive allowlist fragments; Squid still denies private ranges, raw IPs, and unsafe ports ahead of the allow rule, and matches the CONNECT host, not the TLS SNI (not yet implemented).
 
+## Serena Development Helper
+
+Serena is control-plane development tooling, not an `agent` workload or runtime dependency. Its
+one-shot Compose service uses `network_mode: none`, a read-only root filesystem, a non-root user,
+`cap_drop: ALL`, no-new-privileges, resource limits, and tmpfs for global state. The repository is
+RW at `/workspace` for explicitly requested source edits, but Git metadata, local
+environment/state paths, and protected rails are hidden or re-bound read-only. Project cache writes
+go to a private temporary bind at `/workspace/.serena/cache`. It receives no host home, Agent Lab
+secrets mount, credentials, proxy environment, Docker socket, or ports.
+Every bind is private and non-recursive. A metadata-only preflight fails closed on child mounts or
+nested Git metadata before an agent-controlled process starts.
+
+The image pins Serena source and preinstalls its pinned Bash language server and ShellCheck during
+the explicit build. At runtime the managed language-server directory is an immutable image path
+linked into tmpfs state; an unexpected install attempt therefore fails rather than opening egress.
+Usage reporting and the web dashboard are disabled in addition to the absent network.
+
 ## Residual Risks
 
 - This is practical Docker containment, not VM isolation. A host kernel or container-runtime escape defeats this design.

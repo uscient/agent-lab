@@ -9,7 +9,7 @@
 # Generated files (do not hand-edit the marked/whole regions):
 #   .claude/settings.json          (whole file — strict JSON, no comments)
 #   .codex/rules/agent-lab.rules   (whole file — execpolicy prefix_rule; token-based)
-#   .grok/config.toml              (whole file — [permission] + [ui])
+#   .grok/config.toml              (whole file — [permission] + project MCP)
 #
 # Codex notes: execpolicy is TOKEN-prefix, so branch-aware decisions cannot be expressed as rules;
 # the guard enforces those while native rules cover unconditional denials.
@@ -21,6 +21,9 @@ cd "$root"
 command -v jq >/dev/null 2>&1 || { echo "render-adapters: jq is required" >&2; exit 1; }
 
 mapfile -t ALLOW < <(grep -vE '^[[:space:]]*(#|$)' policy/allow.commands)
+
+# Client hook names differ even though all three clients invoke the same Serena tools.
+SERENA_MCP_MUTATORS='mcp__serena__replace_symbol_body|mcp__serena__insert_before_symbol|mcp__serena__insert_after_symbol'
 
 # Unconditional native deny heads. AGENTS.md is authoritative; guard handles scoped operations.
 NATIVE_DENY=(
@@ -60,18 +63,19 @@ emit_claude() {
 
   local guard='bash "$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh"'
   local boot='bash "$(git rev-parse --show-toplevel)/tools/session-bootstrap.sh" claude'
+  local file_matcher="Read|Edit|Write|MultiEdit|NotebookEdit|${SERENA_MCP_MUTATORS}"
   mkdir -p .claude
   jq -n \
     --argjson allow "$(printf '%s\n' "${allow[@]}" | jq -R . | jq -s .)" \
     --argjson deny "$(printf '%s\n' "${deny[@]}" | jq -R . | jq -s .)" \
-    --arg guard "$guard" --arg boot "$boot" \
+    --arg guard "$guard" --arg boot "$boot" --arg file_matcher "$file_matcher" \
     '{
       "$schema": "https://json.schemastore.org/claude-code-settings.json",
       permissions: { defaultMode: "acceptEdits", allow: $allow, deny: $deny },
       hooks: {
         PreToolUse: [
           { matcher: "Bash", hooks: [ { type: "command", command: $guard } ] },
-          { matcher: "Read|Edit|Write|MultiEdit|NotebookEdit", hooks: [ { type: "command", command: $guard } ] }
+          { matcher: $file_matcher, hooks: [ { type: "command", command: $guard } ] }
         ],
         SessionStart: [
           { matcher: "startup|resume", hooks: [ { type: "command", command: $boot } ] }
@@ -110,7 +114,7 @@ emit_codex() {
   } > .codex/rules/agent-lab.rules
 }
 
-# ---------------- Grok: whole config.toml ([permission] + [ui]) ----------------
+# ---------------- Grok: whole config.toml ([permission] + project MCP) ----------------
 emit_grok() {
   local c d
   mkdir -p .grok
@@ -138,6 +142,12 @@ emit_grok() {
     echo '  "Read(**)", "Edit(**)", "Write(**)",'
     echo ']'
     echo "# <<< END GENERATED <<<"
+    echo
+    echo "# Serena is project-scoped and starts in a dedicated no-network container."
+    echo "# Do not pass --project here: explicit activation must remain recoverable."
+    echo "[mcp_servers.serena]"
+    echo 'command = "env"'
+    echo 'args = ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=grok"]'
   } > .grok/config.toml
 }
 

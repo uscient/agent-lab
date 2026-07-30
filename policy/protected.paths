@@ -14,5 +14,15 @@ tools/bin/
 .claude/
 .codex/
 .grok/
+.mcp.json
+.serena/.gitignore
+.serena/project.yml
+compose.serena.yaml
+images/serena/
+scripts/dev/serena-build
+scripts/dev/serena-smoke
+scripts/lib/serena.sh
+scripts/serena-mcp
+tools/serena-entrypoint.sh
 .cursor/
 .devguard/

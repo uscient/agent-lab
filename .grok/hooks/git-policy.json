@@ -8,7 +8,7 @@
         ]
       },
       {
-        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|serena__replace_symbol_body|serena__insert_before_symbol|serena__insert_after_symbol",
         "hooks": [
           { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
         ]
