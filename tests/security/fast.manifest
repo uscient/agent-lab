@@ -1,0 +1,35 @@
+# Strict Docker-free security gate.
+# Format:
+#   tool  <executable>
+#   suite <stable-id> <repo-relative-script> <required completion marker...>
+
+tool awk
+tool bash
+tool basename
+tool cat
+tool cmp
+tool cp
+tool dirname
+tool env
+tool file
+tool find
+tool git
+tool grep
+tool head
+tool jq
+tool mktemp
+tool readlink
+tool sed
+tool shellcheck
+tool sort
+tool tr
+tool wc
+
+suite lint scripts/dev/lint-scripts PASS lint-scripts
+suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
+suite guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
+suite guard-mount tests/guard/cases.sh SUMMARY failures=0
+suite config-authority tests/agent/config-guard.sh SUMMARY failures=0
+suite adapter-idempotence tests/agent/render-adapters-idempotence.sh PASS generated adapters match tracked files and are idempotent
+suite policy-probe tests/agent/policy-verify.sh SUMMARY pass=
+suite containment-static tools/containment-lint.sh containment-lint: 0 fail, 0 warn

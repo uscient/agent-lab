@@ -4,13 +4,19 @@ source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
 cd_root
 
 scope="${1:-default}"
+base="${AGENT_LAB_DIFF_BASE:-}"
 fail=0
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-changed_files > "$tmp"
+if ! changed_files "$base" > "$tmp"; then
+  exit 125
+fi
 
 echo "== guard-diff scope: $scope =="
+if [ -n "$base" ]; then
+  echo "-- diff base: $base"
+fi
 
 echo "-- changed files --"
 cat "$tmp"
@@ -84,7 +90,10 @@ done < "$tmp"
 
 echo
 echo "-- whitespace check --"
-if ! git diff --check; then
+if [ -n "$base" ] && ! git diff --check "${base}...HEAD"; then
+  fail=1
+fi
+if ! git diff --check HEAD --; then
   fail=1
 fi
 
