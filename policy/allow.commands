@@ -2,7 +2,7 @@
 # Consumed by tools/render-adapters.sh to generate each tool's native allow rules. The guard is
 # DENY-oriented (it blocks deny/carveout/containment and lets everything else through), so this
 # file does not gate the guard — it defines what the adapters auto-approve for no-prompt autonomy.
-# Doctrine: doctrine/git-workflow.md (git), doctrine/containment.md (capabilities).
+# AGENTS.md defines the autonomy boundary.
 
 # --- repo work commands (the real Agent Lab stack: bash + docker-compose) ---
 ./scripts/dev/
@@ -14,7 +14,7 @@ shellcheck
 bash -n
 docker compose
 
-# --- local git (commit-friendly; remote integrity denied in deny.patterns) ---
+# --- Git/GitHub workflow (branch-aware operations are validated by the guard) ---
 git add
 git commit
 git fetch
@@ -29,6 +29,8 @@ git log
 git show
 git merge
 git rebase
+git push
+gh pr
 
 # --- standard read/inspect tools ---
 cat

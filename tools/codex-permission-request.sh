@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Codex PermissionRequest approver. Codex fires PermissionRequest when a tool call wants to escalate
-# past the sandbox — notably `git commit`, since workspace-write makes .git/ read-only. This keeps the
-# allowed set prompt-free WITHOUT a global bypass, by MIRRORING the guard's policy (single source =
-# policy/*): approve the allow-set, deny whatever the guard denies, otherwise emit NO decision (defer).
+# past the sandbox. This keeps the allowed set prompt-free WITHOUT a global bypass: approve the
+# allow-set, deny whatever the authoritative guard denies, otherwise emit NO decision (defer).
 #
 # Response shape verified against Codex docs (2026-06-15):
 #   approve: {"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}
@@ -19,12 +18,6 @@ command -v jq >/dev/null 2>&1 && cmd="$(printf '%s' "$input" | jq -r '.tool_inpu
 [ -z "$cmd" ] && exit 0 # no command (file edits etc.) -> defer to sandbox + the PreToolUse guard
 
 active_patterns() { grep -vE '^[[:space:]]*(#|$)' "$1" 2>/dev/null || true; }
-match_any() {
-  local hay="$1" file="$2" pats
-  pats="$(active_patterns "$file")"
-  [ -z "$pats" ] && return 1
-  printf '%s' "$hay" | grep -Eq -f <(printf '%s\n' "$pats")
-}
 allow_match() {
   local c="$1" entry
   while IFS= read -r entry; do
@@ -39,11 +32,15 @@ allow_match() {
 allow() { printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}\n'; exit 0; }
 deny() { printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"%s"}}}\n' "$1"; exit 0; }
 
-# Deny anything the guard denies (single source of policy).
-match_any "$cmd" "$pol/deny.patterns" \
-  && deny "agent-lab: remote git/PR is the human owner (see doctrine/git-workflow.md)"
-match_any "$cmd" "$pol/carveout.patterns" \
-  && deny "agent-lab: destructive/integrity op denied under autonomy (see doctrine/destructive-ops.md)"
+# Deny anything the guard denies.
+guard_rc=0
+printf '{"tool_name":"Bash","tool_input":{"command":%s}}' \
+  "$(jq -Rn --arg c "$cmd" '$c')" \
+  | "$root/tools/pretooluse-guard.sh" >/dev/null 2>&1 || guard_rc=$?
+[ "$guard_rc" -eq 2 ] \
+  && deny "agent-lab: operation is outside the AGENTS.md autonomy boundary"
+[ "$guard_rc" -ne 0 ] \
+  && deny "agent-lab: policy guard failed closed"
 # Approve the allow-set (frictionless commit / local-git / work commands).
 allow_match "$cmd" && allow
 # Otherwise: no decision -> defer to Codex's normal flow.

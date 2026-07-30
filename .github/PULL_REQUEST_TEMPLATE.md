@@ -29,6 +29,6 @@
 - [ ] Change is minimal and focused
 - [ ] Tests / validation scripts pass (`./scripts/dev/check ...`)
 - [ ] No secrets or policy violations introduced
-- [ ] Follows internal process (AGENTS.md / doctrine)
+- [ ] Follows the internal process in `AGENTS.md`
 
 If you are not a member, please close this PR instead of submitting.

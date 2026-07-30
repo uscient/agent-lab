@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# agent-lab SessionStart hook: never work on master/main. Idempotent; never blocks the session.
+# agent-lab SessionStart hook: never work on dev/master/main. Idempotent; never blocks the session.
 # Usage (from each tool's SessionStart hook):  tools/session-bootstrap.sh <tool>   # claude|codex|grok
-# If HEAD is master/main/detached, create agent/<tool>/<slug>; otherwise no-op.
+# If HEAD is dev/master/main/detached, create agent/<tool>/<slug> from origin/dev (or local dev);
+# otherwise no-op.
 #   slug = ${AGENT_LAB_TASK_SLUG:-<UTC timestamp>}, sanitized to a valid ref component.
 set -uo pipefail
 
@@ -11,12 +12,21 @@ cd "$root" || exit 0
 
 branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
 case "$branch" in
-  master | main | DETACHED)
+  dev | master | main | DETACHED)
     slug="${AGENT_LAB_TASK_SLUG:-$(date -u +%Y%m%d-%H%M%S)}"
     slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/[-.]+$//')"
     [ -z "$slug" ] && slug="$(date -u +%Y%m%d-%H%M%S)"
     target="agent/${tool}/${slug}"
-    if git switch -c "$target" 2>/dev/null; then
+    base=""
+    if git show-ref --verify --quiet refs/remotes/origin/dev; then
+      base="origin/dev"
+    elif git show-ref --verify --quiet refs/heads/dev; then
+      base="dev"
+    else
+      echo "agent-lab: WARNING no origin/dev or local dev ref — cannot create a correctly based work branch" >&2
+      exit 0
+    fi
+    if git switch -c "$target" "$base" 2>/dev/null; then
       echo "agent-lab: started work branch $target" >&2
     elif git switch "$target" 2>/dev/null; then
       echo "agent-lab: switched to existing work branch $target" >&2

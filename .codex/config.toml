@@ -1,18 +1,16 @@
 # Codex project config — for an agent DEVELOPING Agent Lab (control plane).
-# Autonomy inside a hard boundary; NEVER a global bypass.
+# Autonomy inside the AGENTS.md boundary; NEVER a global bypass.
 # Do NOT use --yolo / --dangerously-bypass-approvals-and-sandbox / danger-full-access /
 # codex exec --full-auto / --ignore-rules (see docs/agent-config.md).
 
 approval_policy = "on-request"      # work inside the sandbox without prompts; ask to cross the boundary
 sandbox_mode    = "workspace-write" # read repo, edit workspace, run local commands
-web_search      = "disabled"        # no external integrations
+web_search      = "disabled"        # repository workflow uses Git/GitHub tools, not web search
 
 [features]
 hooks = true
 
 [sandbox_workspace_write]
-# Network OFF by design. This blocks `git push` (good) AND `git fetch` — so there is NO
-# in-session fetch on Codex; refresh remote state OUTSIDE the session first (see docs/agent-config.md).
-# Keeping fetch outside the session is the deliberate trade-off: enabling network would remove the
-# sandbox layer from the push denial.
-network_access = false
+# Network supports fetch, same-branch push, and PR creation. The guard, repository branch
+# protection, and AGENTS.md keep protected branches, auth, and integration mutations out of scope.
+network_access = true
