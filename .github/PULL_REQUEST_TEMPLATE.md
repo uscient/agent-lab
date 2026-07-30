@@ -27,7 +27,8 @@
 ## Checklist (members only)
 
 - [ ] Change is minimal and focused
-- [ ] Tests / validation scripts pass (`./scripts/dev/check ...`)
+- [ ] Fast gate passes with the appropriate diff base (see `docs/ci.md`)
+- [ ] Relevant strict/static or Docker gate has been run, or its omission is explained
 - [ ] No secrets or policy violations introduced
 - [ ] Follows the internal process in `AGENTS.md`
 

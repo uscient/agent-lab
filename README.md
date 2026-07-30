@@ -1,202 +1,185 @@
-# agent-lab
+# Agent Lab
 
-`agent-lab` is a Docker Compose containment lab for experimenting with autonomous agent workloads behind explicit network, filesystem, credential, and egress controls.
+Agent Lab is a Docker Compose containment lab for running untrusted or failure-prone agent workloads
+against a deliberately narrow set of host resources and network destinations.
 
-> **Repository status (public mirror)**
+It provides the containment substrate—an internal agent network, lab-local DNS, a deny-by-default
+egress proxy, guarded filesystem mounts, file-backed secrets, and executable security checks. It is
+not a general AI application stack, hosted service, or VM-grade sandbox.
+
+> **Repository status: public mirror**
 >
-> This code is published under the Apache 2.0 license for transparency, reference, and local use/forking.  
-> **No contributions are accepted from non-members.** Pull requests and issues from outside the organization will be closed without review.
->
-> See [CONTRIBUTING.md](.github/CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) for details.
+> This code is published under the Apache 2.0 license for transparency, reference, and local
+> use/forking. Contributions from outside the organization are not accepted. See
+> [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
-It is not a general AI application stack, a public SaaS control plane, or an unrestricted agent launcher. It implements the containment substrate — an internal agent network, controlled DNS, a Squid egress proxy, and acceptance tests — plus a bring-your-own-agent profile (`scripts/agent`) that runs any agent image on your project behind those controls.
+## What Agent Lab gives you
 
-## Default Posture
+- Agent containers join only an internal Docker network with no direct route to the host, LAN, or
+  internet.
+- CoreDNS answers lab-local names and refuses arbitrary external recursion.
+- Squid is the only dual-homed service and permits only explicitly selected destination domains.
+- Agent root filesystems are read-only, capabilities are dropped, privilege escalation is disabled,
+  and CPU, memory, and process limits are set.
+- Projects and secrets enter through separate, guarded mounts. Whole or broad host-home mounts,
+  credential stores, the Docker socket, privileged mode, host networking, and public ports are
+  refused. A narrow project below a home directory is allowed.
+- Runtime configuration is parsed as data, validated before side effects, and rechecked before
+  Docker consumes host paths.
+- Security claims are mapped to fast, static, and deterministic Docker runtime gates.
 
-- No public ports.
-- No direct internet from agent/test containers.
-- No Docker socket mounts.
-- No host home-directory mounts.
-- No privileged containers.
-- No real secrets in Git.
-- Agent/test containers attach only to the `agents` network.
-- The `agents` network is `internal: true`; this is the primary default-deny boundary.
-- Squid is the only sanctioned outbound path.
-- Proxy environment variables help cooperating tools, but they are not the security boundary.
+## Quick start
 
-This is practical Docker containment, not VM-grade isolation. Containers still share the host kernel. A container-runtime or kernel escape is outside the guarantees of this lab.
+Prerequisites are Bash, Docker with a reachable daemon, and Docker Compose v2. A non-root host user
+is the supported posture, especially when matching a bind-mounted project's ownership.
 
-## Quick Start
+Prepare the operator-local configuration, check the host, and run a read-only Agent Lab preflight:
 
 ```bash
 cp .env.example .env.local
 ./scripts/doctor
-./scripts/up core
-./scripts/up egress
-./scripts/egress-test
+AGENT_LAB_EPHEMERAL_HOME=1 ./scripts/agent --check
 ```
 
-Stop the stack:
+Start the default contained shell with the same ephemeral agent home:
 
 ```bash
-./scripts/down
+AGENT_LAB_EPHEMERAL_HOME=1 ./scripts/agent -- bash
 ```
 
-`./scripts/down --volumes` also removes named volumes, including the `audit` log volume.
+The default image is built locally on first use. The one-off agent container is removed when it
+exits, but CoreDNS and Squid remain running. The default workspace and audit logs are named volumes
+and can persist even when the agent home is ephemeral.
 
-## Bring Your Own Agent
+The default `base` egress recipe permits no destination, including an agent API. A network failure
+in this first shell is expected until you deliberately select a narrow recipe.
 
-`scripts/agent` runs any agent image against your project, secure-by-default: read-only rootfs, attached only to the internal `agents` network, no Docker socket, no host home mount, all capabilities dropped, and deny-by-default egress.
+Stop the services while retaining named volumes:
 
 ```bash
-cp .env.example .env.local
-# Point at your project (optional; defaults to an ephemeral workspace volume):
-#   AGENT_LAB_PROJECT_DIR=/abs/path/to/your/repo
-./scripts/agent --check       # read-only config/path/recipe preflight
-./scripts/agent -- bash      # interactive shell in the sandbox (devbox built on first use)
-./scripts/agent --clean      # stop and remove the named volumes
+./scripts/agent down
 ```
 
-You adapt the lab through exactly four seams; everything else is locked:
-
-| Seam | How | Effect |
-| --- | --- | --- |
-| Agent image | `AGENT_LAB_AGENT_IMAGE` | which image runs (default: locally-built `agent-lab/devbox:local`) |
-| Project | `AGENT_LAB_PROJECT_DIR` | one host dir mounted RW at `/workspace` (guarded at preflight) |
-| Secrets | `AGENT_LAB_SECRETS_DIR` | files loaded into the agent's env at runtime, never into config or `docker inspect` |
-| Egress | `AGENT_LAB_ALLOWLIST_RECIPES` | which `policies/recipes/*.allowlist` fragments compose into Squid |
-
-Adaptability comes from these narrow, guard-railed openings, never from loosened defaults. Unsafe choices — mounting `$HOME`, a system path, or a directory holding `.ssh`/`.aws`/an `.npmrc` auth token — are refused at preflight, not silently honored. Project and secrets paths are canonicalized before use and must be disjoint, so a read-only secret cannot also appear through the writable workspace.
-
-### Fail-closed runtime configuration
-
-`scripts/agent` parses `.env.local` as data; it never sources it. The accepted file syntax is intentionally narrow: blank lines, column-one comments, and exact unquoted `KEY=VALUE` assignments. Duplicate keys, unknown keys, quotes, `export`, surrounding whitespace, inline comments, CRLF, and shell metacharacters are rejected. A final assignment does not need a trailing newline.
-
-Precedence is exact: a shell-set value, including an explicitly empty one, wins over the env file, which wins over the documented default. Every Compose-consumed network, proxy, identity, resource, and BYO-agent value is validated and exported. Compose then reads `/dev/null` as its env file, so it cannot reinterpret or race the original input.
-
-Important scalar bounds:
-
-- `AGENT_LAB_EPHEMERAL_HOME` is exactly `0` or `1`.
-- UID/GID are canonical decimal values from `1` through `2147483647`.
-- Memory is `64m..65536m` or `1g..64g`, using lowercase integer units.
-- CPU is a canonical number from `0.1` through `64`, with up to three decimal places.
-- Recipe names are comma-separated lowercase kebab names. Recipe entries are canonical lowercase DNS names or leading-dot suffixes; duplicates and wildcard/URL/IP forms are rejected.
-
-`scripts/agent --check` performs this validation plus canonical mount guards without creating the secrets directory, generating `.cache` policy state, inspecting images, or calling Docker. Run mode rechecks path identities immediately before Compose. A concurrent privileged host process can still race path-based Docker APIs; hostile host control remains outside this container-containment boundary.
-
-### Egress is opt-in (deny-by-default)
-
-The `base` recipe is empty, so with no recipes the agent reaches **nothing** — including its own API. Add recipes to open specific domains:
+Remove the services and Agent Lab's named workspace, home, and audit volumes:
 
 ```bash
-AGENT_LAB_ALLOWLIST_RECIPES=base,node-dev ./scripts/agent -- npm install
+./scripts/agent --clean
 ```
 
-Shipped recipes: `base` (empty), `node-dev`, `python-dev`, `claude-code`, `codex`. The `claude-code`/`codex` recipes carry only the published API host; discover the rest of an agent's real domains from a run instead of guessing:
+`--clean` does not delete a host project, host secret files, or ignored host cache files.
+
+To work on a host project, export the path, non-root host identity, and HOME mode for one preview
+and run:
 
 ```bash
-scripts/dev/harvest-allowlist > /tmp/candidates.txt   # review-only; never auto-applied
+export AGENT_LAB_PROJECT_DIR=/absolute/path/to/project
+export AGENT_LAB_AGENT_UID="$(id -u)"
+export AGENT_LAB_AGENT_GID="$(id -g)"
+export AGENT_LAB_EPHEMERAL_HOME=1
+./scripts/agent --check
+./scripts/agent -- bash
+unset AGENT_LAB_PROJECT_DIR AGENT_LAB_AGENT_UID AGENT_LAB_AGENT_GID AGENT_LAB_EPHEMERAL_HOME
 ```
 
-Then copy the lines you trust into a recipe. Recipe changes take effect on the next `./scripts/agent` run: the generated policy is content-addressed, and the proxy is recreated automatically when its verified policy hash changes.
+The project is mounted read-write at `/workspace`. Agent Lab rejects broad, sensitive,
+credential-bearing, overlapping, or unstable project/secret paths before Docker starts.
 
-### Bringing a third-party image into compliance
+Read the [operator guide](docs/operations.md) before adding secrets, enabling egress, or bringing a
+third-party image.
 
-The agent image must load file-based secrets via the baked-in entrypoint. Make any image compliant in one command, preserving its original entrypoint/command:
-
-```bash
-scripts/wrap-image ghcr.io/example/agent:latest
-AGENT_LAB_AGENT_IMAGE=agent-lab/agent:wrapped ./scripts/agent
-```
-
-`images/devbox/Dockerfile` is the canonical compliant example. Agent state/cache lives in the `agent-home` named volume by default and may hold login tokens; set `AGENT_LAB_EPHEMERAL_HOME=1` to map `/home/agent` to tmpfs so nothing persists. See `THREAT_MODEL.md` for the full writable-surface taxonomy.
-
-## Profiles
-
-- `core`: creates the internal network substrate and starts CoreDNS.
-- `egress`: starts Squid as the only dual-homed service on `agents` and `egress`.
-- `devtools`: enables the disposable `egress-test` container used by acceptance tests.
-
-Nothing starts by default. The helper scripts activate profile combinations intentionally.
-
-`./scripts/up egress` automatically includes `core`. `./scripts/up devtools` also includes `core`, so it can be used for no-internet tests without starting Squid.
-
-## Developing Agent Lab with Serena
-
-Claude, Codex, and Grok can use Serena for symbol-aware Bash navigation, bounded semantic edits, and
-language-server diagnostics while developing this repository. This is development tooling, not
-part of the experimental workloads started by `scripts/agent`.
-
-Build the contained toolchain once and verify it:
-
-```bash
-./scripts/dev/serena-build
-./scripts/dev/serena-smoke
-```
-
-At the start of each coding session, the agent should use this Serena sequence:
+## How it works
 
 ```text
-get_current_config
-activate_project(project="/workspace")       # when the project is absent or wrong
-get_current_config
-get_symbols_overview(relative_path="scripts/lib/config.sh")
+host operator
+     │
+     │ scripts/agent: parse → validate → guard → verify
+     ▼
+agent container ─────── internal `agents` network ─────── CoreDNS
+     │
+     │ HTTP(S) proxy only
+     ▼
+Squid egress proxy ─── internet-capable `egress` network ─── allowlisted destinations
 ```
 
-The project is `agent-lab-dev`, its Serena-visible root is `/workspace`, and semantic analysis covers
-`.sh` and `.bash` files. The final live symbol call proves more than a successful MCP connection or
-project activation.
+The internal network—not proxy environment variables—is the default-deny boundary. The agent never
+joins the internet-capable network. Proxy variables direct cooperating tools to Squid, while the
+network topology prevents a raw direct route.
 
-Serena runs in a dedicated one-shot, no-network Compose service. It receives this checkout but no
-host home, credentials, secrets, Docker socket, proxy, port, or Agent Lab workload state. For the
-daily workflow, a real code example, tool-selection guidance, health evidence, limitations, and
-recovery steps, read [Using Serena to develop Agent Lab](docs/serena.md).
+The repository also contains a separate development control plane: agent operating rules, client
+hooks, CI gates, and specialist development helpers. Those tools develop Agent Lab; they are not
+injected into workloads run by Agent Lab.
 
-## Egress Modes
+See [Architecture](docs/architecture.md) for the complete data flow, state model, configuration
+authority, and control-plane/data-plane split.
 
-No-internet mode is `core` plus `devtools`, without `egress-proxy`. The test container is attached only to the internal `agents` network, so raw direct internet attempts fail because there is no off-bridge route.
+## Controlled configuration
 
-Allowlisted-egress mode is `core` plus `egress` plus `devtools`. The test container still has no direct internet route. Cooperating tools can use `HTTP_PROXY` or `HTTPS_PROXY` to reach Squid at `172.30.0.20:3128`. Squid allows only domains in `policies/egress.allowlist.example` by default.
+The workload path exposes four primary adaptation seams, a persistence switch, and bounded
+identity/resource controls:
 
-Raw direct egress attempts are blocked by the internal Docker network, but they are not logged unless optional host firewall hardening is added. Proxy-mediated allowed and denied requests are logged by Squid.
+| Setting | Purpose | Default |
+|---|---|---|
+| `AGENT_LAB_AGENT_IMAGE` | agent image | locally built `agent-lab/devbox:local` |
+| `AGENT_LAB_PROJECT_DIR` | host project mounted at `/workspace` | persistent `agent-workspace` volume |
+| `AGENT_LAB_SECRETS_DIR` | file-backed secrets mounted read-only | `./secrets` |
+| `AGENT_LAB_ALLOWLIST_RECIPES` | additive egress destination recipes | `base` (empty; deny all) |
+| `AGENT_LAB_EPHEMERAL_HOME` | use tmpfs instead of persistent `agent-home` | `0` (persistent) |
+| `AGENT_LAB_AGENT_UID` / `GID` | non-root workload identity | `1000:1000` |
+| `AGENT_LAB_AGENT_MEM` / `CPUS` | workload resource limits | `4g`, `2` |
 
-## Static Network Defaults
+Networks, proxy route, mount targets, hardening, and the accepted ranges remain locked by the
+launcher and Compose model. Do not put credentials in `.env.local`; it is runtime configuration,
+not secret storage.
 
-```text
-agents subnet: 172.30.0.0/24
-CoreDNS:       172.30.0.10
-Squid:         172.30.0.20:3128
-egress subnet: 198.18.0.0/24
-```
+## Verification paths
 
-The agent subnet, DNS, and proxy values are duplicated in `.env.example` and
-the relevant Compose and service files. The egress subnet is an explicit
-Compose default and is supplied by the deterministic Docker test harness.
+These commands answer different questions:
 
-## What This Lab Does Not Prove
+| Command | Evidence |
+|---|---|
+| `./scripts/doctor` | host prerequisites, local configuration presence, secret scan, and rendered topology checks |
+| `./scripts/agent --check` | side-effect-free workload configuration, recipe, and canonical mount preflight |
+| `./scripts/egress-test` | operator acceptance smoke against live external behavior |
+| `./scripts/dev/check default quick` | Docker-free source, policy, and security contracts |
+| `./tools/validate.sh --strict` | strict Compose rendering and static containment invariants |
+| `./scripts/dev/docker-gate` | deterministic Docker runtime containment evidence |
 
-- TLS SNI peek/splice enforcement is not enabled yet. Squid currently enforces the CONNECT host/domain allowlist, private destination denies, unsafe port denies, and default deny. SNI mismatch protection is not yet implemented.
-- Raw blocked attempts are not logged without a future host firewall layer.
-- IPv6 is not enabled on the `agents` network. If Docker IPv6 is enabled host-wide, re-audit before relying on these rules.
-- Allowlisted domains can still receive exfiltrated data. The allowlist bounds where data may go, not what data is sent.
+The acceptance smoke is useful, but it is not a substitute for the deterministic security gate.
+See [Development and verification](docs/development.md) and [CI gate mapping](docs/ci.md).
 
-## License
+## Documentation
+
+Use the [documentation map](docs/README.md) for the complete index. The three main paths are:
+
+- [Operate Agent Lab](docs/operations.md)
+- [Understand the architecture and security model](docs/architecture.md)
+- [Develop and verify the repository](docs/development.md)
+
+Formal hard stops and guarantees remain in [SECURITY.md](SECURITY.md) and
+[THREAT_MODEL.md](THREAT_MODEL.md).
+
+## Important limits
+
+- Containers share the host kernel. Agent Lab is practical Docker containment, not VM isolation.
+- An allowlisted destination can still receive exfiltrated data.
+- HTTPS policy currently checks the CONNECT hostname; TLS SNI mismatch protection is not
+  implemented.
+- Raw blocked direct traffic is not logged without an additional host firewall layer.
+- The shipped agent network disables IPv6. Enabling host-wide or custom Docker IPv6 requires a new
+  audit before relying on the same boundary.
+- Browser automation, cloud infrastructure, and production deployment are outside the current
+  guarantee.
+
+Do not weaken containment to work around a failed command. A refusal or exit status 125 is evidence
+to diagnose, not permission to bypass the control.
+
+## Contributing, security, and license
+
+External pull requests and issues are not accepted. Organization members follow `AGENTS.md`, work on
+a branch from `dev`, and use human-reviewed pull requests to integrate changes.
+
+Organization members report suspected boundary bypasses or secret exposure through the private
+channel described in [SECURITY.md](SECURITY.md). This mirror publishes no external intake; never put
+exploit details in a public issue.
 
 Licensed under the [Apache License 2.0](LICENSE).
-
-## Contributing & PR Policy
-
-**No contributions are accepted from non-members.**
-
-- External pull requests will be closed.
-- External issues will generally be closed (see the issue templates for redirects to documentation and private reporting).
-
-Organization members: see `AGENTS.md` and the internal process.
-The required checks and exact local replay loop are documented in
-[`docs/ci.md`](docs/ci.md).
-
-For everyone else: the repository is provided as-is for you to review or run locally. We are not accepting changes, feature requests, or support requests from the public.
-
-## Security
-
-See [SECURITY.md](SECURITY.md) for the lab's security model and how to report vulnerabilities (private channel only).

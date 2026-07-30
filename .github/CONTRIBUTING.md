@@ -13,7 +13,8 @@ Pull requests and issues from anyone who is not a member of the organization wil
 - Use the code locally for your own experiments (Apache 2.0 license).
 - Fork the repository for personal or internal use.
 - File issues **only** if you are a member (they will still be triaged internally).
-- Report security issues privately (see [SECURITY.md](../SECURITY.md)).
+- Organization members report security issues through the established private channel. This mirror
+  publishes no external intake; see [SECURITY.md](../SECURITY.md).
 
 ## For organization members
 
@@ -21,6 +22,8 @@ Pull requests and issues from anyone who is not a member of the organization wil
 - Publish only the current work branch and open its PR to `dev`.
 - Humans review and merge; agents never write protected branches or merge their own PRs.
 
-If you have questions about usage of the lab itself (running your own copy), the README and docs inside the repo are the authoritative source. There is no separate public support channel.
+If you have questions about using the lab locally, start with the
+[README](../README.md) and [documentation map](../docs/README.md). There is no
+separate public support channel.
 
 Thank you for understanding.

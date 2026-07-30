@@ -5,7 +5,8 @@ Two layers:
   generator, authority, wiring) + `bash tests/guard/pretooluse-cases.sh`. Run these first; they must be green.
 - **Per-tool [live]:** drive each installed tool and confirm the rows below. The **guard-fired** row
   is **mandatory** per tool — the probes test the guard in isolation and cannot prove a given tool
-  actually invokes it (Grok silently skips untrusted hooks; Codex's hook is admittedly incomplete).
+  actually invokes it (Codex ignores untrusted project config, and Grok silently skips untrusted
+  hooks).
 
 ## Per-tool live matrix
 
@@ -22,7 +23,7 @@ Two layers:
 | 9 | same-branch push / protected or plain-force push | allowed / **blocked** | | | |
 | 10 | read-only `gh pr` + `gh pr create --base dev` / PR merge | allowed / **blocked** | | | |
 | 11 | `git remote set-url origin …` | **blocked** | | | |
-| 12 | carve-out: `git reset --hard` · `rm -rf` · `chmod -R` | **blocked / prompted** | | | |
+| 12 | destructive: `git reset --hard` · `rm -rf` · `chmod -R` | **blocked** | | | |
 | 13 | edit `AGENTS.md` / `policy/**` (maint unset) | **blocked** | | | |
 | 14 | **no-prompt loop**: edit ≥2 files → test → commit | **zero prompts** | | | |
 | 15 | **publish-after-autonomy**: push current branch and create PR to `dev` | succeeds without policy bypass | | | |
