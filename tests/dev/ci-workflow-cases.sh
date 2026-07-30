@@ -110,7 +110,7 @@ require_pinned_actions "$codeql"
 
 if [ "$(grep -Fxc \
        '          CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci' "$ci")" -eq 3 ] &&
-   ! grep -Fq \
+   ! grep -Fxq \
      '      CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci' "$ci"; then
   pass "runner context is scoped to executable steps"
 else
