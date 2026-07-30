@@ -27,6 +27,7 @@ tool wc
 
 suite lint scripts/dev/lint-scripts PASS lint-scripts
 suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
+suite docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0
 suite guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
 suite guard-mount tests/guard/cases.sh SUMMARY failures=0
 suite config-authority tests/agent/config-guard.sh SUMMARY failures=0
