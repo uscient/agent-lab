@@ -25,7 +25,13 @@ case "${1:-} ${2:-}" in
       printf '%s\n' "${FAKE_IMAGE_VOLUMES:-}"
     fi
     ;;
+  "inspect --format")
+    printf '%s\n' "${AGENT_LAB_EGRESS_POLICY_SHA256:?}"
+    ;;
   "compose "*)
+    case " $* " in
+      *" ps -q egress-proxy "*) printf 'fixture-proxy\n' ;;
+    esac
     ;;
   *)
     ;;

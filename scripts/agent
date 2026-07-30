@@ -17,6 +17,8 @@ source "${REPO_ROOT}/scripts/lib/allowlist.sh"
 source "${REPO_ROOT}/scripts/lib/config.sh"
 # shellcheck source=scripts/lib/image.sh
 source "${REPO_ROOT}/scripts/lib/image.sh"
+# shellcheck source=scripts/lib/egress.sh
+source "${REPO_ROOT}/scripts/lib/egress.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -140,9 +142,9 @@ fi
 # before the containment substrate or agent is started.
 agent_lab_validate_image_volumes "$agent_image"
 
-# Start the containment substrate: CoreDNS + Squid. Squid loads the allowlist at startup,
-# so changing recipes needs `scripts/agent down` first to take effect.
-run_compose --profile core --profile egress up -d --wait dns egress-proxy
+# Start the containment substrate. Squid loads its policy at startup, so the lifecycle
+# helper recreates it when the requested content hash differs and verifies the active label.
+agent_lab_start_verified_egress
 
 # Run the agent. Guard the bash 3.2 empty-array expansion before "${agent_cmd[@]}".
 if [ "${#agent_cmd[@]}" -gt 0 ]; then

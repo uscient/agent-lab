@@ -41,7 +41,8 @@ if [ "${1:-}" = "compose" ]; then
     *" up -d --wait "*)
       recreate=0
       case " $* " in *" --force-recreate "*) recreate=1 ;; esac
-      if [ ! -f "${FAKE_ACTIVE_HASH:?}" ] || [ "$recreate" -eq 1 ]; then
+      if { [ ! -f "${FAKE_ACTIVE_HASH:?}" ] || [ "$recreate" -eq 1 ]; } &&
+         [ "${FAKE_IGNORE_RECREATE:-0}" != "1" ]; then
         hash="${AGENT_LAB_EGRESS_POLICY_SHA256:-}"
         if [ -z "$hash" ]; then
           hash="$(sha256sum "${AGENT_LAB_EGRESS_ALLOWLIST:?}" | awk '{print $1}')"
@@ -69,6 +70,7 @@ run_agent() {
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_ACTIVE_HASH="$active_hash" \
     FAKE_ACTIVE_ALLOWLIST="$active_allowlist" \
+    FAKE_IGNORE_RECREATE="${FAKE_IGNORE_RECREATE:-0}" \
     AGENT_LAB_ENV_FILE="$env_file" \
     AGENT_LAB_AGENT_IMAGE="fixture:test" \
     AGENT_LAB_PROJECT_DIR="" \
@@ -118,6 +120,14 @@ if run_agent "base,node-dev" "$work/widen.out" &&
   pass "narrow-to-broad transition replaces the active policy"
 else
   fail "narrow-to-broad transition replaces the active policy"
+fi
+
+if FAKE_IGNORE_RECREATE=1 run_agent "base" "$work/stale.out"; then
+  fail "agent refuses to run when the active policy cannot be verified"
+elif grep -Fq "active egress policy mismatch" "$work/stale.out"; then
+  pass "agent refuses to run when the active policy cannot be verified"
+else
+  fail "active-policy verification failure reports the mismatch"
 fi
 
 rm -f "$active_hash" "$active_allowlist"
