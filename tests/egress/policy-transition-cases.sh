@@ -53,6 +53,7 @@ if [ "${1:-}" = "compose" ]; then
           hash="$(sha256sum "${AGENT_LAB_EGRESS_ALLOWLIST:?}" | awk '{print $1}')"
         fi
         printf '%s\n' "$hash" > "$FAKE_ACTIVE_HASH"
+        rm -f "${FAKE_ACTIVE_ALLOWLIST:?}"
         cp "${AGENT_LAB_EGRESS_ALLOWLIST:?}" "${FAKE_ACTIVE_ALLOWLIST:?}"
       fi
       exit 0
@@ -137,6 +138,7 @@ fi
 
 rm -f "$active_hash" "$active_allowlist"
 run_agent "base" "$work/mount-baseline.out"
+chmod u+w "$active_allowlist"
 printf '.tampered.example\n' >> "$active_allowlist"
 if run_agent "base" "$work/tampered-mount.out"; then
   fail "agent refuses a mounted policy whose bytes do not match its label"
