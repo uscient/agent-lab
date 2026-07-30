@@ -1,0 +1,34 @@
+# Strict Docker-free security gate.
+# Format:
+#   tool  <executable>
+#   suite <stable-id> <repo-relative-script>
+
+tool awk
+tool bash
+tool basename
+tool cmp
+tool cp
+tool dirname
+tool env
+tool file
+tool find
+tool git
+tool grep
+tool head
+tool jq
+tool mktemp
+tool readlink
+tool sed
+tool shellcheck
+tool sort
+tool tr
+tool wc
+
+suite lint scripts/dev/lint-scripts
+suite guard-diff tests/dev/guard-diff-cases.sh
+suite guard-command tests/guard/pretooluse-cases.sh
+suite guard-mount tests/guard/cases.sh
+suite config-authority tests/agent/config-guard.sh
+suite adapter-idempotence tests/agent/render-adapters-idempotence.sh
+suite policy-probe tests/agent/policy-verify.sh
+suite containment-static tools/containment-lint.sh
