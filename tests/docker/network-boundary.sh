@@ -3,8 +3,8 @@ set -euo pipefail
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/lib.sh"
 
-docker_test_init "network" || exit $?
 trap docker_test_cleanup EXIT
+docker_test_init "network" || exit $?
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -82,10 +82,6 @@ else
   fail "real agent cannot directly reach the known-live UDP canary"
 fi
 
-if ! docker_test_compose --profile devtools build egress-test >/dev/null; then
-  docker_test_infra "could not build the controlled egress-test image"
-  exit 125
-fi
 egress_test_out=""
 if egress_test_out="$(
      docker_test_compose --profile devtools run --rm --no-deps --entrypoint /bin/bash \
@@ -140,7 +136,7 @@ fi
 if docker run --rm \
      --network "${LAB_PROJECT}_egress" \
      --entrypoint curl \
-     agent-lab/devbox:local \
+     "$LAB_DEVBOX_IMAGE_ID" \
      -fsS --noproxy '*' "http://${LAB_HTTP_CANARY_IP}/${LAB_MARKER}" |
      grep -Fxq "$LAB_MARKER"; then
   pass "insecure egress-network mutation turns the direct probe red"

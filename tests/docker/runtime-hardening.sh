@@ -5,8 +5,8 @@ test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "$test_dir/lib.sh"
 checker="$test_dir/check-runtime-inspect.sh"
 
-docker_test_init "runtime" || exit $?
 trap docker_test_cleanup EXIT
+docker_test_init "runtime" || exit $?
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }

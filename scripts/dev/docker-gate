@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+infra() {
+  printf 'INFRA %s\n' "$*" >&2
+  exit 125
+}
+
+command -v docker >/dev/null 2>&1 || infra "Docker CLI is unavailable"
+docker info >/dev/null 2>&1 || infra "Docker daemon is unavailable"
+docker compose version >/dev/null 2>&1 ||
+  infra "Docker Compose v2 is unavailable"
+
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  docker buildx version >/dev/null 2>&1 ||
+    infra "Docker Buildx is unavailable in GitHub Actions"
+  docker buildx build \
+    --cache-from type=gha \
+    --cache-to type=gha,mode=max \
+    --load \
+    -t agent-lab/devbox:local \
+    -f images/devbox/Dockerfile .
+else
+  docker build \
+    -t agent-lab/devbox:local \
+    -f images/devbox/Dockerfile .
+fi
+
+exec ./scripts/dev/security-gate docker

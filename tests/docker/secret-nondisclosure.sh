@@ -5,8 +5,8 @@ test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "$test_dir/lib.sh"
 scanner="$test_dir/check-secret-absence.sh"
 
-docker_test_init "secrets" || exit $?
 trap docker_test_cleanup EXIT
+docker_test_init "secrets" || exit $?
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -60,8 +60,8 @@ else
 fi
 
 docker inspect "$container_id" > "$LAB_WORK/container-inspect.json"
-docker image inspect agent-lab/devbox:local > "$LAB_WORK/image-inspect.json"
-docker history --no-trunc agent-lab/devbox:local > "$LAB_WORK/image-history.txt"
+docker image inspect "$LAB_DEVBOX_IMAGE_ID" > "$LAB_WORK/image-inspect.json"
+docker history --no-trunc "$LAB_DEVBOX_IMAGE_ID" > "$LAB_WORK/image-history.txt"
 docker_test_compose --profile core --profile egress --profile agent config \
   > "$LAB_WORK/compose-config.txt"
 docker logs "$container_id" > "$LAB_WORK/container-logs.txt" 2>&1 || true
@@ -119,7 +119,8 @@ capture_tag="${LAB_PROJECT}-context-capture:local"
 } > "$capture_df"
 docker build --network=none -t "$capture_tag" -f "$capture_df" "$LAB_COPY" >/dev/null
 capture_container="${LAB_PROJECT}-context-capture"
-docker create --name "$capture_container" "$capture_tag" >/dev/null
+docker create --name "$capture_container" "$capture_tag" \
+  /captured/tools/agent-entrypoint.sh >/dev/null
 docker_test_track_container "$capture_container"
 docker export "$capture_container" > "$LAB_WORK/context.tar"
 context_list="$LAB_WORK/context.list"

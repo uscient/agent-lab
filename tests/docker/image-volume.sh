@@ -3,8 +3,8 @@ set -euo pipefail
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/lib.sh"
 
-docker_test_init "volumes" || exit $?
 trap docker_test_cleanup EXIT
+docker_test_init "volumes" || exit $?
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -15,11 +15,11 @@ safe_tag="${LAB_PROJECT}-safe-volumes:local"
 hostile_df="$LAB_WORK/hostile.Dockerfile"
 safe_df="$LAB_WORK/safe.Dockerfile"
 {
-  printf 'FROM agent-lab/devbox:local\n'
+  printf 'FROM %s\n' "$LAB_DEVBOX_PINNED_REF"
   printf 'VOLUME ["/etc", "/opt/extra"]\n'
 } > "$hostile_df"
 {
-  printf 'FROM agent-lab/devbox:local\n'
+  printf 'FROM %s\n' "$LAB_DEVBOX_PINNED_REF"
   printf 'VOLUME ["/workspace", "/home/agent", "/tmp", "/run/agent-secrets"]\n'
 } > "$safe_df"
 docker build --network=none -t "$hostile_tag" -f "$hostile_df" "$LAB_WORK" >/dev/null

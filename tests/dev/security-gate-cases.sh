@@ -51,23 +51,37 @@ if [ ! -x "$gate" ]; then
   exit 1
 fi
 
-required_ids=(
-  lint
-  guard-diff
-  guard-command
-  guard-mount
-  config-authority
-  adapter-idempotence
-  policy-probe
-  containment-static
-)
-for id in "${required_ids[@]}"; do
-  if awk -v wanted="$id" '$1 == "suite" && $2 == wanted { found=1 } END { exit !found }' "$default_manifest"; then
-    pass "default manifest requires $id"
-  else
-    fail "default manifest is missing required suite $id"
-  fi
-done
+expected_suites="$work/expected-fast-suites"
+cat > "$expected_suites" <<'EOF'
+lint scripts/dev/lint-scripts
+gate-contract tests/dev/security-gate-cases.sh
+ci-workflow-contract tests/dev/ci-workflow-cases.sh
+required-gates-contract tests/dev/required-gates-cases.sh
+guard-diff tests/dev/guard-diff-cases.sh
+docker-harness-contract tests/dev/docker-harness-cases.sh
+guard-command tests/guard/pretooluse-cases.sh
+guard-mount tests/guard/cases.sh
+config-authority tests/agent/config-guard.sh
+config-matrix tests/agent/config-matrix.sh
+allowlist-schema tests/agent/allowlist-cases.sh
+image-volume-policy tests/agent/image-volume-policy-cases.sh
+runtime-inspector tests/agent/runtime-inspector-cases.sh
+secret-parser tests/agent/entrypoint-secret-cases.sh
+egress-policy-transition tests/egress/policy-transition-cases.sh
+dns-contract-unit tests/egress/dns-contract-cases.sh
+wrapper-context tests/wrap-image/context-cases.sh
+adapter-idempotence tests/agent/render-adapters-idempotence.sh
+policy-probe tests/agent/policy-verify.sh
+containment-static tools/containment-lint.sh
+EOF
+actual_suites="$work/actual-fast-suites"
+awk '$1 == "suite" { print $2, $3 }' "$default_manifest" > "$actual_suites"
+if cmp -s "$expected_suites" "$actual_suites"; then
+  pass "default manifest has the exact required suite contract"
+else
+  fail "default manifest has the exact required suite contract"
+  diff -u "$expected_suites" "$actual_suites" || true
+fi
 
 required_tools=(
   awk
@@ -77,6 +91,7 @@ required_tools=(
   chmod
   cmp
   cp
+  diff
   dirname
   env
   file
@@ -120,6 +135,7 @@ write_script "$work/skip-exit.sh" "SKIP fixture" 77
 write_script "$work/skip-output.sh" "SKIP fixture" 0
 write_script "$work/todo-output.sh" "NOT_IMPLEMENTED fixture" 0
 write_script "$work/warn-output.sh" "WARN fixture" 0
+write_script "$work/infra.sh" "INFRA fixture" 125
 
 cat > "$work/pass.manifest" <<EOF
 tool bash
@@ -182,6 +198,22 @@ tool bash
 suite fixture-warn-output $work/warn-output.sh PASS fixture
 EOF
 expect_rc 1 "WARN output blocks the gate" "$work/warn-output.manifest" "forbidden status output"
+
+cat > "$work/infra.manifest" <<EOF
+tool bash
+suite fixture-infra $work/infra.sh INFRA fixture
+EOF
+expect_rc 125 "suite exit 125 is infrastructure failure" \
+  "$work/infra.manifest" "reported infrastructure failure"
+
+cat > "$work/mixed.manifest" <<EOF
+tool bash
+suite fixture-fail $work/skip-output.sh PASS fixture
+suite fixture-infra $work/infra.sh INFRA fixture
+suite fixture-after $work/pass.sh PASS fixture
+EOF
+expect_rc 1 "assertion failure takes precedence while every suite still executes" \
+  "$work/mixed.manifest" "SECURITY GATE SUMMARY pass=1 fail=1 skip=0 infra=1"
 
 cat > "$work/no-suite.manifest" <<EOF
 tool bash
@@ -261,15 +293,6 @@ if [ "$adapter_rc" -ne 0 ] && printf '%s\n' "$adapter_out" | grep -Fq "generated
 else
   fail "generated-adapter mutation turns the idempotence test red (rc=$adapter_rc)"
   printf '%s\n' "$adapter_out"
-fi
-
-default_rc=0
-default_out="$("$gate" 2>&1)" || default_rc=$?
-if [ "$default_rc" -eq 0 ] && printf '%s\n' "$default_out" | grep -Fq "SECURITY GATE PASS"; then
-  pass "default strict gate passes"
-else
-  fail "default strict gate passes (rc=$default_rc)"
-  printf '%s\n' "$default_out"
 fi
 
 lint_rc=0

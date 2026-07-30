@@ -71,6 +71,17 @@ for workflow in "$ci" "$codeql"; do
   fi
 done
 
+if [ "$(sed -n '1p' "$ci")" = "name: CI" ]; then
+  pass "CI workflow keeps the stable branch-protection name"
+else
+  fail "CI workflow keeps the stable branch-protection name"
+fi
+if [ "$(sed -n '1p' "$codeql")" = "name: CodeQL" ]; then
+  pass "CodeQL workflow keeps its stable check name"
+else
+  fail "CodeQL workflow keeps its stable check name"
+fi
+
 if [ "$(grep -Fxc '    branches: [dev, master, main]' "$ci")" -eq 2 ]; then
   pass "CI runs for pushes and pull requests on every integration branch"
 else
@@ -80,6 +91,12 @@ if [ "$(grep -Fxc '    branches: [dev, master, main]' "$codeql")" -eq 2 ]; then
   pass "CodeQL runs for pushes and pull requests on every integration branch"
 else
   fail "CodeQL runs for pushes and pull requests on every integration branch"
+fi
+if grep -Fxq '  merge_group:' "$ci" &&
+   grep -Fxq '  merge_group:' "$codeql"; then
+  pass "CI and CodeQL run for merge-queue candidates"
+else
+  fail "CI and CodeQL run for merge-queue candidates"
 fi
 if ! grep -Fq 'pull_request_target:' "$ci" "$codeql"; then
   pass "workflows never grant pull_request_target semantics"
@@ -93,12 +110,16 @@ require_pinned_actions "$codeql"
 
 require_job_text fast '    name: Fast' "fast job has a stable display name"
 require_job_text fast '    timeout-minutes: 15' "fast job has a bounded runtime"
+require_job_text fast '      diff-base: ${{ steps.diff-base.outputs.base }}' \
+  "fast job publishes its immutable base to the aggregate"
 require_job_text fast './scripts/dev/check default quick' \
   "fast job exposes the canonical local replay command"
 require_job_text fast 'git merge-base --is-ancestor "$base" HEAD' \
   "fast job proves the diff base is an ancestor"
-require_job_text fast '^[0-9a-f]{40}$|^[0-9a-f]{64}$' \
+require_job_text fast '^([0-9a-f]{40}|[0-9a-f]{64})$' \
   "fast job validates the event SHA grammar"
+require_job_text fast 'merge_group) base="$MERGE_GROUP_BASE_SHA"' \
+  "fast job resolves the immutable merge-group base"
 
 require_job_text static '    name: Static' "static job has a stable display name"
 require_job_text static '    timeout-minutes: 15' "static job has a bounded runtime"
@@ -108,7 +129,7 @@ require_job_text static './tools/validate.sh --strict' \
 require_job_text docker '    name: Docker security' \
   "Docker job has a stable display name"
 require_job_text docker '    timeout-minutes: 45' "Docker job has a bounded runtime"
-require_job_text docker './scripts/dev/security-gate docker' \
+require_job_text docker './scripts/dev/docker-gate' \
   "Docker job exposes the canonical local replay command"
 
 require_job_text required-gates '    name: Required gates' \
@@ -123,14 +144,19 @@ require_job_text required-gates './scripts/dev/required-gates' \
   "aggregate job uses the versioned fail-closed reducer"
 
 if [ "$(grep -Fc 'actions/upload-artifact@' "$ci")" -eq 3 ]; then
-  pass "each worker retains a failure log artifact"
+  pass "each worker retains its produced gate log on failure"
 else
-  fail "each worker retains a failure log artifact"
+  fail "each worker retains its produced gate log on failure"
 fi
 if [ "$(grep -Fc 'retention-days: 7' "$ci")" -eq 3 ]; then
   pass "failure artifacts have an explicit short retention"
 else
   fail "failure artifacts have an explicit short retention"
+fi
+if [ "$(grep -Fc '${{ github.run_id }}-${{ github.run_attempt }}' "$ci")" -eq 3 ]; then
+  pass "failure artifact names remain unique across reruns"
+else
+  fail "failure artifact names remain unique across reruns"
 fi
 if [ "$(grep -Fc 'GITHUB_STEP_SUMMARY' "$ci")" -ge 3 ]; then
   pass "worker and aggregate results publish navigable summaries"

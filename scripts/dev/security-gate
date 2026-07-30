@@ -228,11 +228,14 @@ done
 printf '\nSECURITY GATE SUMMARY pass=%s fail=%s skip=%s infra=%s\n' \
   "$passed" "$failed" "$skipped" "$infrastructure"
 
-if [ "$infrastructure" -ne 0 ]; then
-  exit 125
-fi
+# A real assertion failure remains the primary result even when another suite also
+# encountered infrastructure trouble. The summary retains both classifications, and
+# pure infrastructure failures still use 125.
 if [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
   exit 1
+fi
+if [ "$infrastructure" -ne 0 ]; then
+  exit 125
 fi
 
 printf 'SECURITY GATE PASS\n'

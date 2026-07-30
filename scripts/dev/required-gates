@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+manifest="$repo_root/tests/security/ci.manifest"
+
+usage() {
+  printf 'Usage: %s [--manifest PATH]\n' "$0" >&2
+}
+
+case "$#" in
+  0) ;;
+  2)
+    if [ "$1" != "--manifest" ]; then
+      usage
+      exit 2
+    fi
+    manifest="$2"
+    case "$manifest" in
+      /*) ;;
+      *) manifest="$repo_root/$manifest" ;;
+    esac
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+declare -a gate_ids=()
+declare -a replay_commands=()
+declare -a gate_results=()
+declare -A seen_gate_ids=()
+manifest_version=""
+manifest_errors=0
+
+manifest_infra() {
+  printf 'INFRA %s\n' "$*" >&2
+  manifest_errors=1
+}
+
+if [ ! -f "$manifest" ]; then
+  printf 'INFRA required-gates manifest is missing: %s\n' "$manifest" >&2
+  exit 125
+fi
+
+line_no=0
+while IFS= read -r line || [ -n "$line" ]; do
+  line_no=$((line_no + 1))
+  case "$line" in
+    ''|'#'*) continue ;;
+  esac
+
+  kind="${line%%[[:space:]]*}"
+  if [ "$kind" = "$line" ]; then
+    rest=""
+  else
+    rest="${line#"$kind"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+  fi
+
+  case "$kind" in
+    version)
+      if [ "$rest" != "1" ]; then
+        manifest_infra "unsupported or malformed manifest version at $manifest:$line_no"
+      elif [ -n "$manifest_version" ]; then
+        manifest_infra "duplicate manifest version at $manifest:$line_no"
+      else
+        manifest_version="$rest"
+      fi
+      ;;
+    gate)
+      gate_id="${rest%%[[:space:]]*}"
+      if [ "$gate_id" = "$rest" ]; then
+        replay=""
+      else
+        replay="${rest#"$gate_id"}"
+        replay="${replay#"${replay%%[![:space:]]*}"}"
+      fi
+
+      case "$gate_id" in
+        fast|static|docker) ;;
+        *)
+          manifest_infra "unknown gate ID at $manifest:$line_no: ${gate_id:-<empty>}"
+          continue
+          ;;
+      esac
+      if [ -z "$replay" ]; then
+        manifest_infra "missing replay command at $manifest:$line_no"
+        continue
+      fi
+      if [ -n "${seen_gate_ids[$gate_id]+x}" ]; then
+        manifest_infra "duplicate gate ID in $manifest: $gate_id"
+        continue
+      fi
+      seen_gate_ids["$gate_id"]=1
+      gate_ids+=("$gate_id")
+      replay_commands+=("$replay")
+      ;;
+    *)
+      manifest_infra "unknown manifest entry at $manifest:$line_no: ${kind:-<empty>}"
+      ;;
+  esac
+done < "$manifest"
+
+if [ -z "$manifest_version" ]; then
+  manifest_infra "manifest version is missing: $manifest"
+fi
+if [ "${#gate_ids[@]}" -ne 3 ]; then
+  manifest_infra "manifest must define exactly the fast, static, and docker gates: $manifest"
+fi
+for required_gate in fast static docker; do
+  if [ -z "${seen_gate_ids[$required_gate]+x}" ]; then
+    manifest_infra "manifest is missing required gate: $required_gate"
+  fi
+done
+if [ "$manifest_errors" -ne 0 ]; then
+  exit 125
+fi
+
+summary_marker=""
+summary_outcome=""
+summary_detail=""
+fast_diff_base=""
+
+markdown_escape_cell() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//|/\\|}"
+  value="${value//$'\r'/ }"
+  value="${value//$'\n'/ }"
+  printf '%s' "$value"
+}
+
+render_summary() {
+  local summary gate_id result replay i
+
+  summary="$(
+    printf '## Required CI gates\n\n'
+    printf '| Gate | Result | Local replay command |\n'
+    printf '| --- | --- | --- |\n'
+    for i in "${!gate_ids[@]}"; do
+      gate_id="$(markdown_escape_cell "${gate_ids[$i]}")"
+      result="$(markdown_escape_cell "${gate_results[$i]:-unknown}")"
+      replay="${replay_commands[$i]}"
+      if [ "${gate_ids[$i]}" = "fast" ]; then
+        if [ -n "$fast_diff_base" ]; then
+          replay="AGENT_LAB_DIFF_BASE=${fast_diff_base} ${replay}"
+        else
+          replay="unavailable: immutable diff base did not resolve"
+        fi
+      fi
+      replay="$(markdown_escape_cell "$replay")"
+      printf '| `%s` | `%s` | `%s` |\n' "$gate_id" "$result" "$replay"
+    done
+    printf '\nOutcome: **%s**' "$summary_outcome"
+    if [ -n "$summary_detail" ]; then
+      printf ' — %s' "$summary_detail"
+    fi
+    printf '\n\n%s\n' "$summary_marker"
+  )"
+
+  printf '%s\n' "$summary"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    if ! printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"; then
+      printf 'INFRA could not append required-gates summary: %s\n' \
+        "$GITHUB_STEP_SUMMARY" >&2
+      return 125
+    fi
+  fi
+}
+
+finish_infra() {
+  summary_outcome="infrastructure error"
+  summary_detail="$1"
+  summary_marker="REQUIRED GATES INFRA"
+  render_summary
+  exit 125
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  finish_infra "required tool \`jq\` is unavailable."
+fi
+if [ -z "${CI_NEEDS_JSON+x}" ]; then
+  finish_infra "\`CI_NEEDS_JSON\` is unset."
+fi
+if ! printf '%s' "$CI_NEEDS_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+  finish_infra "\`CI_NEEDS_JSON\` is not a valid JSON object."
+fi
+
+actual_keys="$(
+  printf '%s' "$CI_NEEDS_JSON" |
+    jq -r 'keys[]' 2>/dev/null |
+    LC_ALL=C sort
+)" || finish_infra "\`CI_NEEDS_JSON\` keys could not be read."
+expected_keys="$(printf '%s\n' "${gate_ids[@]}" | LC_ALL=C sort)"
+if [ "$actual_keys" != "$expected_keys" ]; then
+  finish_infra "\`CI_NEEDS_JSON\` must contain exactly the fast, static, and docker jobs."
+fi
+
+invalid_result=""
+blocked=0
+blocked_gates=()
+fast_result=""
+for gate_id in "${gate_ids[@]}"; do
+  if ! printf '%s' "$CI_NEEDS_JSON" |
+    jq -e --arg gate "$gate_id" \
+      '.[$gate] | type == "object" and has("result") and (.result | type == "string")' \
+      >/dev/null 2>&1; then
+    invalid_result="$gate_id"
+    break
+  fi
+
+  result="$(
+    printf '%s' "$CI_NEEDS_JSON" |
+      jq -r --arg gate "$gate_id" '.[$gate].result'
+  )" || {
+    invalid_result="$gate_id"
+    break
+  }
+  gate_results+=("$result")
+  if [ "$gate_id" = "fast" ]; then
+    fast_result="$result"
+  fi
+  case "$result" in
+    success) ;;
+    failure|cancelled|skipped)
+      blocked=1
+      blocked_gates+=("\`$gate_id\` (\`$result\`)")
+      ;;
+    *)
+      invalid_result="$gate_id"
+      break
+      ;;
+  esac
+done
+
+if [ -n "$invalid_result" ]; then
+  finish_infra "job \`$invalid_result\` has a missing, malformed, or unknown result."
+fi
+
+fast_diff_base="$(
+  printf '%s' "$CI_NEEDS_JSON" |
+    jq -er '.fast.outputs["diff-base"] | select(type == "string")' 2>/dev/null
+)" || fast_diff_base=""
+if [[ ! "$fast_diff_base" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+   [[ "$fast_diff_base" =~ ^0+$ ]]; then
+  fast_diff_base=""
+  if [ "$blocked" -eq 0 ] && [ "$fast_result" = "success" ]; then
+    finish_infra "successful \`fast\` job did not publish a valid immutable diff base."
+  fi
+fi
+
+if [ "$blocked" -ne 0 ]; then
+  blocked_list=""
+  for blocked_gate in "${blocked_gates[@]}"; do
+    if [ -n "$blocked_list" ]; then
+      blocked_list+=", "
+    fi
+    blocked_list+="$blocked_gate"
+  done
+  summary_outcome="blocked"
+  summary_detail="required job result: $blocked_list."
+  summary_marker="REQUIRED GATES FAIL"
+  render_summary
+  exit 1
+fi
+
+summary_outcome="pass"
+summary_detail="all required jobs completed successfully."
+summary_marker="REQUIRED GATES PASS"
+render_summary

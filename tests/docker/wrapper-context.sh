@@ -3,8 +3,8 @@ set -euo pipefail
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/lib.sh"
 
-docker_test_init "wrapper" || exit $?
 trap docker_test_cleanup EXIT
+docker_test_init "wrapper" || exit $?
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -34,13 +34,28 @@ created="${LAB_PROJECT}-wrapped-export"
 docker create --name "$created" "$wrapped_tag" >/dev/null
 docker_test_track_container "$created"
 docker export "$created" > "$LAB_WORK/wrapped.tar"
+wrapped_list="$LAB_WORK/wrapped.list"
+tar -tf "$LAB_WORK/wrapped.tar" > "$wrapped_list"
 captured="$(
-  tar -tf "$LAB_WORK/wrapped.tar" |
-    sed -n 's#^captured/##p' |
-    grep -Ev '^$' |
-    sort
+  awk '
+    {
+      path = $0
+      sub(/^\.\//, "", path)
+      sub(/\/$/, "", path)
+      if (path != "captured" && index(path, "captured/") == 1) {
+        print path
+      }
+    }
+  ' "$wrapped_list" |
+    LC_ALL=C sort -u
 )"
-if [ "$captured" = "agent-entrypoint.sh" ]; then
+printf 'INFO hostile ONBUILD captured paths:\n'
+if [ -n "$captured" ]; then
+  printf '%s\n' "$captured" | sed 's/^/  /'
+else
+  printf '  <none>\n'
+fi
+if [ "$captured" = "captured/agent-entrypoint.sh" ]; then
   pass "hostile ONBUILD receives only the explicit isolated wrapper input"
 else
   fail "hostile ONBUILD receives only the explicit isolated wrapper input"
@@ -53,10 +68,10 @@ else
 fi
 
 behavior_tag="${LAB_PROJECT}-behavior-wrapped:local"
-"$LAB_COPY/scripts/wrap-image" agent-lab/devbox:local "$behavior_tag" >/dev/null
-base_user="$(docker inspect -f '{{.Config.User}}' agent-lab/devbox:local)"
+"$LAB_COPY/scripts/wrap-image" "$LAB_DEVBOX_PINNED_REF" "$behavior_tag" >/dev/null
+base_user="$(docker inspect -f '{{.Config.User}}' "$LAB_DEVBOX_IMAGE_ID")"
 wrapped_user="$(docker inspect -f '{{.Config.User}}' "$behavior_tag")"
-base_cmd="$(docker inspect -f '{{json .Config.Cmd}}' agent-lab/devbox:local)"
+base_cmd="$(docker inspect -f '{{json .Config.Cmd}}' "$LAB_DEVBOX_IMAGE_ID")"
 wrapped_cmd="$(docker inspect -f '{{json .Config.Cmd}}' "$behavior_tag")"
 if [ "$wrapped_user" = "$base_user" ] && [ "$wrapped_cmd" = "$base_cmd" ]; then
   pass "wrapped image preserves original USER and CMD metadata"

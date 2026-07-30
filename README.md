@@ -161,6 +161,8 @@ Licensed under the [Apache License 2.0](LICENSE).
 - External issues will generally be closed (see the issue templates for redirects to documentation and private reporting).
 
 Organization members: see `AGENTS.md`, `doctrine/`, and the internal process.
+The required checks and exact local replay loop are documented in
+[`docs/ci.md`](docs/ci.md).
 
 For everyone else: the repository is provided as-is for you to review or run locally. We are not accepting changes, feature requests, or support requests from the public.
 

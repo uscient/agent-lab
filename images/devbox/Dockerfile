@@ -6,7 +6,7 @@
 FROM debian:bookworm-slim
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      bash ca-certificates curl git jq python3 ripgrep tini \
+      bash ca-certificates curl dnsutils git jq python3 ripgrep tini \
  && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 1000 agent \
  && useradd --uid 1000 --gid 1000 --create-home --home-dir /home/agent --shell /bin/bash agent \

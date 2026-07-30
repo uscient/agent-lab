@@ -5,8 +5,8 @@ test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 source "$test_dir/lib.sh"
 source "$DOCKER_TEST_ROOT/scripts/lib/dns.sh"
 
-docker_test_init "dns" || exit $?
 trap docker_test_cleanup EXIT
+docker_test_init "dns" || exit $?
 
 failures=0
 attempt=0
@@ -15,10 +15,6 @@ fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
 if ! docker_test_agent "base" true >/dev/null; then
   docker_test_infra "could not start DNS fixture substrate"
-  exit 125
-fi
-if ! docker_test_compose --profile devtools build egress-test >/dev/null; then
-  docker_test_infra "could not build DNS probe image"
   exit 125
 fi
 
@@ -99,14 +95,14 @@ docker run -d \
   --ip "$authority_ip" \
   --read-only \
   -v "$authority_corefile:/etc/coredns/Corefile:ro" \
-  coredns/coredns:1.14.3 -conf /etc/coredns/Corefile >/dev/null
+  "$LAB_DNS_IMAGE_ID" -conf /etc/coredns/Corefile >/dev/null
 docker_test_track_container "$authority"
 
 authority_a=""
 while [ "$attempt" -lt 30 ]; do
   authority_a="$(
     docker run --rm --network "${LAB_PROJECT}_egress" --entrypoint dig \
-      agent-lab/egress-test:0.1 +short +time=1 +tries=1 \
+      "$LAB_EGRESS_TEST_IMAGE_ID" +short +time=1 +tries=1 \
       "@${authority_ip}" external.fixture.test A |
       grep -Ev '^$' || true
   )"
@@ -116,7 +112,7 @@ while [ "$attempt" -lt 30 ]; do
 done
 authority_aaaa="$(
   docker run --rm --network "${LAB_PROJECT}_egress" --entrypoint dig \
-    agent-lab/egress-test:0.1 +short "@${authority_ip}" external.fixture.test AAAA |
+    "$LAB_EGRESS_TEST_IMAGE_ID" +short "@${authority_ip}" external.fixture.test AAAA |
     grep -Ev '^$' || true
 )"
 if [ "$authority_a" = "$LAB_HTTP_CANARY_IP" ] &&
