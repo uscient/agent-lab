@@ -57,6 +57,14 @@ if [ -x "$docker_gate" ] &&
 else
   fail "canonical Docker replay builds the devbox before running the strict gate"
 fi
+if grep -Fq 'AGENT_LAB_DEVBOX_PREBUILT' "$docker_gate" &&
+   grep -Fq 'docker image inspect' "$docker_gate" &&
+   grep -Fq 'TIMING devbox-' "$docker_gate" &&
+   grep -Fq 'TIMING docker-suites=' "$docker_gate"; then
+  pass "CI prebuilt mode is verified and Docker phase timings are observable"
+else
+  fail "CI prebuilt mode is verified and Docker phase timings are observable"
+fi
 
 # shellcheck source=tests/docker/lib.sh
 source "$docker_lib"

@@ -160,6 +160,21 @@ require_job_text docker '    name: Docker security' \
 require_job_text docker '    timeout-minutes: 45' "Docker job has a bounded runtime"
 require_job_text docker './scripts/dev/docker-gate' \
   "Docker job exposes the canonical local replay command"
+require_job_text docker 'docker/build-push-action@' \
+  "Docker job uses the supported BuildKit cache integration"
+require_job_text docker 'cache-from: type=gha,scope=devbox' \
+  "Docker job restores the explicitly scoped devbox cache"
+require_job_text docker 'cache-to: type=gha,mode=max,scope=devbox' \
+  "Docker job persists the explicitly scoped devbox cache"
+require_job_text docker 'AGENT_LAB_DEVBOX_PREBUILT: 1' \
+  "Docker gate verifies the image built by the cache-aware step"
+require_job_text docker 'push:dev:2)' \
+  "Docker job reuses PR evidence only for a dev merge commit"
+if ! job_block "$ci" docker | grep -Fqi 'openclaw'; then
+  pass "required Docker CI never builds OpenClaw"
+else
+  fail "required Docker CI never builds OpenClaw"
+fi
 if job_has_fail_closed_tee fast &&
    job_has_fail_closed_tee static &&
    job_has_fail_closed_tee docker; then
