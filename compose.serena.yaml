@@ -21,18 +21,24 @@ services:
         read_only: false
         bind:
           create_host_path: false
+          propagation: rprivate
+          recursive: disabled
       - type: bind
         source: ${AGENT_LAB_SERENA_GIT_MASK_SOURCE:?set by scripts/serena-mcp}
         target: /workspace/.git
         read_only: true
         bind:
           create_host_path: false
+          propagation: rprivate
+          recursive: disabled
       - type: bind
         source: ${AGENT_LAB_SERENA_CACHE_DIR:?set by scripts/serena-mcp}
         target: /workspace/.serena/cache
         read_only: false
         bind:
           create_host_path: false
+          propagation: rprivate
+          recursive: disabled
     security_opt:
       - no-new-privileges:true
     cap_drop:

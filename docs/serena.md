@@ -17,6 +17,7 @@ The runtime has:
 - project root `/workspace`, bound RW from this repository;
 - private temporary RW storage over `/workspace/.serena/cache`;
 - empty or read-only overlays for Git metadata, local environment/state paths, and protected rails;
+- private, non-recursive binds plus a fail-closed child-mount and nested-`.git` preflight;
 - `network_mode: none`;
 - read-only root filesystem and tmpfs-only global Serena state;
 - no host home, secret, credential, token, Docker socket, proxy, or port;
@@ -72,7 +73,9 @@ pinned source label, it fails with an actionable message. Project registrations 
 
 Every registration calls `scripts/serena-mcp` without `--project` and without
 `--project-from-cwd`. That distinction is deliberate: preselecting a project removes recovery tools
-from single-project client contexts in the pinned Serena version.
+from single-project client contexts in the pinned Serena version. Registrations remove ambient
+`BASH_ENV` and `ENV` before invoking a non-login, no-profile Bash, so host startup files cannot run
+ahead of the contained launcher.
 
 ## Normal agent workflow
 

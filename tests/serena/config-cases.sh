@@ -48,6 +48,14 @@ require_text compose.serena.yaml 'read_only: true' \
   "Serena runtime root filesystem is read-only"
 require_text compose.serena.yaml 'create_host_path: false' \
   "Serena project bind cannot create an unintended host path"
+if [ "$(grep -Fc '          propagation: rprivate' \
+        "$repo_root/compose.serena.yaml")" -eq 3 ] &&
+   [ "$(grep -Fc '          recursive: disabled' \
+        "$repo_root/compose.serena.yaml")" -eq 3 ]; then
+  pass "Every base Serena bind is private and nonrecursive"
+else
+  fail "Every base Serena bind is private and nonrecursive"
+fi
 require_text compose.serena.yaml 'target: /workspace' \
   "Serena sees the stable container project root"
 require_absent compose.serena.yaml \
@@ -78,19 +86,34 @@ require_absent scripts/serena-mcp \
 require_text .codex/config.toml '[mcp_servers.serena]' \
   "Codex registers Serena at project scope"
 require_text .codex/config.toml \
-  'args = ["-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=codex"]' \
-  "Codex discovers the repository root before using its verified Serena context"
-require_text .mcp.json \
-  '"-c"' \
-  "Claude invokes bash without login-shell startup files"
+  'command = "env"' \
+  "Codex strips startup-file variables before invoking Bash"
+require_text .codex/config.toml \
+  'args = ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=codex"]' \
+  "Codex uses a clean non-login Bash and discovers the repository root"
+if jq -e '
+  .mcpServers.serena.command == "env" and
+  .mcpServers.serena.args == [
+    "-u", "BASH_ENV", "-u", "ENV",
+    "bash", "--noprofile", "--norc", "-c",
+    "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=claude-code"
+  ]
+' .mcp.json >/dev/null; then
+  pass "Claude uses a clean non-login Bash and discovers the repository root"
+else
+  fail "Claude uses a clean non-login Bash and discovers the repository root"
+fi
 require_text .mcp.json \
   '"root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=claude-code"' \
   "Claude discovers the repository root before using its verified Serena context"
 require_text .grok/config.toml '[mcp_servers.serena]' \
   "Grok registers Serena at project scope"
 require_text .grok/config.toml \
-  'args = ["-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=grok"]' \
-  "Grok discovers the repository root before using its verified Serena context"
+  'command = "env"' \
+  "Grok strips startup-file variables before invoking Bash"
+require_text .grok/config.toml \
+  'args = ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=grok"]' \
+  "Grok uses a clean non-login Bash and discovers the repository root"
 
 for excluded_tool in replace_in_files replace_content rename_symbol safe_delete_symbol; do
   require_text .serena/project.yml "- $excluded_tool" \
@@ -160,10 +183,112 @@ if [ "$mount_rc" -eq 0 ] &&
      "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
    ! grep -Fq "target: '/workspace/.env.example'" \
      "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
-   ! grep -Fq 'read_only: false' "$AGENT_LAB_SERENA_MOUNT_OVERRIDE"; then
+   ! grep -Fq 'read_only: false' "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
+   [ "$(grep -Fc '      - type: bind' \
+        "$AGENT_LAB_SERENA_MOUNT_OVERRIDE")" -eq \
+     "$(grep -Fc '          propagation: rprivate' \
+        "$AGENT_LAB_SERENA_MOUNT_OVERRIDE")" ] &&
+   [ "$(grep -Fc '      - type: bind' \
+        "$AGENT_LAB_SERENA_MOUNT_OVERRIDE")" -eq \
+     "$(grep -Fc '          recursive: disabled' \
+        "$AGENT_LAB_SERENA_MOUNT_OVERRIDE")" ]; then
   pass "Serena mount plan masks local state and overlays every existing rail read-only"
 else
   fail "Serena mount plan masks local state and overlays every existing rail read-only"
+fi
+
+mkdir -p "$fixture/src/same-device-bind"
+mountinfo_fixture="$work/mountinfo"
+mountinfo_error="$work/mountinfo-error"
+printf '%s\n' \
+  '25 1 0:42 / / rw,relatime - tmpfs tmpfs rw' \
+  "26 25 0:42 /source $fixture/src/same-device-bind rw,relatime - tmpfs tmpfs rw" \
+  > "$mountinfo_fixture"
+mountinfo_rc=0
+agent_lab_serena_reject_child_mounts \
+  "$fixture" "$mountinfo_fixture" 2>"$mountinfo_error" ||
+  mountinfo_rc=$?
+if [ "$mountinfo_rc" -eq 125 ] &&
+   grep -Fq \
+     'refusing child mount exposed by the project bind' \
+     "$mountinfo_error" &&
+   grep -Fq '/workspace/src/same-device-bind' "$mountinfo_error"; then
+  pass "Serena rejects a same-filesystem child bind from mount metadata"
+else
+  fail "Serena rejects a same-filesystem child bind from mount metadata"
+fi
+
+missing_cover_fixture="$work/mountinfo-missing-cover"
+missing_cover_error="$work/mountinfo-missing-cover-error"
+printf '%s\n' \
+  '25 1 0:42 / /unrelated rw,relatime - tmpfs tmpfs rw' \
+  > "$missing_cover_fixture"
+missing_cover_rc=0
+agent_lab_serena_reject_child_mounts \
+  "$fixture" "$missing_cover_fixture" 2>"$missing_cover_error" ||
+  missing_cover_rc=$?
+if [ "$missing_cover_rc" -eq 125 ] &&
+   grep -Fq \
+     'process mount metadata does not cover the project root' \
+     "$missing_cover_error"; then
+  pass "Serena mount inspection fails closed without a covering mount"
+else
+  fail "Serena mount inspection fails closed without a covering mount"
+fi
+
+malformed_mountinfo="$work/mountinfo-malformed"
+malformed_mountinfo_error="$work/mountinfo-malformed-error"
+printf '%s\n' 'not mountinfo' > "$malformed_mountinfo"
+malformed_mountinfo_rc=0
+agent_lab_serena_reject_child_mounts \
+  "$fixture" "$malformed_mountinfo" 2>"$malformed_mountinfo_error" ||
+  malformed_mountinfo_rc=$?
+if [ "$malformed_mountinfo_rc" -eq 125 ] &&
+   grep -Fq 'process mount metadata is malformed' \
+     "$malformed_mountinfo_error"; then
+  pass "Serena mount inspection fails closed on malformed metadata"
+else
+  fail "Serena mount inspection fails closed on malformed metadata"
+fi
+
+live_bind_project="$work/live-bind-project"
+live_bind_state="$work/live-bind-state"
+live_bind_error="$work/live-bind-error"
+mkdir -p \
+  "$live_bind_project/.git" \
+  "$live_bind_project/policy" \
+  "$live_bind_project/source" \
+  "$live_bind_project/child" \
+  "$live_bind_state"
+: > "$live_bind_project/policy/protected.paths"
+if unshare --user --map-root-user --mount \
+    bash --noprofile --norc -c '
+      set -euo pipefail
+      mount --make-rprivate /
+      mount --bind "$1/source" "$1/child"
+      umount "$1/child"
+    ' _ "$live_bind_project" >/dev/null 2>&1; then
+  if unshare --user --map-root-user --mount \
+      bash --noprofile --norc -c '
+        set -euo pipefail
+        mount --make-rprivate /
+        source "$1"
+        mount --bind "$2/source" "$2/child"
+        rc=0
+        agent_lab_serena_prepare_mounts "$2" "$3" \
+          >/dev/null 2>"$4" || rc=$?
+        [ "$rc" -eq 125 ]
+        grep -Fq "refusing child mount exposed by the project bind" "$4"
+        grep -Fq "/workspace/child" "$4"
+      ' _ "$repo_root/scripts/lib/serena.sh" "$live_bind_project" \
+        "$live_bind_state" "$live_bind_error"; then
+    pass "Serena rejects a live same-filesystem child bind mount"
+  else
+    fail "Serena rejects a live same-filesystem child bind mount"
+  fi
+else
+  printf '%s\n' \
+    'INFO live child-bind probe unavailable; synthetic same-device case remains mandatory'
 fi
 
 find "$fixture/secrets" -depth -delete
@@ -192,6 +317,25 @@ if [ "$nested_rc" -eq 125 ]; then
   pass "Serena mount planning rejects nested credential and key paths"
 else
   fail "Serena mount planning rejects nested credential and key paths"
+fi
+
+find "$fixture/src/private" -depth -delete
+mkdir -p "$fixture/vendor/component"
+: > "$fixture/vendor/component/.git"
+nested_git_state="$work/nested-git-state"
+nested_git_error="$work/nested-git-error"
+mkdir "$nested_git_state"
+nested_git_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$nested_git_state" >/dev/null 2>"$nested_git_error" ||
+  nested_git_rc=$?
+if [ "$nested_git_rc" -eq 125 ] &&
+   grep -Fq \
+     'refusing nested .git object exposed at /workspace/vendor/component/.git' \
+     "$nested_git_error"; then
+  pass "Serena mount planning rejects a visible nested .git object"
+else
+  fail "Serena mount planning rejects a visible nested .git object"
 fi
 
 require_text compose.serena.yaml \

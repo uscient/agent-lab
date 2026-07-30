@@ -59,6 +59,8 @@ agent_lab_serena_emit_bind() {
     fi
     printf '        bind:\n'
     printf '          create_host_path: false\n'
+    printf '          propagation: rprivate\n'
+    printf '          recursive: disabled\n'
   } >> "$override_file"
 }
 
@@ -86,6 +88,96 @@ agent_lab_serena_require_mount_type() {
       return 125
       ;;
   esac
+}
+
+agent_lab_serena_reject_child_mounts() {
+  local repo_root="$1" mountinfo_path="${2:-/proc/self/mountinfo}"
+  local canonical_repo_root mount_line mount_target relative
+  local mount_records=0
+  local covering_mount=0
+  local -a mount_fields=()
+
+  canonical_repo_root="$(readlink -e -- "$repo_root")" || {
+    agent_lab_serena_fail "cannot resolve the project root for mount inspection"
+    return 125
+  }
+  [ -r "$mountinfo_path" ] || {
+    agent_lab_serena_fail "cannot read process mount metadata"
+    return 125
+  }
+
+  while IFS= read -r mount_line || [ -n "$mount_line" ]; do
+    mount_fields=()
+    read -r -a mount_fields <<< "$mount_line"
+    if [ "${#mount_fields[@]}" -lt 6 ] ||
+       [[ "$mount_line" != *" - "* ]] ||
+       [[ "${mount_fields[4]}" != /* ]]; then
+      agent_lab_serena_fail "process mount metadata is malformed"
+      return 125
+    fi
+    mount_records=$((mount_records + 1))
+    mount_target="${mount_fields[4]}"
+    # Linux mountinfo escapes whitespace and backslashes in path fields.
+    mount_target="${mount_target//\\040/ }"
+    mount_target="${mount_target//\\011/$'\t'}"
+    mount_target="${mount_target//\\012/$'\n'}"
+    mount_target="${mount_target//\\134/\\}"
+
+    if [ "$mount_target" = "$canonical_repo_root" ] ||
+       [ "$mount_target" = "/" ] ||
+       { [ "$mount_target" != "/" ] &&
+         [[ "$canonical_repo_root" == "$mount_target/"* ]]; }; then
+      covering_mount=1
+    fi
+
+    if { [ "$canonical_repo_root" = "/" ] &&
+         [ "$mount_target" != "/" ] &&
+         [[ "$mount_target" == /* ]]; } ||
+       { [ "$canonical_repo_root" != "/" ] &&
+         [[ "$mount_target" == "$canonical_repo_root/"* ]]; }; then
+      if [ "$canonical_repo_root" = "/" ]; then
+        relative="${mount_target#/}"
+      else
+        relative="${mount_target#"$canonical_repo_root"/}"
+      fi
+      printf \
+        'Serena MCP: refusing child mount exposed by the project bind: host=%q container=%q\n' \
+        "$mount_target" "/workspace/$relative" >&2
+      return 125
+    fi
+  done < "$mountinfo_path"
+
+  if [ "$mount_records" -eq 0 ]; then
+    agent_lab_serena_fail "process mount metadata is empty"
+    return 125
+  fi
+  if [ "$covering_mount" -ne 1 ]; then
+    agent_lab_serena_fail "process mount metadata does not cover the project root"
+    return 125
+  fi
+}
+
+agent_lab_serena_reject_nested_git_objects() {
+  local repo_root="$1" state_root="$2"
+  local scan_file nested relative
+  scan_file="$state_root/nested-git-paths"
+
+  # Inspect names and object metadata only. The top-level .git object is
+  # separately masked; any deeper .git object would remain visible.
+  if ! find "$repo_root" -xdev \
+      \( -path "$repo_root/.git" -prune \) -o \
+      \( -mindepth 2 -name '.git' -print0 -prune \) > "$scan_file"; then
+    agent_lab_serena_fail "cannot complete nested .git metadata scan"
+    return 125
+  fi
+
+  if IFS= read -r -d '' nested < "$scan_file"; then
+    relative="${nested#"$repo_root"/}"
+    printf \
+      'Serena MCP: refusing nested .git object exposed at %q\n' \
+      "/workspace/$relative" >&2
+    return 125
+  fi
 }
 
 agent_lab_serena_reject_nested_sensitive_paths() {
@@ -184,6 +276,11 @@ agent_lab_serena_prepare_mounts() {
     "$repo_root/policy/protected.paths" file "protected-path policy" ||
     return 125
   agent_lab_serena_require_mount_type "$state_root" directory "mask state root" ||
+    return 125
+
+  agent_lab_serena_reject_child_mounts "$repo_root" /proc/self/mountinfo ||
+    return 125
+  agent_lab_serena_reject_nested_git_objects "$repo_root" "$state_root" ||
     return 125
 
   empty_dir="$state_root/empty-dir"

@@ -60,6 +60,8 @@ RW at `/workspace` for explicitly requested source edits, but Git metadata, loca
 environment/state paths, and protected rails are hidden or re-bound read-only. Project cache writes
 go to a private temporary bind at `/workspace/.serena/cache`. It receives no host home, Agent Lab
 secrets mount, credentials, proxy environment, Docker socket, or ports.
+Every bind is private and non-recursive. A metadata-only preflight fails closed on child mounts or
+nested Git metadata before an agent-controlled process starts.
 
 The image pins Serena source and preinstalls its pinned Bash language server and ShellCheck during
 the explicit build. At runtime the managed language-server directory is an immutable image path

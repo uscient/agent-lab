@@ -93,8 +93,15 @@ if jq -e \
     --arg cache "$probe_state/project-cache" \
     --arg git_mask "$probe_state/empty-dir" \
     '
-      .[0].Mounts as $mounts
-      | ([ $mounts[] | select(.RW == true) | .Destination ] | sort)
+      .[0] as $container
+      | $container.Mounts as $mounts
+      | ($container.HostConfig.Mounts // []) as $host_mounts
+      | (($host_mounts | length) == ($mounts | length))
+        and all($host_mounts[];
+          .Type == "bind"
+          and .BindOptions.NonRecursive == true
+          and .BindOptions.Propagation == "rprivate")
+        and ([ $mounts[] | select(.RW == true) | .Destination ] | sort)
           == ["/workspace", "/workspace/.serena/cache"]
         and any($mounts[];
           .Destination == "/workspace"

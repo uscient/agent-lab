@@ -2,8 +2,15 @@
   "mcpServers": {
     "serena": {
       "type": "stdio",
-      "command": "bash",
+      "command": "env",
       "args": [
+        "-u",
+        "BASH_ENV",
+        "-u",
+        "ENV",
+        "bash",
+        "--noprofile",
+        "--norc",
         "-c",
         "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=claude-code"
       ]

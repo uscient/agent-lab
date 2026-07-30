@@ -1,5 +1,5 @@
 # Repository-root build contexts are deny-by-default. Keep this list aligned with the
-# only two root-context Dockerfiles: images/devbox and tests/egress.
+# root-context Dockerfiles: images/devbox, images/serena, and tests/egress.
 **
 !.dockerignore
 !images/
