@@ -69,7 +69,39 @@ for id in "${required_ids[@]}"; do
   fi
 done
 
+required_tools=(
+  awk
+  bash
+  basename
+  cat
+  cmp
+  cp
+  dirname
+  env
+  file
+  find
+  git
+  grep
+  head
+  jq
+  mktemp
+  readlink
+  sed
+  shellcheck
+  sort
+  tr
+  wc
+)
+for tool in "${required_tools[@]}"; do
+  if awk -v wanted="$tool" '$1 == "tool" && $2 == wanted { found=1 } END { exit !found }' "$default_manifest"; then
+    pass "default manifest requires tool $tool"
+  else
+    fail "default manifest is missing required tool $tool"
+  fi
+done
+
 write_script "$work/pass.sh" "PASS fixture" 0
+write_script "$work/empty.sh" "" 0
 write_script "$work/skip-exit.sh" "SKIP fixture" 77
 write_script "$work/skip-output.sh" "SKIP fixture" 0
 write_script "$work/todo-output.sh" "NOT_IMPLEMENTED fixture" 0
@@ -77,43 +109,49 @@ write_script "$work/warn-output.sh" "WARN fixture" 0
 
 cat > "$work/pass.manifest" <<EOF
 tool bash
-suite fixture-pass $work/pass.sh
+suite fixture-pass $work/pass.sh PASS fixture
 EOF
 expect_rc 0 "all-pass manifest succeeds" "$work/pass.manifest" "SECURITY GATE PASS"
 
+cat > "$work/empty.manifest" <<EOF
+tool bash
+suite fixture-empty $work/empty.sh PASS fixture
+EOF
+expect_rc 1 "empty zero-exit suite blocks the gate" "$work/empty.manifest" "missing completion marker"
+
 cat > "$work/missing-tool.manifest" <<EOF
 tool agent_lab_missing_tool_for_test
-suite fixture-pass $work/pass.sh
+suite fixture-pass $work/pass.sh PASS fixture
 EOF
 expect_rc 125 "missing prerequisite is infrastructure failure" "$work/missing-tool.manifest" "INFRA"
 
 cat > "$work/missing-suite.manifest" <<EOF
 tool bash
-suite fixture-missing $work/does-not-exist.sh
+suite fixture-missing $work/does-not-exist.sh PASS fixture
 EOF
 expect_rc 125 "missing required suite is infrastructure failure" "$work/missing-suite.manifest" "INFRA"
 
 cat > "$work/skip-exit.manifest" <<EOF
 tool bash
-suite fixture-skip $work/skip-exit.sh
+suite fixture-skip $work/skip-exit.sh PASS fixture
 EOF
 expect_rc 1 "suite exit 77 blocks the gate" "$work/skip-exit.manifest" "SKIP"
 
 cat > "$work/skip-output.manifest" <<EOF
 tool bash
-suite fixture-skip-output $work/skip-output.sh
+suite fixture-skip-output $work/skip-output.sh PASS fixture
 EOF
 expect_rc 1 "SKIP output blocks the gate" "$work/skip-output.manifest" "forbidden status output"
 
 cat > "$work/todo-output.manifest" <<EOF
 tool bash
-suite fixture-todo-output $work/todo-output.sh
+suite fixture-todo-output $work/todo-output.sh PASS fixture
 EOF
 expect_rc 1 "NOT_IMPLEMENTED output blocks the gate" "$work/todo-output.manifest" "forbidden status output"
 
 cat > "$work/warn-output.manifest" <<EOF
 tool bash
-suite fixture-warn-output $work/warn-output.sh
+suite fixture-warn-output $work/warn-output.sh PASS fixture
 EOF
 expect_rc 1 "WARN output blocks the gate" "$work/warn-output.manifest" "forbidden status output"
 
@@ -124,10 +162,78 @@ expect_rc 125 "manifest with no suites is infrastructure failure" "$work/no-suit
 
 cat > "$work/duplicate.manifest" <<EOF
 tool bash
-suite duplicate $work/pass.sh
-suite duplicate $work/pass.sh
+suite duplicate $work/pass.sh PASS fixture
+suite duplicate $work/pass.sh PASS fixture
 EOF
 expect_rc 125 "duplicate suite ID is infrastructure failure" "$work/duplicate.manifest" "INFRA"
+
+runner_repo="$work/runner-repo"
+mkdir -p "$runner_repo/scripts/dev" "$runner_repo/scripts/lib"
+cp "$repo_root/scripts/dev/test" "$runner_repo/scripts/dev/test"
+cp "$repo_root/scripts/dev/security-gate" "$runner_repo/scripts/dev/security-gate"
+cp "$repo_root/scripts/dev/lint-scripts" "$runner_repo/scripts/dev/lint-scripts"
+cp "$repo_root/scripts/lib/dev-common.sh" "$runner_repo/scripts/lib/dev-common.sh"
+git -C "$runner_repo" init -q
+runner_rc=0
+runner_out="$(cd "$runner_repo" && bash scripts/dev/test quick 2>&1)" || runner_rc=$?
+if [ "$runner_rc" -eq 125 ] && printf '%s\n' "$runner_out" | grep -Fq "required manifest is missing"; then
+  pass "canonical test runner fails closed without its manifest"
+else
+  fail "canonical test runner fails closed without its manifest (rc=$runner_rc)"
+  printf '%s\n' "$runner_out"
+fi
+
+validator_repo="$work/validator-repo"
+mkdir -p "$validator_repo/tools"
+cp "$repo_root/tools/validate.sh" "$validator_repo/tools/validate.sh"
+validator_rc=0
+validator_out="$(cd "$validator_repo" && bash tools/validate.sh --strict 2>&1)" || validator_rc=$?
+if [ "$validator_rc" -eq 125 ] \
+  && printf '%s\n' "$validator_out" | grep -Fq "required validation input is missing"; then
+  pass "strict validation fails closed when required evidence is missing"
+else
+  fail "strict validation fails closed when required evidence is missing (rc=$validator_rc)"
+  printf '%s\n' "$validator_out"
+fi
+
+mkdir -p "$work/no-docker-bin"
+ln -s "$(command -v dirname)" "$work/no-docker-bin/dirname"
+docker_rc=0
+docker_out="$(
+  cd "$repo_root" \
+    && PATH="$work/no-docker-bin" /bin/bash tools/validate.sh --strict 2>&1
+)" || docker_rc=$?
+if [ "$docker_rc" -eq 125 ] && printf '%s\n' "$docker_out" | grep -Fq "docker is required"; then
+  pass "strict validation reports missing Docker as infrastructure failure"
+else
+  fail "strict validation reports missing Docker as infrastructure failure (rc=$docker_rc)"
+  printf '%s\n' "$docker_out"
+fi
+
+adapter_fixture="$work/adapter-source"
+mkdir -p \
+  "$adapter_fixture/.claude" \
+  "$adapter_fixture/.codex/rules" \
+  "$adapter_fixture/.grok" \
+  "$adapter_fixture/policy" \
+  "$adapter_fixture/tools"
+cp "$repo_root/.claude/settings.json" "$adapter_fixture/.claude/settings.json"
+cp "$repo_root/.codex/rules/agent-lab.rules" "$adapter_fixture/.codex/rules/agent-lab.rules"
+cp "$repo_root/.grok/config.toml" "$adapter_fixture/.grok/config.toml"
+cp "$repo_root/policy/allow.commands" "$adapter_fixture/policy/allow.commands"
+cp "$repo_root/policy/protected.paths" "$adapter_fixture/policy/protected.paths"
+cp "$repo_root/tools/render-adapters.sh" "$adapter_fixture/tools/render-adapters.sh"
+printf '\n' >> "$adapter_fixture/.claude/settings.json"
+adapter_rc=0
+adapter_out="$(
+  bash "$repo_root/tests/agent/render-adapters-idempotence.sh" "$adapter_fixture" 2>&1
+)" || adapter_rc=$?
+if [ "$adapter_rc" -ne 0 ] && printf '%s\n' "$adapter_out" | grep -Fq "generated adapter drift"; then
+  pass "generated-adapter mutation turns the idempotence test red"
+else
+  fail "generated-adapter mutation turns the idempotence test red (rc=$adapter_rc)"
+  printf '%s\n' "$adapter_out"
+fi
 
 default_rc=0
 default_out="$("$gate" 2>&1)" || default_rc=$?

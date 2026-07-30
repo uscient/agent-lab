@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+repo_root="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+
+assert_same() {
+  local expected="$1" actual="$2" label="$3"
+  if ! cmp "$expected" "$actual"; then
+    printf 'FAIL generated adapter drift: %s\n' "$label" >&2
+    return 1
+  fi
+}
 
 mkdir -p \
   "$work/.claude" \
@@ -25,17 +33,17 @@ cp "$work/.codex/rules/agent-lab.rules" "$work/expected/codex.rules"
 cp "$work/.grok/config.toml" "$work/expected/grok.toml"
 
 AGENT_LAB_MAINTENANCE=1 bash "$work/tools/render-adapters.sh" >/dev/null
-cmp "$work/expected/claude.json" "$work/.claude/settings.json"
-cmp "$work/expected/codex.rules" "$work/.codex/rules/agent-lab.rules"
-cmp "$work/expected/grok.toml" "$work/.grok/config.toml"
+assert_same "$work/expected/claude.json" "$work/.claude/settings.json" "Claude"
+assert_same "$work/expected/codex.rules" "$work/.codex/rules/agent-lab.rules" "Codex"
+assert_same "$work/expected/grok.toml" "$work/.grok/config.toml" "Grok"
 
 cp "$work/.claude/settings.json" "$work/expected/claude.second.json"
 cp "$work/.codex/rules/agent-lab.rules" "$work/expected/codex.second.rules"
 cp "$work/.grok/config.toml" "$work/expected/grok.second.toml"
 
 AGENT_LAB_MAINTENANCE=1 bash "$work/tools/render-adapters.sh" >/dev/null
-cmp "$work/expected/claude.second.json" "$work/.claude/settings.json"
-cmp "$work/expected/codex.second.rules" "$work/.codex/rules/agent-lab.rules"
-cmp "$work/expected/grok.second.toml" "$work/.grok/config.toml"
+assert_same "$work/expected/claude.second.json" "$work/.claude/settings.json" "Claude second render"
+assert_same "$work/expected/codex.second.rules" "$work/.codex/rules/agent-lab.rules" "Codex second render"
+assert_same "$work/expected/grok.second.toml" "$work/.grok/config.toml" "Grok second render"
 
 printf 'PASS generated adapters match tracked files and are idempotent\n'

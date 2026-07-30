@@ -6,6 +6,7 @@
 tool awk
 tool bash
 tool basename
+tool cat
 tool cmp
 tool cp
 tool dirname
@@ -24,11 +25,11 @@ tool sort
 tool tr
 tool wc
 
-suite lint scripts/dev/lint-scripts
-suite guard-diff tests/dev/guard-diff-cases.sh
-suite guard-command tests/guard/pretooluse-cases.sh
-suite guard-mount tests/guard/cases.sh
-suite config-authority tests/agent/config-guard.sh
-suite adapter-idempotence tests/agent/render-adapters-idempotence.sh
-suite policy-probe tests/agent/policy-verify.sh
-suite containment-static tools/containment-lint.sh
+suite lint scripts/dev/lint-scripts PASS lint-scripts
+suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
+suite guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
+suite guard-mount tests/guard/cases.sh SUMMARY failures=0
+suite config-authority tests/agent/config-guard.sh SUMMARY failures=0
+suite adapter-idempotence tests/agent/render-adapters-idempotence.sh PASS generated adapters match tracked files and are idempotent
+suite policy-probe tests/agent/policy-verify.sh SUMMARY pass=
+suite containment-static tools/containment-lint.sh containment-lint: 0 fail, 0 warn
