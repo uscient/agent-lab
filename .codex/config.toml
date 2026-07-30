@@ -18,5 +18,5 @@ network_access = true
 [mcp_servers.serena]
 startup_timeout_sec = 60
 tool_timeout_sec = 240
-command = "bash"
-args = ["-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=codex"]
+command = "env"
+args = ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=codex"]

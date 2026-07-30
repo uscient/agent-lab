@@ -128,7 +128,9 @@ tool. Serena runs through a dedicated one-shot Compose service with no network, 
 filesystem, and tmpfs-only global state. The source tree is RW at `/workspace`, while Git metadata,
 local environment/state paths, and protected rails are hidden or overlaid read-only; a separate
 private temporary bind receives only `.serena/cache` writes. It never receives the Agent Lab secrets
-mount or host home state and is not part of workloads started by `scripts/agent`.
+mount or host home state. Binds are private and non-recursive, and the launcher fails closed on
+child mounts or nested Git metadata before startup. Serena is not part of workloads started by
+`scripts/agent`.
 
 Build the pinned toolchain once, then run the fail-loud MCP smoke:
 

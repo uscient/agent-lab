@@ -41,6 +41,8 @@ The Serena development helper binds the current repository RW at `/workspace`, t
 metadata, local environment/state paths, and protected rails with empty or read-only binds. A
 private temporary bind receives only `.serena/cache` writes; global state is tmpfs. It has no Agent
 Lab secrets mount, host home mount, proxy environment, Docker socket, or runtime install path.
+All binds are private and non-recursive; preflight rejects child mounts and nested Git metadata
+before Docker starts.
 The Serena source and direct language-server/tool versions are fetched at the explicit image build
 and pinned before the no-network runtime is started.
 

@@ -138,6 +138,9 @@ home, project, and egress policy. Instead, `scripts/serena-mcp` starts the fixed
 repo as the only content-bearing RW project bind at `/workspace`. Read-only overlays mask Git,
 local state, and protected rails, while a private temporary bind isolates `.serena/cache`. This
 preserves the control-plane/data-plane distinction while containing the development helper itself.
+All binds are private and non-recursive, and the launcher rejects child mounts or nested Git
+metadata before startup. Client registrations also remove `BASH_ENV` and `ENV` before invoking a
+non-login, no-profile Bash for repository-root discovery.
 
 Do not use Serena's user-global setup commands for this repo and do not add `--project` or
 `--project-from-cwd` to the registration. The repository launcher must start recoverably so all

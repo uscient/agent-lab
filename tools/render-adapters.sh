@@ -146,8 +146,8 @@ emit_grok() {
     echo "# Serena is project-scoped and starts in a dedicated no-network container."
     echo "# Do not pass --project here: explicit activation must remain recoverable."
     echo "[mcp_servers.serena]"
-    echo 'command = "bash"'
-    echo 'args = ["-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=grok"]'
+    echo 'command = "env"'
+    echo 'args = ["-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc", "-c", "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=grok"]'
   } > .grok/config.toml
 }
 
