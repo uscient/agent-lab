@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+serena_repo_root="$(pwd -P)"
+# shellcheck source=scripts/lib/serena.sh
+source "$serena_repo_root/scripts/lib/serena.sh"
+
+need_cmd docker
+need_cmd python3
+docker info >/dev/null 2>&1 || {
+  printf 'INFRA Docker daemon is unavailable\n' >&2
+  exit 125
+}
+docker image inspect "$AGENT_LAB_SERENA_TAG" >/dev/null 2>&1 || {
+  printf 'INFRA Serena image is missing; run ./scripts/dev/serena-build\n' >&2
+  exit 125
+}
+
+python3 tests/serena/mcp-smoke.py \
+  --repo-root "$serena_repo_root"
+
+# Repository verification is deliberately independent from Serena.
+bash tests/agent/config-guard.sh
+printf 'PASS independent Agent Lab repository check\n'

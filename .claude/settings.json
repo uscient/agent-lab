@@ -149,7 +149,7 @@
         ]
       },
       {
-        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|mcp__serena__replace_symbol_body|mcp__serena__insert_before_symbol|mcp__serena__insert_after_symbol",
         "hooks": [
           {
             "type": "command",

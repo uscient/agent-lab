@@ -34,8 +34,17 @@ Repo: `https://github.com/uscient/agent-lab` · base branch: `dev`
 | unit tests | `bash tests/guard/pretooluse-cases.sh` · `bash tests/guard/cases.sh` · `bash tests/agent/*.sh` |
 | orient | `./scripts/dev/brief` · `./scripts/dev/changed` · `./scripts/doctor` |
 | stack | `./scripts/up [core\|egress\|devtools]` · `./scripts/down` · `./scripts/agent` |
+| Serena | `./scripts/dev/serena-build` · `./scripts/dev/serena-smoke` |
 
 Use integrations only for the scoped repository/GitHub workflow. No secret access. Never weaken containment (`SECURITY.md`, `THREAT_MODEL.md`).
+
+## Serena — semantic development tooling
+- Serena runs in its dedicated no-network container; it is not an Agent Lab workload, runtime dependency, authority system, or source of truth. Its logical project is `agent-lab-dev` at container path `/workspace`, using the Bash LSP backend.
+- Before substantial semantic work, call `get_current_config`. In the pinned Serena version, a fresh session returns the expected `isError` state `No active project`; recover with `activate_project` on `/workspace`, then call `get_current_config` again. Activation alone is not readiness—complete a live symbol operation.
+- Start with `get_symbols_overview` or targeted `find_symbol`, retrieve only needed bodies, and use `find_declaration` / `find_referencing_symbols` to assess impact. Prefer the usable bounded semantic editors—`replace_symbol_body`, `insert_before_symbol`, and `insert_after_symbol`—when the change matches a reliable symbol boundary.
+- Use ordinary search/edit tools for prose, configuration, generated data, partial text changes, extensionless Bash entrypoints, and the stdlib-only Python smoke harness, which are outside the configured Bash semantic scope. If this follows a Serena failure, state the failure instead of claiming semantic verification.
+- After edits, inspect the affected symbols and call `get_diagnostics_for_file`; then run the normal tests/lint/build separately. Serena never replaces repository gates.
+- The activation response plus `list_memories` is the current onboarding check. Keep any future memory factual and project-specific; never store secrets, tokens, transient container IDs, or host-only paths. See `docs/serena.md` for failure-state diagnosis and smoke evidence.
 
 ## Authority
 - `AGENTS.md` is the sole operating-policy source for agents developing this repository.

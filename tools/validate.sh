@@ -20,6 +20,8 @@ if [ "$strict" -eq 1 ]; then
     compose.agent.yaml
     compose.agent.persist.yaml
     compose.agent.ephemeral.yaml
+    compose.serena.yaml
+    .serena/project.yml
     tests/agent/invariants.sh
   )
   missing_inputs=0
@@ -29,6 +31,7 @@ if [ "$strict" -eq 1 ]; then
       missing_inputs=1
     fi
   done
+
   if [ "$missing_inputs" -ne 0 ]; then
     exit 125
   fi
@@ -61,6 +64,26 @@ if command -v docker >/dev/null 2>&1; then
       echo "   FAIL: agent + $overlay" >&2; rc=1
     fi
   done
+
+  if [ -f compose.serena.yaml ]; then
+    echo ">> docker compose (Serena development helper) config"
+    if AGENT_LAB_SERENA_IMAGE="agent-lab/serena:validation" \
+         AGENT_LAB_SERENA_PROJECT_DIR="$here" \
+         AGENT_LAB_SERENA_GIT_MASK_SOURCE="$here/.git" \
+         AGENT_LAB_SERENA_CACHE_DIR="$here/.serena/cache" \
+         AGENT_LAB_SERENA_UID="$(id -u)" \
+         AGENT_LAB_SERENA_GID="$(id -g)" \
+         docker compose \
+           --env-file /dev/null \
+           -f compose.serena.yaml \
+           --profile serena \
+           config --quiet >/dev/null 2>&1; then
+      echo "   OK"
+    else
+      echo "   FAIL: Serena development helper" >&2
+      rc=1
+    fi
+  fi
 
   # §3 agent-service invariants (static; config-only).
   if [ -f tests/agent/invariants.sh ]; then

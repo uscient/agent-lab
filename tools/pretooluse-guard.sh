@@ -5,7 +5,8 @@
 # boundary: a hostile agent is contained by the sandbox/network posture (SECURITY.md /
 # THREAT_MODEL.md), not by these string matches.
 #
-# Matchers: Bash (inspect tool_input.command) and Edit/Write/apply_patch (inspect file_path).
+# Matchers: Bash (inspect tool_input.command), host file tools, and the allowed Serena semantic
+# mutators. Hook envelopes may use snake_case or camelCase keys depending on the client.
 # Unconditional denials and destructive carve-outs live in policy/*.patterns; scoped workflow
 # decisions live below because they require branch-aware validation.
 # Exit 2 blocks and prints the reason (citing the relevant AGENTS.md section). Exit 0 defers.
@@ -22,9 +23,22 @@ pol="$root/policy"
 input="$(cat)"
 tool_name="" cmd="" fpath=""
 if command -v jq >/dev/null 2>&1; then
-  tool_name="$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null || true)"
-  cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
-  fpath="$(printf '%s' "$input" | jq -r '(.tool_input.file_path // .tool_input.path // .tool_input.notebook_path // empty)' 2>/dev/null || true)"
+  tool_name="$(printf '%s' "$input" | jq -r '(.tool_name // .toolName // empty)' 2>/dev/null || true)"
+  cmd="$(
+    printf '%s' "$input" \
+      | jq -r '((.tool_input // .toolInput // {}) | (.command // empty))' 2>/dev/null \
+      || true
+  )"
+  fpath="$(
+    printf '%s' "$input" \
+      | jq -r '
+          ((.tool_input // .toolInput // {}) |
+            (.file_path // .filePath // .path //
+             .notebook_path // .notebookPath //
+             .relative_path // .relativePath // empty))
+        ' 2>/dev/null \
+      || true
+  )"
 fi
 
 block() { # block <reason> <AGENTS.md section>
@@ -84,7 +98,7 @@ protected_alternation() {
 maint="${AGENT_LAB_MAINTENANCE:-}"
 
 # ---------------------------------------------------------------------------
-# Edit/Write/apply_patch path: protect the rails from file-tool edits.
+# Host and Serena file-mutation path: protect secrets and maintenance-only rails.
 # ---------------------------------------------------------------------------
 case "$tool_name" in
   Read)
@@ -99,6 +113,19 @@ case "$tool_name" in
     fi
     if [ "$maint" != 1 ] && path_is_protected "$fpath"; then
       block "editing a protected rail ($fpath) is a maintenance-only action — set AGENT_LAB_MAINTENANCE=1 for sanctioned maintenance" "Authority"
+    fi
+    exit 0
+    ;;
+  mcp__serena__replace_symbol_body | mcp__serena__insert_before_symbol | mcp__serena__insert_after_symbol | \
+  serena__replace_symbol_body | serena__insert_before_symbol | serena__insert_after_symbol)
+    if [ -z "$fpath" ]; then
+      block "Serena semantic mutation is missing its project-relative path and cannot be authorized" "Autonomy boundary"
+    fi
+    if path_is_secret "$fpath" || path_is_auth_material "$fpath"; then
+      block "editing secret, credential, authentication, or Git configuration material through Serena is forbidden" "Autonomy boundary"
+    fi
+    if [ "$maint" != 1 ] && path_is_protected "$fpath"; then
+      block "editing a protected rail through Serena ($fpath) is a maintenance-only action — set AGENT_LAB_MAINTENANCE=1 for sanctioned maintenance" "Authority"
     fi
     exit 0
     ;;

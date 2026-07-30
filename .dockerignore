@@ -5,12 +5,15 @@
 !images/
 !images/devbox/
 !images/devbox/Dockerfile
+!images/serena/
+!images/serena/Dockerfile
 !tests/
 !tests/egress/
 !tests/egress/Dockerfile
 !tests/egress/cases.sh
 !tools/
 !tools/agent-entrypoint.sh
+!tools/serena-entrypoint.sh
 
 # Explicit defense-in-depth for local and credential-bearing paths.
 secrets

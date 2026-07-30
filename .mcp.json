@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "serena": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "-c",
+        "root=\"$(git rev-parse --show-toplevel)\" && exec \"$root/scripts/serena-mcp\" --context=claude-code"
+      ]
+    }
+  }
+}

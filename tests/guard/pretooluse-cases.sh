@@ -56,6 +56,12 @@ expect_read() {
     | env -u AGENT_LAB_MAINTENANCE "$guard" >/dev/null 2>&1 || rc=$?
   _check "$exp" "$name" "$rc"
 }
+expect_payload() {
+  local exp="$1" name="$2" payload="$3" maint="${4:-}" rc=0
+  printf '%s' "$payload" \
+    | env AGENT_LAB_MAINTENANCE="$maint" "$guard" >/dev/null 2>&1 || rc=$?
+  _check "$exp" "$name" "$rc"
+}
 
 echo "== allow: local work + git (commit inversion fixed; local merge/rebase preserved) =="
 expect_cmd allow "git commit"                 'git commit -m "wip"'
@@ -165,6 +171,13 @@ expect_edit block "edit AGENTS.md (no maint)"        'AGENTS.md'
 expect_edit block "edit guard (no maint)"            'tools/pretooluse-guard.sh'
 expect_edit block "edit policy (no maint)"           'policy/deny.patterns'
 expect_edit block "edit .codex (no maint)"           '.codex/config.toml'
+expect_edit block "edit Claude MCP registration"     '.mcp.json'
+expect_edit block "edit Serena project config"       '.serena/project.yml'
+expect_edit block "edit Serena Compose config"       'compose.serena.yaml'
+expect_edit block "edit Serena image source"         'images/serena/Dockerfile'
+expect_edit block "edit Serena launcher"             'scripts/serena-mcp'
+expect_edit block "edit Serena pin constants"        'scripts/lib/serena.sh'
+expect_edit block "edit Serena image entrypoint"     'tools/serena-entrypoint.sh'
 expect_edit block "edit abs-path policy (no maint)"   "$repo_root/policy/deny.patterns"
 expect_edit block "edit secret file"                  'secrets/token'
 expect_edit block "edit environment file"             '.env'
@@ -176,6 +189,26 @@ expect_edit allow "edit AGENTS.md (maint=1)"         'AGENTS.md' 1
 expect_edit allow "edit .grok (maint=1)"             '.grok/config.toml' 1
 expect_edit allow "edit normal file"                 'scripts/dev/test'
 expect_edit allow "edit README"                      'README.md'
+
+echo "== Serena vendor hook envelopes and semantic mutators =="
+expect_payload allow "Codex snake-case Serena source edit" \
+  '{"tool_name":"mcp__serena__replace_symbol_body","tool_input":{"relative_path":"scripts/lib/config.sh"}}'
+expect_payload block "Codex snake-case Serena rail edit" \
+  '{"tool_name":"mcp__serena__insert_before_symbol","tool_input":{"relative_path":"AGENTS.md"}}'
+expect_payload allow "Codex snake-case Serena maintenance edit" \
+  '{"tool_name":"mcp__serena__insert_after_symbol","tool_input":{"relative_path":"AGENTS.md"}}' 1
+expect_payload block "Claude camel-case Serena rail edit" \
+  '{"toolName":"mcp__serena__replace_symbol_body","toolInput":{"relativePath":".codex/config.toml"}}'
+expect_payload allow "Claude camel-case Serena source edit" \
+  '{"toolName":"mcp__serena__insert_after_symbol","toolInput":{"relativePath":"scripts/lib/config.sh"}}'
+expect_payload block "Grok camel-case Serena rail edit" \
+  '{"toolName":"serena__insert_before_symbol","toolInput":{"relativePath":"compose.serena.yaml"}}'
+expect_payload allow "Grok snake-case Serena source edit" \
+  '{"tool_name":"serena__replace_symbol_body","tool_input":{"relative_path":"scripts/lib/config.sh"}}'
+expect_payload block "Serena secret edit remains forbidden in maintenance" \
+  '{"toolName":"serena__insert_after_symbol","toolInput":{"relativePath":"secrets/token"}}' 1
+expect_payload block "Serena mutator without path fails closed" \
+  '{"tool_name":"mcp__serena__replace_symbol_body","tool_input":{"name_path":"x"}}'
 
 echo "== shell mutation of rails (maintenance-gated) =="
 expect_cmd block "append to AGENTS.md"        'echo x >> AGENTS.md'
