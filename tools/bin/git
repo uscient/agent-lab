@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# PATH shim for `git` — enforces the dev git-policy at the ARGV level, so it catches evasions a
-# raw-string regex can't: `git -C . push`, `g=push; git $g`, subprocess(['git','push']), aliases.
+# PATH shim for `git` — enforces the AGENTS.md workflow at the ARGV level, so it catches evasions a
+# raw-string regex cannot: variable indirection, subprocess argv, and Git global options.
 # Everything non-dangerous passes straight through to the real git. Defense-in-depth — containment
-# (the sandbox/network posture), not this shim, is the real boundary. See doctrine/git-workflow.md.
+# (the sandbox/network posture), not this shim, is the real boundary.
 # Install: prepend tools/bin to PATH for the dev session (see docs/agent-config.md). NOT baked into
 # Agent Lab's contained-workload runtime (scripts/agent) — that is data plane, governed by containment.
 set -uo pipefail
@@ -21,14 +21,30 @@ if [ -z "$real" ]; then
 fi
 [ -z "$real" ] && { echo "agent-lab git-shim: cannot locate the real git" >&2; exit 127; }
 
-block() { echo "BLOCKED by agent-lab policy: $1 (see doctrine/git-workflow.md)" >&2; exit 2; }
+block() { echo "BLOCKED by agent-lab policy: $1 (see AGENTS.md — Autonomy boundary)" >&2; exit 2; }
 
 # Locate the subcommand, skipping git's global options (some carry a value).
 args=("$@"); n=${#args[@]}; i=0; sub=""
 while [ "$i" -lt "$n" ]; do
   a="${args[$i]}"
   case "$a" in
-    -C | -c | --git-dir | --work-tree | --namespace | --super-prefix | --exec-path | --config-env)
+    -c)
+      case "${args[$((i + 1))]:-}" in
+        user.name=* | user.email=* | user.signingkey=* | commit.gpgsign=* | alias.*)
+          block "Git attribution, signing identity, and alias overrides are forbidden" ;;
+      esac
+      i=$((i + 2)); continue ;;
+    -cuser.name=* | -cuser.email=* | -cuser.signingkey=* | -ccommit.gpgsign=* | -calias.*)
+      block "Git attribution, signing identity, and alias overrides are forbidden" ;;
+    --config-env)
+      case "${args[$((i + 1))]:-}" in
+        user.name=* | user.email=* | user.signingkey=* | commit.gpgsign=* | alias.*)
+          block "Git attribution, signing identity, and alias overrides are forbidden" ;;
+      esac
+      i=$((i + 2)); continue ;;
+    --config-env=user.name=* | --config-env=user.email=* | --config-env=user.signingkey=* | --config-env=commit.gpgsign=* | --config-env=alias.*)
+      block "Git attribution, signing identity, and alias overrides are forbidden" ;;
+    -C | --git-dir | --work-tree | --namespace | --super-prefix | --exec-path)
       i=$((i + 2)); continue ;;
     --git-dir=* | --work-tree=* | --namespace=* | --exec-path=* | -c*) i=$((i + 1)); continue ;;
     -*) i=$((i + 1)); continue ;;
@@ -37,21 +53,76 @@ while [ "$i" -lt "$n" ]; do
 done
 
 case "$sub" in
-  push) block "git push is forbidden — the human owns the remote and the merge gate" ;;
+  commit)
+    branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+    case "$branch" in
+      dev | master | main | DETACHED)
+        block "commit on a protected branch or detached HEAD is forbidden" ;;
+    esac
+    for a in "${args[@]:$((i + 1))}"; do
+      case "$a" in
+        --author | --author=* | --reset-author)
+          block "Git commit attribution overrides are forbidden" ;;
+      esac
+    done ;;
+  push)
+    [ "$i" -eq 0 ] || block "push through an alternate Git working directory is forbidden"
+    branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+    case "$branch" in
+      dev | master | main | DETACHED)
+        block "push from protected or detached HEAD is forbidden" ;;
+    esac
+    positional=()
+    j=$((i + 1))
+    while [ "$j" -lt "$n" ]; do
+      case "${args[$j]}" in
+        -u | --set-upstream | --porcelain | --progress | --no-progress | --no-verify) ;;
+        --force-with-lease) ;;
+        --force-with-lease=* | --force | -f | --mirror | --delete | -d)
+          block "plain force, deletion, and mirror pushes are forbidden" ;;
+        -*) block "unsupported push option is outside the scoped workflow: ${args[$j]}" ;;
+        *) positional+=("${args[$j]}") ;;
+      esac
+      j=$((j + 1))
+    done
+    [ "${#positional[@]}" -eq 2 ] \
+      || block "push must explicitly name origin and HEAD (or the current branch)"
+    [ "${positional[0]}" = origin ] \
+      || block "push is limited to origin"
+    { [ "${positional[1]}" = HEAD ] || [ "${positional[1]}" = "$branch" ]; } \
+      || block "push target must be the current same-named branch"
+    ;;
   pull) block "git pull is forbidden — fetch (where available) + local merge of a LOCAL ref instead" ;;
   merge | rebase)
+    if [ "$sub" = rebase ] && [ "$i" -ne 0 ]; then
+      block "remote rebase through an alternate Git working directory is forbidden"
+    fi
     j=$((i + 1))
     while [ "$j" -lt "$n" ]; do
       case "${args[$j]}" in
         origin/* | upstream/* | refs/remotes/*)
-          block "git $sub from a remote-tracking ref is forbidden (it is the 2nd half of a pull)" ;;
+          if [ "$sub" = rebase ] \
+            && [ "${args[$j]}" = origin/dev ] \
+            && [ "$j" -eq $((n - 1)) ]; then
+            branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+            case "$branch" in
+              dev | master | main | DETACHED)
+                block "origin/dev rebase requires a non-protected work branch" ;;
+            esac
+          else
+            block "remote integration is limited to rebasing the current work branch on origin/dev"
+          fi
+          ;;
       esac
       j=$((j + 1))
     done ;;
   remote)
     case "${args[$((i + 1))]:-}" in
-      add | set-url | remove | rm | rename | prune) block "git remote mutation is forbidden" ;;
+      add | set-url | remove | rm | rename | prune | set-head | set-branches | update)
+        block "git remote mutation is forbidden" ;;
     esac ;;
+  config) block "Git configuration access is forbidden" ;;
+  credential) block "Git credential access is forbidden" ;;
 esac
 
 exec "$real" "$@"

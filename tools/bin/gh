@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# PATH shim for `gh` — blocks PR/release/remote-write subcommands at the argv level; everything else
-# passes through to the real gh. Defense-in-depth; containment is the real boundary.
-# See doctrine/git-workflow.md.
+# PATH shim for `gh` — allows read-only PR work and PR creation to dev while blocking authentication,
+# integration, release mutation, and other remote writes. Defense-in-depth; AGENTS.md is authoritative.
 set -uo pipefail
 
 self="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -18,15 +17,60 @@ if [ -z "$real" ]; then
 fi
 [ -z "$real" ] && { echo "agent-lab gh-shim: cannot locate the real gh" >&2; exit 127; }
 
-block() { echo "BLOCKED by agent-lab policy: $1 (see doctrine/git-workflow.md)" >&2; exit 2; }
+block() { echo "BLOCKED by agent-lab policy: $1 (see AGENTS.md — Autonomy boundary)" >&2; exit 2; }
 
-case "${1:-}" in
-  pr) block "opening or mutating a PR via gh is forbidden — the human owns the PR" ;;
-  release) block "gh release is forbidden (remote write)" ;;
-  api)
-    for a in "$@"; do
-      case "$a" in */pulls | */pulls/* | *pulls*) block "gh api to a pulls endpoint is forbidden" ;; esac
-    done ;;
+args=("$@")
+n=${#args[@]}
+i=0
+sub=""
+while [ "$i" -lt "$n" ]; do
+  case "${args[$i]}" in
+    -R | --repo | --hostname) i=$((i + 2)); continue ;;
+    --repo=* | --hostname=* | --help | --version) i=$((i + 1)); continue ;;
+    -*) i=$((i + 1)); continue ;;
+    *) sub="${args[$i]}"; break ;;
+  esac
+done
+
+case "$sub" in
+  auth) block "GitHub authentication access is forbidden" ;;
+  pr)
+    [ "$i" -eq 0 ] || block "GitHub PR commands must target the current repository directly"
+    for a in "${args[@]:$((i + 2))}"; do
+      case "$a" in
+        -R | -R?* | --repo | --repo=* | --hostname | --hostname=*)
+          block "GitHub PR commands must target the current repository directly" ;;
+      esac
+    done
+    case "${args[$((i + 1))]:-}" in
+      list | view | status | checks | diff) ;;
+      create)
+        branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+        case "$branch" in
+          dev | master | main | DETACHED)
+            block "PR creation requires a non-protected work branch" ;;
+        esac
+        base="" head="" j=$((i + 2))
+        while [ "$j" -lt "$n" ]; do
+          a="${args[$j]}"
+          case "$a" in
+            --base | -B)
+              j=$((j + 1)); base="${args[$j]:-}" ;;
+            --base=*) base="${a#*=}" ;;
+            --head | -H)
+              j=$((j + 1)); head="${args[$j]:-}" ;;
+            --head=*) head="${a#*=}" ;;
+          esac
+          j=$((j + 1))
+        done
+        [ "$base" = dev ] || block "PR creation requires explicit --base dev"
+        [ -z "$head" ] || [ "$head" = "$branch" ] \
+          || block "PR head must be the current work branch"
+        ;;
+      *) block "PR mutation is forbidden; only reads and create --base dev are allowed" ;;
+    esac ;;
+  "" | help | version) ;;
+  *) block "GitHub access is limited to the scoped PR workflow" ;;
 esac
 
 exec "$real" "$@"

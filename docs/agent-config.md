@@ -1,27 +1,28 @@
 # Agent configuration — setup & maintenance
 
 How the three coding agents that **develop Agent Lab** (Claude Code, Codex, Grok) are configured to
-work autonomously inside a hard boundary: commit locally, never push/PR, never weaken containment.
+work autonomously inside the `AGENTS.md` boundary: develop on a branch, publish that branch, open a
+PR to `dev`, never merge it themselves, and never weaken containment.
 
 > **Framing.** The `PreToolUse` guard is **defense-in-depth** — it makes the safe path automatic and
-> catches mistakes and casual evasion. The **real** boundary is containment (the network-off sandbox,
+> catches mistakes and casual evasion. The **real** boundary is containment (the sandbox,
 > no Docker socket, no host mounts, internal-only network — see `SECURITY.md` / `THREAT_MODEL.md`).
 > Read every "hard line" here as "defense-in-depth, backed by containment."
 
 ## Architecture — shared core + thin per-tool adapters
 
-One policy, three thin adapters. Three single-sources-of-truth, zero hand-duplication:
+One operating policy, shared enforcement, and three generated thin adapters:
 
 | Concern | Single source | Consumed by |
 |---|---|---|
-| Instruction / doctrine | `AGENTS.md` + `doctrine/*.md` | auto-discovered by all three tools; doctrine read on demand |
+| Operating policy | `AGENTS.md` | auto-discovered by all three tools |
 | Enforcement logic | `tools/pretooluse-guard.sh` + `tools/session-bootstrap.sh` + `policy/*.patterns` | each tool's `PreToolUse` / `SessionStart` hook |
-| Allow/deny rule bodies | `policy/allow.commands` + `policy/protected.paths` (+ guard's `deny.patterns`) | `tools/render-adapters.sh` → the three adapters |
+| Native adapter rule bodies | `policy/allow.commands` + `NATIVE_DENY` in `tools/render-adapters.sh` | `tools/render-adapters.sh` → the three adapters |
 
 ```text
-AGENTS.md  doctrine/  policy/            # shared core (instruction + enforcement data)
+AGENTS.md  policy/                       # shared core (instruction + enforcement data)
 tools/pretooluse-guard.sh                # the one enforcement brain (PreToolUse: Bash + Edit/Write)
-tools/session-bootstrap.sh               # SessionStart: never-on-master -> agent/<tool>/<slug>
+tools/session-bootstrap.sh               # SessionStart: protected branch -> dev-based work branch
 tools/render-adapters.sh                 # generates the adapter rule bodies
 tools/codex-permission-request.sh        # Codex PermissionRequest approver (mirrors policy)
 tools/bin/{git,gh}                        # argv-level PATH shims (deep defense)
@@ -34,7 +35,7 @@ tools/bin/{git,gh}                        # argv-level PATH shims (deep defense)
    - command allow-set → `policy/allow.commands`
    - remote/destructive denials enforced by the guard → `policy/deny.patterns` / `policy/carveout.patterns`
    - read-only "rails" → `policy/protected.paths`
-   - human-readable doctrine → `AGENTS.md` / `doctrine/*.md`
+   - human-readable operating policy → `AGENTS.md`
 2. Regenerate the adapters (a maintenance action — see below):
    ```bash
    AGENT_LAB_MAINTENANCE=1 tools/render-adapters.sh
@@ -47,7 +48,7 @@ regions** in `.claude/settings.json`, `.codex/rules/agent-lab.rules`, or `.grok/
 
 ## The `AGENT_LAB_MAINTENANCE=1` convention (and the self-lock)
 
-The rails (`AGENTS.md`, `doctrine/`, `policy/`, the guard scripts, `tools/bin/`, the adapter dirs)
+The rails (`AGENTS.md`, `policy/`, the guard scripts, `tools/bin/`, the adapter dirs)
 are in `policy/protected.paths`: the guard blocks Edit/Write and shell-mutation of them so an agent
 can't quietly change its own guardrails. To **deliberately** maintain them, run the session with
 `AGENT_LAB_MAINTENANCE=1` **exported in the launching shell** (so the hook subprocess inherits it):
@@ -62,10 +63,10 @@ rules avoid locking yourself out:
 1. **Launch maintenance sessions with `AGENT_LAB_MAINTENANCE=1`.**
 2. **Wire the Claude adapter last** — generate `.claude/settings.json` as the final maintenance step,
    after all other files are in place.
-Note the guard's maintenance flag only relaxes the *guard*; Claude's *native* `permissions.deny`
-rules have no maintenance bypass. The Claude adapter therefore keeps only the git/remote denies in
-native `deny`; protected-path read-only enforcement is left to the guard's `Edit|Write` matcher
-(which honors the flag), so maintenance stays possible.
+Note the guard's maintenance flag only relaxes the *guard*; native `deny` rules have no maintenance
+bypass. The Claude and Grok adapters therefore keep only unconditional command and secret-read
+denials in native `deny`; protected-path enforcement is left to their `Edit|Write` guard hooks
+(which honor the flag), so maintenance stays possible.
 
 ## Per-tool setup / trust
 
@@ -75,19 +76,21 @@ native `deny`; protected-path read-only enforcement is left to the guard's `Edit
 | **Codex** | Trust the project so `.codex/` (config, hooks, rules) loads — Codex ignores an untrusted project's `.codex/`. Verify with a guard-fired check (a deliberately-bad command must print the guard's BLOCKED message). |
 | **Grok** | Trust project hooks, or `.grok/hooks/` are **silently skipped** (and a policy check would falsely pass). Use `grok inspect` to confirm hooks/config were discovered, then run the guard-fired check. |
 
-### Codex network-off runbook (intentional design decision)
+### Codex scoped-network runbook
 
-Codex runs `sandbox_mode = "workspace-write"` with `network_access = false`. That blocks push
-(good) **and** `git fetch`. So **`git fetch` is not available inside a Codex session — by design.**
-Refresh remote state *outside* Codex **before** the session starts:
+Codex runs `sandbox_mode = "workspace-write"` with network access enabled for the repository
+workflow. `AGENTS.md`, the guard, and protected-branch rules scope that access:
 
 ```bash
-git fetch origin          # human / CI / wrapper, before launching codex
-codex …                   # works against the freshly-fetched local refs
+git fetch origin
+git rebase origin/dev
+git push -u origin HEAD
+gh pr create --base dev ...
 ```
 
-Do **not** add a network-on Codex profile to "fix" fetch — enabling network would remove the
-sandbox layer from the push denial. Keeping fetch outside the session is the deliberate trade-off.
+Direct protected-branch pushes, plain force pushes, PR merge/mutation, remote mutation, GitHub
+authentication access, and Git attribution changes remain forbidden. Runtime credentials are used
+implicitly by Git/GitHub tooling; agents must never inspect or modify them.
 
 ## Forbidden flags (never use these as the autonomy mechanism)
 
@@ -105,8 +108,8 @@ Autonomy comes from `acceptEdits` (Claude) / `on-request` + `workspace-write` (C
 2. Add an `emit_<tool>` branch to `tools/render-adapters.sh` that translates `policy/allow.commands`
    + the deny set into the tool's native rule syntax; add the dir to `policy/protected.paths`.
 3. Add the tool's rows to `tests/agent/agent-policy-checklist.md` and run the guard-fired + no-prompt
-   + push-after-autonomy checks.
-The shared guard/policy/AGENTS.md/doctrine are reused unchanged — that is the point of the architecture.
+   + scoped-publish checks.
+The shared guard/policy/AGENTS.md are reused unchanged — that is the point of the architecture.
 
 ## Control plane vs data plane (don't conflate the two "Codex"/"Claude"/"Grok")
 
