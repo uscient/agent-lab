@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Thin default sandbox AND the canonical example of a compliant BYO image.
 # Build context is the repo root (this COPYs tools/agent-entrypoint.sh).
-# TODO: pin debian:bookworm-slim by digest before publishing (see THREAT_MODEL.md
-# image-pinning note); the OpenClaw image already digest-pins its bases.
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       bash ca-certificates curl dnsutils git jq python3 ripgrep tini \

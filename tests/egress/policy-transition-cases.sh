@@ -120,19 +120,20 @@ if run_agent "base" "$work/narrow.out" &&
 else
   fail "broad-to-narrow transition replaces the active policy"
 fi
-if grep -Fq -- "--force-recreate" "$docker_log"; then
-  pass "policy mismatch force-recreates Squid"
+if grep -Fq -- "--force-recreate egress-proxy" "$docker_log" &&
+   ! grep -Eq -- "--force-recreate .*dns" "$docker_log"; then
+  pass "policy mismatch force-recreates only Squid"
 else
-  fail "policy mismatch force-recreates Squid"
+  fail "policy mismatch force-recreates only Squid"
 fi
 
 : > "$docker_log"
 if run_agent "base" "$work/unchanged.out" &&
    ! grep -Fq -- "--force-recreate" "$docker_log" &&
-   ! grep -Fq -- " up -d --wait " "$docker_log"; then
-  pass "unchanged policy reuses the verified substrate without Compose startup"
+   grep -Fq -- " up -d --wait " "$docker_log"; then
+  pass "unchanged policy reconciles Compose without force recreation"
 else
-  fail "unchanged policy reuses the verified substrate without Compose startup"
+  fail "unchanged policy reconciles Compose without force recreation"
 fi
 
 if run_agent "base,node-dev" "$work/widen.out" &&

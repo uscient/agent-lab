@@ -53,13 +53,19 @@ fi
 assert_nxdomain() {
   local name="$1"
   shift
-  local output
+  local header output
   output="$(docker exec "$probe" dig +comments +noquestion +time=2 +tries=1 "$@" 2>&1)" ||
     true
   if agent_lab_dns_result_is_nxdomain "$output"; then
     pass "$name"
   else
     fail "$name"
+    header="$(
+      printf '%s\n' "$output" |
+        grep -m 1 -E '(^;; ->>HEADER<<-|communications error|no servers could be reached)' ||
+        true
+    )"
+    printf 'INFO DNS response: %s\n' "${header:-<no DNS response header>}"
   fi
 }
 

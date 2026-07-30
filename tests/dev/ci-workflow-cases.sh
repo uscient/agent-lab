@@ -168,8 +168,11 @@ require_job_text docker 'cache-to: type=gha,mode=max,scope=devbox' \
   "Docker job persists the explicitly scoped devbox cache"
 require_job_text docker 'AGENT_LAB_DEVBOX_PREBUILT: 1' \
   "Docker gate verifies the image built by the cache-aware step"
-require_job_text docker 'push:dev:2)' \
-  "Docker job reuses PR evidence only for a dev merge commit"
+if ! job_block "$ci" docker | grep -Eq 'run_gate=false|reused-pr-merge'; then
+  pass "required Docker CI never self-skips without runtime evidence"
+else
+  fail "required Docker CI never self-skips without runtime evidence"
+fi
 if ! job_block "$ci" docker | grep -Fqi 'openclaw'; then
   pass "required Docker CI never builds OpenClaw"
 else

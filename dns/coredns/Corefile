@@ -10,7 +10,11 @@
 
     # Exact external-name contract: A and AAAA return authoritative NXDOMAIN.
     # There is deliberately no forwarder or fallback resolver.
-    template IN A AAAA {
+    template IN A {
+        rcode NXDOMAIN
+    }
+
+    template IN AAAA {
         rcode NXDOMAIN
     }
 }

@@ -63,7 +63,7 @@ Egress remains deny-by-default: the `base` recipe is empty, so an agent with no 
 - Path-based Docker APIs cannot eliminate a race by a concurrent privileged host process. The
   launcher canonicalizes and identity-checks paths immediately before use; hostile host control is
   outside the container-containment guarantee.
-- Upstream infrastructure images (CoreDNS, Squid) are pinned by non-`latest` tags, not digests; digest-pinning them remains a TODO. The OpenClaw image already digest-pins its bases, and `images/devbox/Dockerfile` carries a digest-pin TODO for `debian:bookworm-slim`.
+- Upstream infrastructure images (CoreDNS, Squid) are pinned by non-`latest` tags, not digests; digest-pinning them remains a TODO. The OpenClaw and canonical devbox images digest-pin their base images.
 
 ## Out of Scope
 

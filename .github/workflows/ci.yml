@@ -76,6 +76,7 @@ jobs:
           AGENT_LAB_DIFF_BASE: ${{ steps.diff-base.outputs.base }}
           CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
+          set -o pipefail
           mkdir -p "$CI_LOG_DIR"
           ./scripts/dev/check default quick 2>&1 | tee "$CI_LOG_DIR/fast.log"
 
@@ -115,6 +116,7 @@ jobs:
         env:
           CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
+          set -o pipefail
           mkdir -p "$CI_LOG_DIR"
           ./tools/validate.sh --strict 2>&1 | tee "$CI_LOG_DIR/static.log"
 
@@ -147,10 +149,23 @@ jobs:
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
-      - name: Build devbox and run Docker security gate
+      - name: Build cache-aware devbox
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: images/devbox/Dockerfile
+          load: true
+          tags: agent-lab/devbox:local
+          cache-from: type=gha,scope=devbox
+          cache-to: type=gha,mode=max,scope=devbox
+
+      - name: Run Docker security gate
+        id: docker-gate
         env:
+          AGENT_LAB_DEVBOX_PREBUILT: 1
           CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
+          set -o pipefail
           mkdir -p "$CI_LOG_DIR"
           ./scripts/dev/docker-gate 2>&1 | tee "$CI_LOG_DIR/docker.log"
 

@@ -23,6 +23,11 @@ cancelled, malformed, or unknown result fails closed.
 CodeQL remains a separate check because GitHub does not expose cross-workflow
 jobs through `needs`.
 
+The Docker worker always runs the full runtime gate. Its cache-aware devbox
+build is a separate timed step, and the gate records runtime-suite timings so
+slow phases remain visible without turning containment evidence into an
+optional check. The optional OpenClaw image is not built by CI.
+
 ## Agent navigation loop
 
 1. Open `CI / Required gates` for the compact result table and replay commands.

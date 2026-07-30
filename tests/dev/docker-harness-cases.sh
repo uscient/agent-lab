@@ -52,7 +52,8 @@ fi
 if [ -x "$docker_gate" ] &&
    grep -Fq "docker buildx build \\" "$docker_gate" &&
    grep -Fq "docker build \\" "$docker_gate" &&
-   grep -Fq 'exec ./scripts/dev/security-gate docker' "$docker_gate"; then
+   grep -Fq './scripts/dev/security-gate docker || gate_rc=$?' "$docker_gate" &&
+   grep -Fq 'exit "$gate_rc"' "$docker_gate"; then
   pass "canonical Docker replay builds the devbox before running the strict gate"
 else
   fail "canonical Docker replay builds the devbox before running the strict gate"
@@ -64,6 +65,139 @@ if grep -Fq 'AGENT_LAB_DEVBOX_PREBUILT' "$docker_gate" &&
   pass "CI prebuilt mode is verified and Docker phase timings are observable"
 else
   fail "CI prebuilt mode is verified and Docker phase timings are observable"
+fi
+if grep -Eq \
+     '^FROM debian:bookworm-slim@sha256:[0-9a-f]{64}$' \
+     "$repo_root/images/devbox/Dockerfile"; then
+  pass "canonical devbox base is content-pinned"
+else
+  fail "canonical devbox base is content-pinned"
+fi
+
+docker_gate_fixture="$work/docker-gate-fixture"
+docker_gate_bin="$work/docker-gate-bin"
+mkdir -p \
+  "$docker_gate_fixture/scripts/dev" \
+  "$docker_gate_fixture/scripts/lib" \
+  "$docker_gate_bin"
+cp "$docker_gate" "$docker_gate_fixture/scripts/dev/docker-gate"
+cp \
+  "$repo_root/scripts/lib/dev-common.sh" \
+  "$docker_gate_fixture/scripts/lib/dev-common.sh"
+git -C "$docker_gate_fixture" init -q
+
+cat > "$docker_gate_fixture/scripts/dev/security-gate" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_SECURITY_GATE_LOG:?}"
+printf 'FAKE SECURITY GATE rc=%s\n' "${FAKE_SECURITY_GATE_RC:-0}"
+exit "${FAKE_SECURITY_GATE_RC:-0}"
+EOF
+chmod +x "$docker_gate_fixture/scripts/dev/security-gate"
+
+cat > "$docker_gate_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG:?}"
+case "${1:-} ${2:-}" in
+  "info ") exit "${FAKE_DOCKER_INFO_RC:-0}" ;;
+  "compose version") exit "${FAKE_DOCKER_COMPOSE_RC:-0}" ;;
+  "image inspect") exit "${FAKE_DOCKER_INSPECT_RC:-0}" ;;
+  "build "*|"buildx build") exit "${FAKE_DOCKER_BUILD_RC:-0}" ;;
+  "buildx version") exit "${FAKE_DOCKER_BUILDX_RC:-0}" ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "$docker_gate_bin/docker"
+
+run_docker_gate_fixture() {
+  local prebuilt_mode="$1"
+  local inspect_rc="${2:-0}"
+  local security_gate_rc="${3:-0}"
+
+  : > "$work/docker-gate-docker.log"
+  : > "$work/docker-gate-security.log"
+  docker_gate_fixture_rc=0
+  docker_gate_fixture_out="$(
+    cd "$docker_gate_fixture"
+    PATH="$docker_gate_bin:$PATH" \
+    GITHUB_ACTIONS='' \
+    AGENT_LAB_DEVBOX_PREBUILT="$prebuilt_mode" \
+    FAKE_DOCKER_LOG="$work/docker-gate-docker.log" \
+    FAKE_DOCKER_INFO_RC=0 \
+    FAKE_DOCKER_COMPOSE_RC=0 \
+    FAKE_DOCKER_INSPECT_RC="$inspect_rc" \
+    FAKE_DOCKER_BUILD_RC=0 \
+    FAKE_SECURITY_GATE_LOG="$work/docker-gate-security.log" \
+    FAKE_SECURITY_GATE_RC="$security_gate_rc" \
+      ./scripts/dev/docker-gate 2>&1
+  )" || docker_gate_fixture_rc=$?
+}
+
+run_docker_gate_fixture 0
+if [ "$docker_gate_fixture_rc" -eq 0 ] &&
+   grep -Fxq \
+     'build -t agent-lab/devbox:local -f images/devbox/Dockerfile .' \
+     "$work/docker-gate-docker.log" &&
+   ! grep -Eq '^(image inspect|buildx build)( |$)' \
+     "$work/docker-gate-docker.log" &&
+   grep -Fxq 'docker' "$work/docker-gate-security.log" &&
+   printf '%s\n' "$docker_gate_fixture_out" |
+     grep -Fq 'TIMING devbox-local-build='; then
+  pass "Docker gate mode 0 builds before running the security suites"
+else
+  fail "Docker gate mode 0 builds before running the security suites"
+fi
+
+run_docker_gate_fixture 1
+if [ "$docker_gate_fixture_rc" -eq 0 ] &&
+   grep -Fxq 'image inspect agent-lab/devbox:local' \
+     "$work/docker-gate-docker.log" &&
+   ! grep -Eq '^(build|buildx build)( |$)' \
+     "$work/docker-gate-docker.log" &&
+   grep -Fxq 'docker' "$work/docker-gate-security.log" &&
+   printf '%s\n' "$docker_gate_fixture_out" |
+     grep -Fq 'TIMING devbox-prebuilt-verify='; then
+  pass "Docker gate mode 1 inspects the prebuilt image and never builds"
+else
+  fail "Docker gate mode 1 inspects the prebuilt image and never builds"
+fi
+
+run_docker_gate_fixture 1 1
+if [ "$docker_gate_fixture_rc" -eq 125 ] &&
+   printf '%s\n' "$docker_gate_fixture_out" |
+     grep -Fq 'cache-aware CI build did not load agent-lab/devbox:local' &&
+   [ ! -s "$work/docker-gate-security.log" ] &&
+   ! grep -Eq '^(build|buildx build)( |$)' \
+     "$work/docker-gate-docker.log"; then
+  pass "missing prebuilt image is infrastructure failure and runs no suite"
+else
+  fail "missing prebuilt image is infrastructure failure and runs no suite"
+fi
+
+run_docker_gate_fixture invalid
+if [ "$docker_gate_fixture_rc" -eq 125 ] &&
+   printf '%s\n' "$docker_gate_fixture_out" |
+     grep -Fq 'AGENT_LAB_DEVBOX_PREBUILT must be 0 or 1' &&
+   [ ! -s "$work/docker-gate-security.log" ] &&
+   ! grep -Eq '^(image inspect|build|buildx build)( |$)' \
+     "$work/docker-gate-docker.log"; then
+  pass "invalid prebuilt mode is infrastructure failure and runs no suite"
+else
+  fail "invalid prebuilt mode is infrastructure failure and runs no suite"
+fi
+
+run_docker_gate_fixture 1 0 37
+if [ "$docker_gate_fixture_rc" -eq 37 ] &&
+   grep -Fxq 'docker' "$work/docker-gate-security.log" &&
+   printf '%s\n' "$docker_gate_fixture_out" |
+     grep -Fq 'FAKE SECURITY GATE rc=37' &&
+   printf '%s\n' "$docker_gate_fixture_out" |
+     tail -n 1 |
+     grep -Eq '^TIMING docker-suites=[0-9]+s total=[0-9]+s$'; then
+  pass "Docker gate preserves suite failure after reporting phase timings"
+else
+  fail "Docker gate preserves suite failure after reporting phase timings"
 fi
 
 # shellcheck source=tests/docker/lib.sh
