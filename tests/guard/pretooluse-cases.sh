@@ -8,6 +8,22 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && 
 # GUARD_OVERRIDE lets maintenance verify a candidate guard (e.g. tmp/guard-new.sh) before swap-in.
 guard="${GUARD_OVERRIDE:-$repo_root/tools/pretooluse-guard.sh}"
 
+# The commit backstop reads the current branch from Git. Give it an isolated branch context so
+# allow-cases do not depend on whether this suite runs from a working branch, dev, or master.
+infra() { printf 'INFRA %s\n' "$1" >&2; exit 125; }
+guard_git_work="$(mktemp -d)" || infra "could not create guard Git fixture"
+guard_git_repo="$guard_git_work/repo"
+cleanup() { find "$guard_git_work" -depth -delete >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git init -q "$guard_git_repo" \
+  || infra "could not initialize guard Git fixture"
+guard_git_dir="$guard_git_repo/.git"
+set_guard_branch() {
+  git --git-dir="$guard_git_dir" symbolic-ref HEAD "refs/heads/$1" \
+    || infra "could not select guard test branch $1"
+}
+set_guard_branch agent/test/guard
+
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
@@ -23,7 +39,8 @@ _check() {
 expect_cmd() {
   local exp="$1" name="$2" cmd="$3" rc=0
   printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(jq -Rn --arg c "$cmd" '$c')" \
-    | env -u AGENT_LAB_MAINTENANCE "$guard" >/dev/null 2>&1 || rc=$?
+    | env -u AGENT_LAB_MAINTENANCE -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+        GIT_DIR="$guard_git_dir" "$guard" >/dev/null 2>&1 || rc=$?
   _check "$exp" "$name" "$rc"
 }
 # expect_edit <block|allow> <name> <file_path> [maint]
@@ -46,6 +63,13 @@ expect_cmd allow "run tests"                  './scripts/dev/test quick'
 expect_cmd allow "lint"                       './scripts/dev/lint-scripts'
 expect_cmd allow "read a protected file"      'cat AGENTS.md'
 expect_cmd allow "grep doctrine"              'grep -r TLDR doctrine/'
+
+echo "== deny: commit on master (branch backstop) =="
+set_guard_branch master
+expect_cmd block "git commit on master"              'git commit -m "wip"'
+expect_cmd block "git commit with rail words on master" \
+  'git commit -m "update doctrine/ and the guard"'
+set_guard_branch agent/test/guard
 
 echo "== deny: remote integrity =="
 expect_cmd block "push"                       'git push'
