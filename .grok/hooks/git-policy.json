@@ -6,6 +6,12 @@
         "hooks": [
           { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
         ]
+      },
+      {
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
+        ]
       }
     ]
   }

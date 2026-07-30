@@ -160,7 +160,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 - External pull requests will be closed.
 - External issues will generally be closed (see the issue templates for redirects to documentation and private reporting).
 
-Organization members: see `AGENTS.md`, `doctrine/`, and the internal process.
+Organization members: see `AGENTS.md` and the internal process.
 The required checks and exact local replay loop are documented in
 [`docs/ci.md`](docs/ci.md).
 

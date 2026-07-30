@@ -12,6 +12,12 @@
         "hooks": [
           { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
         ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh\"" }
+        ]
       }
     ],
     "SessionStart": [
