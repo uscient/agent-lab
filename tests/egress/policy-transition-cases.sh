@@ -32,6 +32,11 @@ if [ "${1:-}" = "inspect" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "exec" ]; then
+  sha256sum "${FAKE_ACTIVE_ALLOWLIST:?}"
+  exit 0
+fi
+
 if [ "${1:-}" = "compose" ]; then
   case " $* " in
     *" ps -q egress-proxy "*)
@@ -128,6 +133,17 @@ elif grep -Fq "active egress policy mismatch" "$work/stale.out"; then
   pass "agent refuses to run when the active policy cannot be verified"
 else
   fail "active-policy verification failure reports the mismatch"
+fi
+
+rm -f "$active_hash" "$active_allowlist"
+run_agent "base" "$work/mount-baseline.out"
+printf '.tampered.example\n' >> "$active_allowlist"
+if run_agent "base" "$work/tampered-mount.out"; then
+  fail "agent refuses a mounted policy whose bytes do not match its label"
+elif grep -Fq "mounted egress policy mismatch" "$work/tampered-mount.out"; then
+  pass "agent refuses a mounted policy whose bytes do not match its label"
+else
+  fail "mounted-policy verification failure reports the mismatch"
 fi
 
 rm -f "$active_hash" "$active_allowlist"

@@ -28,6 +28,9 @@ case "${1:-} ${2:-}" in
   "inspect --format")
     printf '%s\n' "${AGENT_LAB_EGRESS_POLICY_SHA256:?}"
     ;;
+  "exec fixture-proxy")
+    printf '%s  /etc/squid/allowlist.txt\n' "${AGENT_LAB_EGRESS_POLICY_SHA256:?}"
+    ;;
   "compose "*)
     case " $* " in
       *" ps -q egress-proxy "*) printf 'fixture-proxy\n' ;;

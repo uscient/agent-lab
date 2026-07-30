@@ -23,7 +23,7 @@ agent_lab_sha256_file() {
 }
 
 agent_lab_build_allowlist() {
-  local recipes recipes_spaced out_dir out tmp hash r frag
+  local recipes recipes_spaced out_dir out tmp hash existing_hash r frag
   recipes="${AGENT_LAB_ALLOWLIST_RECIPES:-base}"
   out_dir="${REPO_ROOT:?REPO_ROOT not set}/.cache/squid"
   mkdir -p "$out_dir"
@@ -52,8 +52,19 @@ agent_lab_build_allowlist() {
   fi
   out="${out_dir}/allowlist.${hash}.txt"
   if [ -f "$out" ]; then
+    existing_hash="$(agent_lab_sha256_file "$out")" || {
+      rm -f "$tmp"
+      return 1
+    }
+    if [ "$existing_hash" != "$hash" ]; then
+      rm -f "$tmp"
+      printf 'FAIL content-addressed allowlist was modified: %s\n' "$out" >&2
+      return 1
+    fi
+    chmod 0444 "$out"
     rm -f "$tmp"
   else
+    chmod 0444 "$tmp"
     mv "$tmp" "$out"
   fi
   printf 'PASS generated allowlist [%s] sha256=%s -> %s\n' "$recipes" "$hash" "$out"
