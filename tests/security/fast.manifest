@@ -33,6 +33,7 @@ suite guard-mount tests/guard/cases.sh SUMMARY failures=0
 suite config-authority tests/agent/config-guard.sh SUMMARY failures=0
 suite image-volume-policy tests/agent/image-volume-policy-cases.sh SUMMARY failures=0
 suite runtime-inspector tests/agent/runtime-inspector-cases.sh SUMMARY failures=0
+suite secret-parser tests/agent/entrypoint-secret-cases.sh SUMMARY failures=0
 suite egress-policy-transition tests/egress/policy-transition-cases.sh SUMMARY failures=0
 suite dns-contract-unit tests/egress/dns-contract-cases.sh SUMMARY failures=0
 suite wrapper-context tests/wrap-image/context-cases.sh SUMMARY failures=0
