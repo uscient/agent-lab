@@ -122,5 +122,6 @@ may be doing unrelated work; the dev git-policy does not apply inside them.
   dev config. Keep them straight.
 - *Optional dogfood path:* you may develop Agent Lab "in the box" by pointing
   `AGENT_LAB_PROJECT_DIR` at the repo root (RW) with a coding-agent image — caller configuration,
-  not a baked runtime role. The repo-scoped configs travel with the repo, so an agent editing Agent
-  Lab inherits the dev policy wherever it runs.
+  not a baked runtime role. Select a secrets directory outside that project tree; the data-plane
+  launcher rejects overlapping project/secrets paths. The repo-scoped configs travel with the repo,
+  so an agent editing Agent Lab inherits the dev policy wherever it runs.

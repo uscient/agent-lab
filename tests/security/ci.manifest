@@ -1,0 +1,9 @@
+# Versioned required CI gates.
+# Format:
+#   version <schema-version>
+#   gate <needs-key> <local replay command...>
+
+version 1
+gate fast ./scripts/dev/check default quick
+gate static ./tools/validate.sh --strict
+gate docker ./scripts/dev/docker-gate

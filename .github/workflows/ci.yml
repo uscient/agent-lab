@@ -1,42 +1,204 @@
 name: CI
+run-name: CI / ${{ github.event.pull_request.number || github.ref_name }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 on:
   push:
-    branches: [master, main]
+    branches: [dev, master, main]
   pull_request:
-    branches: [master, main]
+    branches: [dev, master, main]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
 jobs:
-  ci:
+  fast:
+    name: Fast
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      diff-base: ${{ steps.diff-base.outputs.base }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
 
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
-      - name: Lint
-        run: ./scripts/dev/lint-scripts
-
-      - name: Check + validate
+      - name: Resolve committed diff base
+        id: diff-base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
-          ./scripts/dev/check default full
-          ./tools/validate.sh
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            push) base="$PUSH_BEFORE_SHA" ;;
+            merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
+            *)
+              printf '::error title=Unsupported CI event::%s has no deterministic diff base\n' \
+                "$EVENT_NAME"
+              exit 125
+              ;;
+          esac
 
-      - name: Build devbox
+          sha_pattern='^([0-9a-f]{40}|[0-9a-f]{64})$'
+          if [[ ! "$base" =~ $sha_pattern ]] || [[ "$base" =~ ^0+$ ]]; then
+            printf '::error title=Invalid CI diff base::event supplied %s\n' \
+              "${base:-<empty>}"
+            exit 125
+          fi
+          if ! git rev-parse --verify "${base}^{commit}" >/dev/null; then
+            printf '::error title=Unresolvable CI diff base::%s is not a fetched commit\n' \
+              "$base"
+            exit 125
+          fi
+          if ! git merge-base --is-ancestor "$base" HEAD; then
+            printf '::error title=Invalid CI history::%s is not an ancestor of HEAD\n' \
+              "$base"
+            exit 125
+          fi
+
+          head="$(git rev-parse HEAD)"
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+          printf 'head=%s\n' "$head" >> "$GITHUB_OUTPUT"
+
+      - name: Fast security gate
+        env:
+          AGENT_LAB_DIFF_BASE: ${{ steps.diff-base.outputs.base }}
+          CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
-          docker buildx build \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
-            --load \
-            -t agent-lab/devbox:local \
-            -f images/devbox/Dockerfile .
+          set -o pipefail
+          mkdir -p "$CI_LOG_DIR"
+          ./scripts/dev/check default quick 2>&1 | tee "$CI_LOG_DIR/fast.log"
+
+      - name: Summarize fast gate
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ job.status }}
+          DIFF_BASE: ${{ steps.diff-base.outputs.base || 'unresolved' }}
+          HEAD_SHA: ${{ steps.diff-base.outputs.head || github.sha }}
+        run: |
+          {
+            printf '## Fast gate\n\n'
+            printf '| Result | Diff base | Tested head |\n'
+            printf '|---|---|---|\n'
+            printf '| `%s` | `%s` | `%s` |\n\n' "$RESULT" "$DIFF_BASE" "$HEAD_SHA"
+            printf 'Replay: `AGENT_LAB_DIFF_BASE=%s ./scripts/dev/check default quick`\n' \
+              "$DIFF_BASE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain fast failure log
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ci-fast-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agent-lab-ci/fast.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  static:
+    name: Static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Static configuration gate
+        env:
+          CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
+        run: |
+          set -o pipefail
+          mkdir -p "$CI_LOG_DIR"
+          ./tools/validate.sh --strict 2>&1 | tee "$CI_LOG_DIR/static.log"
+
+      - name: Summarize static gate
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            printf '## Static gate\n\n'
+            printf -- '- Result: `%s`\n' "$RESULT"
+            printf -- '- Replay: `./tools/validate.sh --strict`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain static failure log
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ci-static-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agent-lab-ci/static.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  docker:
+    name: Docker security
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build cache-aware devbox
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: images/devbox/Dockerfile
+          load: true
+          tags: agent-lab/devbox:local
+          cache-from: type=gha,scope=devbox
+          cache-to: type=gha,mode=max,scope=devbox
+
+      - name: Run Docker security gate
+        id: docker-gate
+        env:
+          AGENT_LAB_DEVBOX_PREBUILT: 1
+          CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
+        run: |
+          set -o pipefail
+          mkdir -p "$CI_LOG_DIR"
+          ./scripts/dev/docker-gate 2>&1 | tee "$CI_LOG_DIR/docker.log"
+
+      - name: Summarize Docker gate
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            printf '## Docker security gate\n\n'
+            printf -- '- Result: `%s`\n' "$RESULT"
+            printf -- '- Replay: `./scripts/dev/docker-gate`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain Docker failure log
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ci-docker-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agent-lab-ci/docker.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  required-gates:
+    name: Required gates
+    if: ${{ always() }}
+    needs: [fast, static, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Reduce required gate results
+        env:
+          CI_NEEDS_JSON: ${{ toJSON(needs) }}
+        run: ./scripts/dev/required-gates

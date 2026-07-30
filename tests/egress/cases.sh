@@ -90,14 +90,9 @@ coredns_external_refuses() {
   local out
   out="$(dig @"$dns_ip" +time=2 +tries=1 "$allowed_domain" A 2>&1 || true)"
   printf '%s\n' "$out" >/tmp/coredns-external.out
-  case "$out" in
-    *"status: REFUSED"*|*"status: NXDOMAIN"*|*"status: SERVFAIL"*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  printf '%s\n' "$out" | grep -Eq 'status:[[:space:]]*NXDOMAIN,' &&
+    printf '%s\n' "$out" |
+      grep -Eq 'QUERY:[[:space:]]*1,[[:space:]]*ANSWER:[[:space:]]*0,'
 }
 
 direct_external_dns_query() {

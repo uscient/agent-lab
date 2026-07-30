@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+root="$(repo_root)"
+mode="fast"
+manifest=""
+work=""
+
+usage() {
+  printf 'Usage: %s [fast|docker] [--manifest PATH]\n' "$0" >&2
+}
+
+infra() {
+  printf 'INFRA %s\n' "$*" >&2
+}
+
+cleanup() {
+  if [ -n "$work" ] && [ -d "$work" ]; then
+    rm -rf "$work"
+  fi
+}
+trap cleanup EXIT
+
+case "${1:-}" in
+  fast|docker) mode="$1"; shift ;;
+esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      manifest="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$manifest" ]; then
+  manifest="$root/tests/security/${mode}.manifest"
+fi
+case "$manifest" in
+  /*) ;;
+  *) manifest="$root/$manifest" ;;
+esac
+
+if [ ! -f "$manifest" ]; then
+  infra "required manifest is missing: $manifest"
+  exit 125
+fi
+
+declare -a required_tools=()
+declare -a required_tool_any_left=()
+declare -a required_tool_any_right=()
+declare -a suite_ids=()
+declare -a suite_paths=()
+declare -a suite_markers=()
+declare -A seen_suite_ids=()
+manifest_errors=0
+line_no=0
+
+while IFS= read -r line || [ -n "$line" ]; do
+  line_no=$((line_no + 1))
+  case "$line" in
+    ''|'#'*) continue ;;
+  esac
+
+  kind=""
+  field=""
+  value=""
+  marker=""
+  read -r kind field value marker <<< "$line"
+  case "$kind" in
+    tool)
+      if [ -z "$field" ] || [ -n "$value" ] || [ -n "$marker" ]; then
+        infra "malformed tool entry at $manifest:$line_no"
+        manifest_errors=1
+      else
+        required_tools+=("$field")
+      fi
+      ;;
+    tool-any)
+      if [ -z "$field" ] || [ -z "$value" ] || [ -n "$marker" ]; then
+        infra "malformed tool-any entry at $manifest:$line_no"
+        manifest_errors=1
+      else
+        required_tool_any_left+=("$field")
+        required_tool_any_right+=("$value")
+      fi
+      ;;
+    suite)
+      if [ -z "$field" ] || [ -z "$value" ] || [ -z "$marker" ]; then
+        infra "malformed suite entry at $manifest:$line_no"
+        manifest_errors=1
+        continue
+      fi
+      case "$field" in
+        *[!A-Za-z0-9._-]*|'')
+          infra "invalid suite ID at $manifest:$line_no: $field"
+          manifest_errors=1
+          continue
+          ;;
+      esac
+      if [ -n "${seen_suite_ids[$field]+x}" ]; then
+        infra "duplicate suite ID in $manifest: $field"
+        manifest_errors=1
+        continue
+      fi
+      seen_suite_ids["$field"]=1
+      suite_ids+=("$field")
+      suite_paths+=("$value")
+      suite_markers+=("$marker")
+      ;;
+    *)
+      infra "unknown manifest entry at $manifest:$line_no: $kind"
+      manifest_errors=1
+      ;;
+  esac
+done < "$manifest"
+
+if [ "$manifest_errors" -ne 0 ]; then
+  exit 125
+fi
+if [ "${#suite_ids[@]}" -eq 0 ]; then
+  infra "manifest defines no required suites: $manifest"
+  exit 125
+fi
+
+preflight_failed=0
+for tool in "${required_tools[@]}"; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    infra "missing required tool: $tool"
+    preflight_failed=1
+  fi
+done
+if [ "${#required_tool_any_left[@]}" -gt 0 ]; then
+  for i in "${!required_tool_any_left[@]}"; do
+    if ! command -v "${required_tool_any_left[$i]}" >/dev/null 2>&1 &&
+       ! command -v "${required_tool_any_right[$i]}" >/dev/null 2>&1; then
+      infra "missing required tool (need one of: ${required_tool_any_left[$i]} ${required_tool_any_right[$i]})"
+      preflight_failed=1
+    fi
+  done
+fi
+
+for i in "${!suite_ids[@]}"; do
+  suite_path="${suite_paths[$i]}"
+  case "$suite_path" in
+    /*) ;;
+    *) suite_path="$root/$suite_path" ;;
+  esac
+  suite_paths[i]="$suite_path"
+  if [ ! -f "$suite_path" ]; then
+    infra "required suite is missing: ${suite_ids[$i]} ($suite_path)"
+    preflight_failed=1
+  fi
+done
+
+if [ "$preflight_failed" -ne 0 ]; then
+  exit 125
+fi
+
+case "$mode" in
+  docker)
+    if ! docker info >/dev/null 2>&1; then
+      infra "Docker daemon is unavailable"
+      exit 125
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+      infra "Docker Compose v2 is unavailable"
+      exit 125
+    fi
+    ;;
+esac
+
+work="$(mktemp -d)"
+passed=0
+failed=0
+skipped=0
+infrastructure=0
+
+for i in "${!suite_ids[@]}"; do
+  suite_id="${suite_ids[$i]}"
+  suite_path="${suite_paths[$i]}"
+  suite_output="$work/$suite_id.out"
+  rc=0
+
+  printf '\n== security suite: %s (%s) ==\n' "$suite_id" "${suite_path#"$root/"}"
+  bash "$suite_path" >"$suite_output" 2>&1 || rc=$?
+  cat "$suite_output"
+
+  case "$rc" in
+    0)
+      if grep -Eq '^[[:space:]]*(SKIP|NOT_IMPLEMENTED|WARN)([[:space:]:]|$)' "$suite_output"; then
+        printf 'FAIL suite %s emitted forbidden status output\n' "$suite_id" >&2
+        failed=$((failed + 1))
+      elif ! grep -Fq -- "${suite_markers[$i]}" "$suite_output"; then
+        printf 'FAIL suite %s missing completion marker: %s\n' \
+          "$suite_id" "${suite_markers[$i]}" >&2
+        failed=$((failed + 1))
+      else
+        passed=$((passed + 1))
+      fi
+      ;;
+    77)
+      printf 'SKIP suite %s returned 77\n' "$suite_id" >&2
+      skipped=$((skipped + 1))
+      ;;
+    125)
+      infra "suite $suite_id reported infrastructure failure"
+      infrastructure=$((infrastructure + 1))
+      ;;
+    *)
+      printf 'FAIL suite %s exited %s\n' "$suite_id" "$rc" >&2
+      failed=$((failed + 1))
+      ;;
+  esac
+done
+
+printf '\nSECURITY GATE SUMMARY pass=%s fail=%s skip=%s infra=%s\n' \
+  "$passed" "$failed" "$skipped" "$infrastructure"
+
+# A real assertion failure remains the primary result even when another suite also
+# encountered infrastructure trouble. The summary retains both classifications, and
+# pure infrastructure failures still use 125.
+if [ "$failed" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+  exit 1
+fi
+if [ "$infrastructure" -ne 0 ]; then
+  exit 125
+fi
+
+printf 'SECURITY GATE PASS\n'

@@ -2,7 +2,7 @@
 # tests/agent/policy-verify.sh — tool-agnostic verification harness.
 # Runs the guard/shim/token/generator/wiring/doctrine [probe] checks that don't need a live tool.
 # Per-tool LIVE checks (no-prompt loop, guard-fired, trust) are in agent-policy-checklist.md.
-# Tolerant of not-yet-built adapters (SKIP, not FAIL). Run: bash tests/agent/policy-verify.sh
+# Missing adapters are reported as SKIP and make the strict result fail.
 set -uo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 cd "$root" || exit 1
@@ -97,4 +97,4 @@ idx=$(grep -cE '^- `doctrine/.*\.md`' AGENTS.md); files=$(find doctrine -maxdept
 [ "$idx" -eq "$files" ] && pass "AGENTS.md doctrine index 1:1 ($idx)" || fail "doctrine index $idx != $files files"
 
 printf '\nSUMMARY pass=%s fail=%s skip=%s\n' "$P" "$F" "$S"
-[ "$F" -eq 0 ]
+[ "$F" -eq 0 ] && [ "$S" -eq 0 ]

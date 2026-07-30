@@ -1,14 +1,17 @@
 name: CodeQL
+run-name: CodeQL / ${{ github.event.pull_request.number || github.ref_name }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 on:
   push:
-    branches: [master, main]
+    branches: [dev, master, main]
   pull_request:
-    branches: [master, main]
+    branches: [dev, master, main]
+  merge_group:
+    types: [checks_requested]
   schedule:
     - cron: "0 6 * * 1"
 
@@ -16,15 +19,16 @@ jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4
         with:
           languages: actions
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4

@@ -22,6 +22,18 @@ esac
 base="$1"
 wrapped="${2:-}"
 
+valid_image_reference() {
+  case "$1" in
+    ''|-*|*://*|*[!A-Za-z0-9._/@:+-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if ! valid_image_reference "$base"; then
+  printf 'FAIL invalid base image reference: %s\n' "$base" >&2
+  exit 1
+fi
+
 command -v docker >/dev/null 2>&1 || { printf 'FAIL docker is required\n' >&2; exit 1; }
 
 # Default wrapped tag from the base image's bare name (strip registry path, :tag, @digest).
@@ -31,6 +43,10 @@ if [ -z "$wrapped" ]; then
   name="${name##*/}"    # drop registry/path
   name="${name%:*}"     # drop :tag
   wrapped="agent-lab/${name}:wrapped"
+fi
+if ! valid_image_reference "$wrapped"; then
+  printf 'FAIL invalid wrapped image tag: %s\n' "$wrapped" >&2
+  exit 1
 fi
 
 # Pull the base image if it is not already present locally.
@@ -43,45 +59,69 @@ orig_entrypoint="$(docker inspect -f '{{json .Config.Entrypoint}}' "$base")"
 orig_cmd="$(docker inspect -f '{{json .Config.Cmd}}' "$base")"
 orig_user="$(docker inspect -f '{{.Config.User}}' "$base")"
 
-# Merge two compact JSON arrays (or "null") into one, with pure shell -- no jq/python.
-merge_json_arrays() {
-  local a="$1" b="$2"
-  [ "$a" = null ] && a='[]'; [ "$b" = null ] && b='[]'
-  if   [ "$a" = '[]' ] && [ "$b" = '[]' ]; then printf '[]'
-  elif [ "$a" = '[]' ]; then printf '%s' "$b"
-  elif [ "$b" = '[]' ]; then printf '%s' "$a"
-  else printf '%s,%s' "${a%]}" "${b#[}"; fi   # "[x]" + "[y]" -> "[x,y]"
+# Prepend our secret loader to the original exec-form entrypoint. The base CMD remains
+# inherited rather than being flattened into ENTRYPOINT, preserving `docker run IMAGE ARG`
+# semantics: runtime arguments still replace CMD while the original entrypoint remains.
+wrapped_entrypoint() {
+  local entrypoint="$1"
+  case "$entrypoint" in
+    null|'[]') printf '["/usr/local/bin/agent-entrypoint"]' ;;
+    \[*\])
+      printf '["/usr/local/bin/agent-entrypoint",%s' "${entrypoint#\[}"
+      ;;
+    *)
+      printf 'FAIL invalid entrypoint metadata from base image\n' >&2
+      return 1
+      ;;
+  esac
 }
 
-combined="$(merge_json_arrays "$orig_entrypoint" "$orig_cmd")"
+entrypoint="$(wrapped_entrypoint "$orig_entrypoint")"
+case "$orig_cmd" in
+  null|\[*\]) ;;
+  *)
+    printf 'FAIL invalid command metadata from base image\n' >&2
+    exit 1
+    ;;
+esac
 
 printf 'Base image:          %s\n' "$base"
 printf 'Original ENTRYPOINT: %s\n' "$orig_entrypoint"
 printf 'Original CMD:        %s\n' "$orig_cmd"
 printf 'Original USER:       %s\n' "${orig_user:-<root>}"
-printf 'Combined CMD:        %s\n' "$combined"
+printf 'Wrapped ENTRYPOINT:  %s\n' "$entrypoint"
 
-if [ "$combined" = '[]' ]; then
+if [ "$orig_entrypoint" = null ] && [ "$orig_cmd" = null ]; then
   printf 'WARN base declares neither ENTRYPOINT nor CMD; supply a command at runtime:\n' >&2
   printf 'WARN   scripts/agent -- <cmd>\n' >&2
 fi
 
-# Temp Dockerfile. Build context is the repo root so `COPY tools/...` resolves.
-tmp_df="$(mktemp "${TMPDIR:-/tmp}/agent-lab-wrap.XXXXXX")"
-cleanup() { rm -f "$tmp_df"; }
+# Use a purpose-built context. A hostile base's ONBUILD COPY can see only these explicit
+# wrapper inputs, never the repository, ignored files, credentials, caches, or logs.
+build_context="$(mktemp -d "${TMPDIR:-/tmp}/agent-lab-wrap.XXXXXX")"
+dockerfile="${build_context}/Dockerfile"
+entrypoint_file="${build_context}/agent-entrypoint.sh"
+dockerignore="${build_context}/.dockerignore"
+cleanup() {
+  rm -f "$dockerfile" "$entrypoint_file" "$dockerignore"
+  rmdir "$build_context"
+}
 trap cleanup EXIT
+cp "${REPO_ROOT}/tools/agent-entrypoint.sh" "$entrypoint_file"
+chmod 0755 "$entrypoint_file"
 
 {
   printf 'FROM %s\n' "$base"
-  printf 'USER root\n'
-  printf 'COPY tools/agent-entrypoint.sh /usr/local/bin/agent-entrypoint\n'
-  printf 'RUN chmod 0755 /usr/local/bin/agent-entrypoint\n'
-  [ -n "$orig_user" ] && printf 'USER %s\n' "$orig_user"
-  printf 'ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]\n'
-  printf 'CMD %s\n' "$combined"
-} > "$tmp_df"
+  printf 'COPY agent-entrypoint.sh /usr/local/bin/agent-entrypoint\n'
+  printf 'ENTRYPOINT %s\n' "$entrypoint"
+  [ "$orig_cmd" != null ] && printf 'CMD %s\n' "$orig_cmd"
+} > "$dockerfile"
+{
+  printf '*\n'
+  printf '!agent-entrypoint.sh\n'
+} > "$dockerignore"
 
 printf 'Building %s\n' "$wrapped"
-docker build -t "$wrapped" -f "$tmp_df" "$REPO_ROOT"
+docker build --network=none -t "$wrapped" -f "$dockerfile" "$build_context"
 
 printf 'PASS wrapped image ready: %s\n' "$wrapped"

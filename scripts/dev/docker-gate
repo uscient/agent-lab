@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
+cd_root
+
+infra() {
+  printf 'INFRA %s\n' "$*" >&2
+  exit 125
+}
+
+command -v docker >/dev/null 2>&1 || infra "Docker CLI is unavailable"
+docker info >/dev/null 2>&1 || infra "Docker daemon is unavailable"
+docker compose version >/dev/null 2>&1 ||
+  infra "Docker Compose v2 is unavailable"
+
+total_started="$SECONDS"
+build_started="$SECONDS"
+build_mode="local-build"
+case "${AGENT_LAB_DEVBOX_PREBUILT:-0}" in
+  0)
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      build_mode="buildx-fallback"
+      docker buildx version >/dev/null 2>&1 ||
+        infra "Docker Buildx is unavailable in GitHub Actions"
+      docker buildx build \
+        --load \
+        -t agent-lab/devbox:local \
+        -f images/devbox/Dockerfile .
+    else
+      docker build \
+        -t agent-lab/devbox:local \
+        -f images/devbox/Dockerfile .
+    fi
+    ;;
+  1)
+    build_mode="prebuilt-verify"
+    docker image inspect agent-lab/devbox:local >/dev/null 2>&1 ||
+      infra "cache-aware CI build did not load agent-lab/devbox:local"
+    ;;
+  *)
+    infra "AGENT_LAB_DEVBOX_PREBUILT must be 0 or 1"
+    ;;
+esac
+printf 'TIMING devbox-%s=%ss\n' "$build_mode" "$((SECONDS - build_started))"
+
+suites_started="$SECONDS"
+gate_rc=0
+./scripts/dev/security-gate docker || gate_rc=$?
+printf 'TIMING docker-suites=%ss total=%ss\n' \
+  "$((SECONDS - suites_started))" "$((SECONDS - total_started))"
+exit "$gate_rc"
