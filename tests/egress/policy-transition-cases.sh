@@ -5,11 +5,46 @@ set -euo pipefail
 # bind-mounted allowlist only when the service is first created or force-recreated.
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-work="$(mktemp -d)"
-cleanup() { rm -rf "$work"; }
+if ! work="$(mktemp -d)"; then
+  printf 'INFRA egress policy transition cannot create isolated work directory\n' >&2
+  exit 125
+fi
+agent_root="$work/agent-root"
+cleanup() { find "$work" -xdev -depth -delete >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-mkdir -p "$work/bin" "$work/secrets"
+mkdir -p \
+  "$work/bin" "$work/home" "$work/secrets" \
+  "$agent_root/scripts/lib" "$agent_root/policies/recipes"
+cp "$repo_root/scripts/agent" "$repo_root/scripts/common" "$agent_root/scripts/"
+cp \
+  "$repo_root/scripts/lib/allowlist.sh" \
+  "$repo_root/scripts/lib/config.sh" \
+  "$repo_root/scripts/lib/domain.sh" \
+  "$repo_root/scripts/lib/egress.sh" \
+  "$repo_root/scripts/lib/guard.sh" \
+  "$repo_root/scripts/lib/image.sh" \
+  "$agent_root/scripts/lib/"
+cp "$repo_root"/policies/recipes/*.allowlist "$agent_root/policies/recipes/"
+cp \
+  "$repo_root/compose.yaml" \
+  "$repo_root/compose.egress.yaml" \
+  "$repo_root/compose.agent.yaml" \
+  "$repo_root/compose.agent.ephemeral.yaml" \
+  "$repo_root/compose.agent.persist.yaml" \
+  "$agent_root/"
+for fixture_input in \
+  scripts/agent scripts/common \
+  scripts/lib/allowlist.sh scripts/lib/config.sh scripts/lib/domain.sh \
+  scripts/lib/egress.sh scripts/lib/guard.sh scripts/lib/image.sh \
+  compose.yaml compose.egress.yaml compose.agent.yaml \
+  compose.agent.ephemeral.yaml compose.agent.persist.yaml; do
+  if [ ! -f "$agent_root/$fixture_input" ]; then
+    printf 'INFRA egress policy transition fixture is incomplete: %s\n' \
+      "$fixture_input" >&2
+    exit 125
+  fi
+done
 env_file="$work/agent.env"
 docker_log="$work/docker.log"
 active_hash="$work/active.hash"
@@ -85,7 +120,7 @@ run_agent() {
   local recipes="$1" out="$2" rc=0
   env -i \
     PATH="$work/bin:/usr/bin:/bin" \
-    HOME="$HOME" \
+    HOME="$work/home" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_ACTIVE_HASH="$active_hash" \
     FAKE_ACTIVE_ALLOWLIST="$active_allowlist" \
@@ -100,7 +135,7 @@ run_agent() {
     AGENT_LAB_AGENT_GID="1000" \
     AGENT_LAB_AGENT_MEM="1g" \
     AGENT_LAB_AGENT_CPUS="1" \
-    "$repo_root/scripts/agent" -- true >"$out" 2>&1 || rc=$?
+    "$agent_root/scripts/agent" -- true >"$out" 2>&1 || rc=$?
   return "$rc"
 }
 
