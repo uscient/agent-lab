@@ -35,13 +35,6 @@ echo "== token budget =="
 n=$(wc -c < AGENTS.md)
 [ "$n" -le 6000 ] && pass "AGENTS.md <= 6000 bytes ($n)" || fail "AGENTS.md token budget ($n/6000)"
 
-echo "== guard unit matrix (delegate) =="
-if bash tests/guard/pretooluse-cases.sh >/tmp/pol_guard.out 2>&1; then
-  pass "tests/guard/pretooluse-cases.sh ($(grep -c '^PASS' /tmp/pol_guard.out) cases)"
-else
-  fail "tests/guard/pretooluse-cases.sh — see /tmp/pol_guard.out"
-fi
-
 echo "== guard-fired & adversarial stdin (string forms) =="
 for c in 'git push' 'git push --force origin HEAD' 'git push origin dev' 'git -C . push' 'sh -c "git push"' 'env git push' \
          'nohup git push &' 'python3 -c "import subprocess;subprocess.run([\"git\",\"push\"])"' \

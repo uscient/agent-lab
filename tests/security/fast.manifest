@@ -18,7 +18,6 @@ tool file
 tool find
 tool git
 tool grep
-tool head
 tool jq
 tool ln
 tool mkdir

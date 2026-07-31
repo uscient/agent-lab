@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 gate="$repo_root/scripts/dev/security-gate"
+lint="$repo_root/scripts/dev/lint-scripts"
+policy_probe="$repo_root/tests/agent/policy-verify.sh"
 default_manifest="$repo_root/tests/security/fast.manifest"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -43,6 +45,15 @@ expect_rc() {
     fail "$name (rc=$rc, expected=$expected, marker=$marker)"
     printf '%s\n' "$out"
   fi
+}
+
+policy_has_literal_guard_matrix_reference() {
+  [ -r "$1" ] || return 2
+  awk '
+    /^[[:space:]]*#/ { next }
+    /tests\/guard\/pretooluse-cases\.sh/ { found=1 }
+    END { exit !found }
+  ' "$1"
 }
 
 if [ ! -x "$gate" ]; then
@@ -100,7 +111,6 @@ required_tools=(
   find
   git
   grep
-  head
   jq
   ln
   mkdir
@@ -297,16 +307,168 @@ else
   printf '%s\n' "$adapter_out"
 fi
 
+lint_bin="$work/lint-bin"
+mkdir -p "$lint_bin"
+cat > "$lint_bin/shellcheck" <<'EOF'
+#!/usr/bin/env bash
+printf 'FAIL discovery-only mode invoked ShellCheck\n' >&2
+exit 99
+EOF
+cat > "$lint_bin/head" <<'EOF'
+#!/usr/bin/env bash
+printf 'FAIL lint invoked poisoned head\n' >&2
+exit 99
+EOF
+chmod +x "$lint_bin/shellcheck" "$lint_bin/head"
 lint_rc=0
-lint_out="$("$repo_root/scripts/dev/lint-scripts" 2>&1)" || lint_rc=$?
+lint_out="$(PATH="$lint_bin:$PATH" LC_ALL=C "$lint" --list 2>&1)" || lint_rc=$?
+printf '%s\n' "$lint_out" > "$work/lint-discovery.actual"
+LC_ALL=C sort -u "$work/lint-discovery.actual" > "$work/lint-discovery.sorted"
 if [ "$lint_rc" -eq 0 ] \
-  && printf '%s\n' "$lint_out" | grep -Fxq "tools/bin/git" \
-  && printf '%s\n' "$lint_out" | grep -Fxq "tools/bin/gh"; then
-  pass "lint discovers extensionless shell shims"
+  && cmp -s "$work/lint-discovery.actual" "$work/lint-discovery.sorted" \
+  && grep -Fxq "scripts/dev/lint-scripts" "$work/lint-discovery.actual" \
+  && grep -Fxq "tools/bin/git" "$work/lint-discovery.actual" \
+  && grep -Fxq "tools/bin/gh" "$work/lint-discovery.actual" \
+  && ! grep -Eq '^(== bash -n ==|== shellcheck ==|PASS lint-scripts)$' \
+       "$work/lint-discovery.actual"; then
+  pass "lint discovery mode is deterministic and skips validation work"
 else
-  fail "lint discovers extensionless shell shims (rc=$lint_rc)"
+  fail "lint discovery mode is deterministic and skips validation work (rc=$lint_rc)"
   printf '%s\n' "$lint_out"
 fi
+
+lint_validation_repo="$work/lint-validation-repo"
+lint_validation_bin="$work/lint-validation-bin"
+mkdir -p \
+  "$lint_validation_repo/scripts/dev" \
+  "$lint_validation_repo/scripts/lib" \
+  "$lint_validation_repo/tests" \
+  "$lint_validation_repo/tools" \
+  "$lint_validation_bin"
+cp "$repo_root/scripts/dev/lint-scripts" "$lint_validation_repo/scripts/dev/lint-scripts"
+cp "$repo_root/scripts/lib/dev-common.sh" "$lint_validation_repo/scripts/lib/dev-common.sh"
+cat > "$lint_validation_repo/tools/lower-shell" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$lint_validation_repo/tools/upper-shell" <<'EOF'
+#!/usr/bin/env BASH
+exit 0
+EOF
+printf '#!/usr/bin/env bash' > "$lint_validation_repo/tools/no-final-newline"
+: > "$lint_validation_repo/tools/empty"
+git -C "$lint_validation_repo" init -q
+git -C "$lint_validation_repo" add scripts tools
+cat > "$lint_validation_bin/head" <<'EOF'
+#!/usr/bin/env bash
+printf 'FAIL lint invoked poisoned head\n' >&2
+exit 99
+EOF
+cat > "$lint_validation_bin/shellcheck" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$lint_validation_bin/head" "$lint_validation_bin/shellcheck"
+lint_validation_rc=0
+lint_validation_out="$(
+  cd "$lint_validation_repo" &&
+    env PATH="$lint_validation_bin:$PATH" LC_ALL=C BASHOPTS=nocasematch \
+      bash scripts/dev/lint-scripts 2>&1
+)" \
+  || lint_validation_rc=$?
+if [ "$lint_validation_rc" -eq 0 ] \
+  && printf '%s\n' "$lint_validation_out" | grep -Fxq "tools/lower-shell" \
+  && printf '%s\n' "$lint_validation_out" | grep -Fxq "tools/no-final-newline" \
+  && ! printf '%s\n' "$lint_validation_out" | grep -Fxq "tools/upper-shell" \
+  && ! printf '%s\n' "$lint_validation_out" | grep -Fxq "tools/empty" \
+  && printf '%s\n' "$lint_validation_out" | grep -Fxq "PASS lint-scripts" \
+  && ! printf '%s\n' "$lint_validation_out" | grep -Fq "poisoned head"; then
+  pass "focused lint classifies shebangs without head or inherited nocasematch"
+else
+  fail "focused lint classifies shebangs without head or inherited nocasematch (rc=$lint_validation_rc)"
+  printf '%s\n' "$lint_validation_out"
+fi
+
+lint_git_bin="$work/lint-git-bin"
+mkdir -p "$lint_git_bin"
+cat > "$lint_git_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = ls-files ]; then
+  printf 'scripts/dev/lint-scripts\n'
+  exit 42
+fi
+exec "$AGENT_LAB_REAL_GIT" "$@"
+EOF
+chmod +x "$lint_git_bin/git"
+lint_git_rc=0
+lint_git_out="$(
+  AGENT_LAB_REAL_GIT="$(command -v git)" \
+    PATH="$lint_git_bin:$PATH" LC_ALL=C "$lint" --list 2>&1
+)" || lint_git_rc=$?
+if [ "$lint_git_rc" -eq 125 ] \
+  && printf '%s\n' "$lint_git_out" | grep -Fq "INFRA shell script discovery failed" \
+  && ! printf '%s\n' "$lint_git_out" | grep -Fxq "scripts/dev/lint-scripts"; then
+  pass "failed tracked-file discovery is infrastructure failure with no partial list"
+else
+  fail "failed tracked-file discovery is infrastructure failure with no partial list (rc=$lint_git_rc)"
+  printf '%s\n' "$lint_git_out"
+fi
+
+lint_unreadable_bin="$work/lint-unreadable-bin"
+mkdir -p "$lint_unreadable_bin"
+cat > "$lint_unreadable_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = ls-files ]; then
+  printf '%s\nscripts/dev/lint-scripts\n' "${AGENT_LAB_UNREADABLE_CANDIDATE:?}"
+  exit 0
+fi
+exec "$AGENT_LAB_REAL_GIT" "$@"
+EOF
+chmod +x "$lint_unreadable_bin/git"
+lint_unreadable_rc=0
+: > "$work/lint-unreadable.stdout"
+: > "$work/lint-unreadable.stderr"
+unreadable_candidate=/proc/1/mem
+if [ -r /proc/self/mem ]; then
+  unreadable_candidate=/proc/self/mem
+fi
+(
+  cd "$lint_validation_repo" &&
+    AGENT_LAB_REAL_GIT="$(command -v git)" \
+      AGENT_LAB_UNREADABLE_CANDIDATE="$unreadable_candidate" \
+      PATH="$lint_unreadable_bin:$PATH" LC_ALL=C \
+      bash scripts/dev/lint-scripts --list \
+      > "$work/lint-unreadable.stdout" 2> "$work/lint-unreadable.stderr"
+) || lint_unreadable_rc=$?
+if [ "$lint_unreadable_rc" -eq 125 ] \
+  && [ ! -s "$work/lint-unreadable.stdout" ] \
+  && grep -Fq "INFRA cannot read shell candidate: $unreadable_candidate" \
+       "$work/lint-unreadable.stderr"; then
+  pass "read-failing extensionless candidate fails closed without a partial list"
+else
+  fail "read-failing extensionless candidate fails closed without a partial list (rc=$lint_unreadable_rc)"
+  sed 's/^/  stdout: /' "$work/lint-unreadable.stdout"
+  sed 's/^/  stderr: /' "$work/lint-unreadable.stderr"
+fi
+
+cat > "$work/nested-policy-mutant.sh" <<'EOF'
+#!/usr/bin/env bash
+if bash tests/guard/pretooluse-cases.sh; then
+  printf 'nested guard matrix passed\n'
+fi
+EOF
+if policy_has_literal_guard_matrix_reference "$work/nested-policy-mutant.sh"; then
+  pass "literal nested guard-matrix detector catches a direct delegate"
+else
+  fail "literal nested guard-matrix detector catches a direct delegate"
+fi
+policy_scan_rc=0
+policy_has_literal_guard_matrix_reference "$policy_probe" || policy_scan_rc=$?
+case "$policy_scan_rc" in
+  0) fail "policy probe has zero active literal nested guard-suite references" ;;
+  1) pass "policy probe has zero active literal nested guard-suite references" ;;
+  *) fail "policy probe source is unavailable for nested-suite inspection" ;;
+esac
 
 printf 'SUMMARY failures=%s\n' "$failures"
 [ "$failures" -eq 0 ]

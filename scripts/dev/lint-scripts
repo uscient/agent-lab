@@ -1,21 +1,76 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -u nocasematch
 source "$(git rev-parse --show-toplevel)/scripts/lib/dev-common.sh"
 cd_root
 
 fail=0
 scripts=()
+script_first_lines=()
+list_only=0
+shell_shebang_re='^#!.*(bash|dash|ksh|zsh|/sh)([[:space:]]|$)'
 
-mapfile -t candidates < <(
+usage() {
+  printf 'Usage: %s [--list]\n' "$0" >&2
+}
+
+read_shell_candidate_line() {
+  local file="$1" fd read_status=0
+  first_line=""
+  if ! exec {fd}< "$file"; then
+    printf 'INFRA cannot read shell candidate: %s\n' "$file" >&2
+    return 125
+  fi
+  IFS= read -r first_line <&"$fd" || read_status=$?
+  if ! exec {fd}<&-; then
+    printf 'INFRA cannot close shell candidate: %s\n' "$file" >&2
+    return 125
+  fi
+  # Bash reports both a legitimate EOF without a newline and a real I/O error as
+  # read status 1. Probe only that uncommon ambiguous path; normal shebang reads
+  # remain builtin-only.
+  if [ "$read_status" -ne 0 ] && ! LC_ALL=C sed -n '1p' "$file" >/dev/null; then
+    printf 'INFRA cannot read shell candidate: %s\n' "$file" >&2
+    return 125
+  fi
+}
+
+case "$#:${1:-}" in
+  0:) ;;
+  1:--list) list_only=1 ;;
+  1:-h|1:--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+candidate_output=""
+if ! candidate_output="$(
   {
-    find scripts tools tests -type f 2>/dev/null
-    git ls-files
-  } | sort -u
-)
+    find scripts tools tests -type f 2>/dev/null || exit 1
+    git ls-files || exit 1
+  } | LC_ALL=C sort -u
+)"; then
+  echo "INFRA shell script discovery failed" >&2
+  exit 125
+fi
+candidates=()
+if [ -n "$candidate_output" ]; then
+  mapfile -t candidates <<< "$candidate_output"
+fi
 for f in "${candidates[@]}"; do
+  first_line=""
   test -f "$f" || continue
-  if [[ "$f" == *.sh ]] || head -n 1 "$f" | grep -Eq '^#!.*(bash|dash|ksh|zsh|/sh)([[:space:]]|$)'; then
+  if [[ "$f" != *.sh ]]; then
+    read_shell_candidate_line "$f" || exit 125
+  fi
+  if [[ "$f" == *.sh ]] || [[ "$first_line" =~ $shell_shebang_re ]]; then
     scripts+=("$f")
+    script_first_lines+=("$first_line")
   fi
 done
 
@@ -24,10 +79,18 @@ if test "${#scripts[@]}" -eq 0; then
   exit 125
 fi
 
+if [ "$list_only" -eq 1 ]; then
+  printf '%s\n' "${scripts[@]}"
+  exit 0
+fi
+
 echo "== bash -n =="
-for f in "${scripts[@]}"; do
+for i in "${!scripts[@]}"; do
+  f="${scripts[$i]}"
+  first_line="${script_first_lines[$i]}"
   test -f "$f" || continue
-  if head -n 1 "$f" | grep -Eq 'bash|/sh' || [[ "$f" == *.sh ]] || [[ "$f" == scripts/* ]]; then
+  if [[ "$first_line" == *bash* ]] || [[ "$first_line" == */sh* ]] \
+    || [[ "$f" == *.sh ]] || [[ "$f" == scripts/* ]]; then
     echo "$f"
     bash -n "$f" || fail=1
   fi
