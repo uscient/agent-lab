@@ -20,10 +20,21 @@ set -uo pipefail
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 0
 pol="$root/policy"
 
-input="$(cat)"
+# block <reason> <AGENTS.md section>
+block() {
+  echo "BLOCKED by agent-lab policy: $1 (see AGENTS.md — $2)" >&2
+  exit 2
+}
+
+input="$(</dev/stdin)"
 tool_name="" cmd="" fpath=""
 if command -v jq >/dev/null 2>&1; then
-  tool_name="$(printf '%s' "$input" | jq -r '(.tool_name // .toolName // empty)' 2>/dev/null || true)"
+  if ! tool_name="$(
+    printf '%s' "$input" \
+      | jq -er 'if type == "object" then (.tool_name // .toolName // "") else error("invalid envelope") end' 2>/dev/null
+  )"; then
+    block "hook input is not a valid JSON object and cannot be classified" "Autonomy boundary"
+  fi
   cmd="$(
     printf '%s' "$input" \
       | jq -r '((.tool_input // .toolInput // {}) | (.command // empty))' 2>/dev/null \
@@ -39,12 +50,11 @@ if command -v jq >/dev/null 2>&1; then
         ' 2>/dev/null \
       || true
   )"
+else
+  block "jq is unavailable and hook input cannot be classified" "Autonomy boundary"
 fi
-
-block() { # block <reason> <AGENTS.md section>
-  echo "BLOCKED by agent-lab policy: $1 (see AGENTS.md — $2)" >&2
-  exit 2
-}
+[ "$tool_name" != Bash ] || [ -n "$cmd" ] \
+  || block "Bash hook input is missing its command and cannot be classified" "Autonomy boundary"
 
 # active_patterns <file>: strip comments + blank lines
 active_patterns() { grep -vE '^[[:space:]]*(#|$)' "$1" 2>/dev/null || true; }
@@ -144,8 +154,26 @@ scan="$hay"
 scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*'[^'\$\`]*'/\1 /g")"
 scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*\"[^\"\$\`]*\"/\1 /g")"
 
+# Approximate shell token concatenation for executable-name classification. This copy is never
+# executed or used for argument validation; removing quotes/backslashes merely exposes spellings
+# such as `"g""h"` and `/usr/bin/g\h` to the default-deny forge matcher.
+shell_scan="${scan//\"/}"
+shell_scan="${shell_scan//\'/}"
+shell_scan="${shell_scan//\\/}"
+shell_scan="${shell_scan//\$/}"
+case "$shell_scan" in
+  *'['*']'*) shell_scan="$(printf '%s' "$shell_scan" | sed -E 's/\[([[:alnum:]_])\]/\1/g')" ;;
+esac
+case "$shell_scan" in
+  *'+='*)
+    shell_scan="$(
+      printf '%s' "$shell_scan" \
+        | sed -E 's/([[:alpha:]_][[:alnum:]_]*)=([^;[:space:]]+);[[:space:]]*\1\+=([^;[:space:]]+)/\2\3/g'
+    )"
+    ;;
+esac
+
 q="[\"']"                    # an optional quote in front of a redirect target
-fw='(^|[^0-9&])>>?([^&]|$)'  # a FILE-write redirect (> or >>), excluding fd forms (2>, N>, >&N, &>)
 
 # 1) scoped remote workflow.
 branch="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
@@ -202,6 +230,52 @@ validate_gh() {
   [ -z "$head" ] || [ "$head" = "$branch" ] || return 1
 }
 
+# is_nonexecuting_search_data <command>: true only for a single rg invocation whose
+# arguments cannot start another command. rg's --pre option is excluded because it executes an
+# external preprocessor. This lets a literal search pattern name a CLI without treating the data
+# as an invocation of that CLI.
+is_nonexecuting_search_data() {
+  local s="$1" words=() arg
+  read -r -a words <<<"$s"
+  [ "${words[0]:-}" = rg ] || return 1
+  case "$s" in *';'* | *'&'* | *'|'* | *'`'* | *'$'* | *'<'* | *'>'*) return 1 ;; esac
+  [[ "$s" == *$'\n'* ]] && return 1
+  for arg in "${words[@]:1}"; do
+    case "$arg" in
+      --pre | --pre=* | -*\"* | -*\'* | -*\\* | -*\** | -*\?* | -*\[* | -*\{* | -*\}*) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# unsafe_protected_write_redirect <command>: true for every file-write redirect except the exact
+# demonstrated false positive: one direct wc read writing to one literal /tmp file. Keeping this
+# exemption narrow preserves fail-closed handling for dynamic targets, pipelines, and extra commands.
+unsafe_protected_write_redirect() {
+  local s="$1" stripped target
+  stripped="$(
+    printf '%s' "$s" \
+      | sed -E "s#(^|[[:space:]])[0-9]+>>?[[:space:]]*${q}?/dev/null${q}?#\\1#g; s/(^|[[:space:]])[0-9]+>\&[0-9-]+/\\1/g"
+  )"
+  case "$stripped" in *'>'*) ;; *) return 1 ;; esac
+  case "$stripped" in *';'* | *'&'* | *'|'* | *'`'* | *'$'* | *'<'* | *'('* | *')'*) return 0 ;; esac
+  [[ "$stripped" == *$'\n'* ]] && return 0
+  if printf '%s' "$stripped" \
+    | grep -Eq "^[[:space:]]*wc([[:space:]]+-[[:alnum:]]+)*[[:space:]]+[^[:space:]\"'<>]+[[:space:]]+>[[:space:]]*[\"']?/tmp/[A-Za-z0-9._-]+[\"']?[[:space:]]*$"; then
+    target="${stripped##*>}"
+    target="${target#"${target%%[![:space:]]*}"}"
+    target="${target%"${target##*[![:space:]]}"}"
+    case "$target" in
+      \"*\") target="${target#\"}"; target="${target%\"}" ;;
+      \'*\') target="${target#\'}"; target="${target%\'}" ;;
+    esac
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 git_push_re='(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+push([^[:alnum:]_]|$)'
 git_remote_rebase_re='(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+rebase([^[:alnum:]_]|$).*((origin|upstream)/|refs/remotes/)'
 if printf '%s' "$scan" | grep -Eq "$git_push_re"; then
@@ -212,7 +286,8 @@ if printf '%s' "$scan" | grep -Eq "$git_remote_rebase_re"; then
     block "remote rebase is limited to rebasing the current work branch on origin/dev" "Autonomy boundary"
   fi
 fi
-if printf '%s' "$scan" | grep -Eq '(^|[^[:alnum:]_./-])gh([^[:alnum:]_./-]|$)|(^|[;&|][[:space:]]*)/[^[:space:]]*/gh([[:space:]]|$)'; then
+if printf '%s' "$shell_scan" | grep -Eq '(^|[^[:alnum:]_./-])gh([^[:alnum:]_./-]|$)|(^|[;&|][[:space:]]*)/[^[:space:]]*/gh([[:space:]]|$)' \
+  && ! is_nonexecuting_search_data "$scan"; then
   validate_gh || block "GitHub access is limited to direct read-only PR commands and creating the current work branch PR with explicit base dev" "Autonomy boundary"
 fi
 
@@ -249,10 +324,10 @@ fi
 #    stderr redirect next to a rail token (e.g. `cat .claude/x 2>/dev/null`) is a read, not a mutation.
 if [ "$maint" != 1 ]; then
   alt="$(protected_alternation)"
-  if [ -n "$alt" ] && printf '%s' "$scan" | grep -Eq "($alt)"; then
-    if printf '%s' "$scan" | grep -Eq "$fw" \
+  if [ -n "$alt" ] && printf '%s' "$shell_scan" | grep -Eq "($alt)"; then
+    if unsafe_protected_write_redirect "$scan" \
       || printf '%s' "$scan" | grep -Eq ">>?[[:space:]]*${q}?($alt)" \
-      || printf '%s' "$scan" | grep -Eq '(^|[[:space:]])(tee|rm|mv|cp|truncate|install)[[:space:]]|sed[[:space:]]+-i'; then
+      || printf '%s' "$scan" | grep -Eq '(^|[[:space:]])(tee|rm|mv|cp|ln|truncate|install)[[:space:]]|sed[[:space:]]+-i'; then
       block "mutating a protected rail (config / guard / policy) via shell is a maintenance-only action — set AGENT_LAB_MAINTENANCE=1" "Authority"
     fi
   fi
