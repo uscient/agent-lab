@@ -16,6 +16,7 @@
 #   echo '{"tool_name":"Edit","tool_input":{"file_path":"AGENTS.md"}}' | tools/pretooluse-guard.sh # ->2 (unless AGENT_LAB_MAINTENANCE=1)
 #   echo '{"tool_input":{"command":"git commit -m x"}}'         | tools/pretooluse-guard.sh   # ->0
 set -uo pipefail
+shopt -u nocasematch
 
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 0
 pol="$root/policy"
@@ -35,51 +36,74 @@ if command -v jq >/dev/null 2>&1; then
   )"; then
     block "hook input is not a valid JSON object and cannot be classified" "Autonomy boundary"
   fi
-  cmd="$(
-    printf '%s' "$input" \
-      | jq -r '((.tool_input // .toolInput // {}) | (.command // empty))' 2>/dev/null \
-      || true
-  )"
-  fpath="$(
-    printf '%s' "$input" \
-      | jq -r '
-          ((.tool_input // .toolInput // {}) |
-            (.file_path // .filePath // .path //
-             .notebook_path // .notebookPath //
-             .relative_path // .relativePath // empty))
-        ' 2>/dev/null \
-      || true
-  )"
+  case "$tool_name" in
+    Read | Edit | Write | MultiEdit | NotebookEdit | apply_patch | str_replace_editor | \
+    mcp__serena__replace_symbol_body | mcp__serena__insert_before_symbol | mcp__serena__insert_after_symbol | \
+    serena__replace_symbol_body | serena__insert_before_symbol | serena__insert_after_symbol)
+      fpath="$(
+        printf '%s' "$input" \
+          | jq -r '
+              ((.tool_input // .toolInput // {}) |
+                (.file_path // .filePath // .path //
+                 .notebook_path // .notebookPath //
+                 .relative_path // .relativePath // empty))
+            ' 2>/dev/null \
+          || true
+      )"
+      ;;
+    *)
+      cmd="$(
+        printf '%s' "$input" \
+          | jq -r '((.tool_input // .toolInput // {}) | (.command // empty))' 2>/dev/null \
+          || true
+      )"
+      ;;
+  esac
 else
   block "jq is unavailable and hook input cannot be classified" "Autonomy boundary"
 fi
 [ "$tool_name" != Bash ] || [ -n "$cmd" ] \
   || block "Bash hook input is missing its command and cannot be classified" "Autonomy boundary"
 
-# active_patterns <file>: strip comments + blank lines
-active_patterns() { grep -vE '^[[:space:]]*(#|$)' "$1" 2>/dev/null || true; }
+# matches_line <text> <extended-regex>: preserve grep's historical linewise matching semantics
+# without spawning one grep process per predicate on the single-line hot path.
+matches_line() {
+  local text="$1" regex="$2"
+  [ -n "$text" ] || return 1
+  if [[ "$text" == *$'\n'* ]]; then
+    printf '%s' "$text" | grep -Eq -- "$regex"
+    return
+  fi
+  [[ "$text" =~ $regex ]]
+}
 
 # match_any <haystack> <patterns-file>: 0 if any active pattern matches
 match_any() {
-  local hay="$1" file="$2" pats
-  pats="$(active_patterns "$file")"
-  [ -z "$pats" ] && return 1
-  printf '%s' "$hay" | grep -Eq -f <(printf '%s\n' "$pats")
+  local hay="$1" file="$2" pattern patterns
+  [ -r "$file" ] || return 1
+  if [[ "$hay" == *$'\n'* ]]; then
+    patterns="$(grep -vE '^[[:space:]]*(#|$)' "$file" 2>/dev/null || true)"
+    [ -n "$patterns" ] || return 1
+    printf '%s' "$hay" | grep -Eq -f <(printf '%s\n' "$patterns")
+    return
+  fi
+  while IFS= read -r pattern || [ -n "$pattern" ]; do
+    [[ "$pattern" =~ ^[[:space:]]*(#|$) ]] && continue
+    matches_line "$hay" "$pattern" && return 0
+  done < "$file"
+  return 1
 }
 
 # path_is_protected <path>: 0 if path matches any policy/protected.paths entry (at a / boundary)
 path_is_protected() {
-  local p="$1" entry esc re
+  local p="$1" entry needle hay
   [ -z "$p" ] && return 1
-  while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    esc="$(printf '%s' "$entry" | sed -e 's/[.[\*^$()+?{}|]/\\&/g')"
-    case "$entry" in
-      */) re="(^|/)${esc}" ;;          # directory prefix
-      *)  re="(^|/)${esc}($|/)" ;;      # exact file (or that path as a dir)
-    esac
-    printf '%s' "$p" | grep -Eq "$re" && return 0
-  done < <(active_patterns "$pol/protected.paths")
+  hay="/${p#/}/"
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    [[ "$entry" =~ ^[[:space:]]*(#|$) ]] && continue
+    needle="/${entry%/}/"
+    [[ "$hay" == *"$needle"* ]] && return 0
+  done < "$pol/protected.paths"
   return 1
 }
 
@@ -98,11 +122,15 @@ path_is_auth_material() {
   esac
 }
 
-# protected_alternation: regex OR of all protected entries, for the Bash control-plane check
-protected_alternation() {
-  active_patterns "$pol/protected.paths" \
-    | sed -e 's/[.[\*^$()+?{}|]/\\&/g' \
-    | paste -sd '|' -
+# references_protected_path <text>: literal substring check matching the shell guard's historical
+# protected-alternation behavior, without constructing a regex or spawning helper processes.
+references_protected_path() {
+  local text="$1" entry
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    [[ "$entry" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$text" == *"$entry"* ]] && return 0
+  done < "$pol/protected.paths"
+  return 1
 }
 
 maint="${AGENT_LAB_MAINTENANCE:-}"
@@ -151,8 +179,12 @@ hay="${cmd:-$input}"
 # plain quoted literal with no command substitution / expansion ($(  `  ${ ) — so anything that can
 # execute stays fully matched. -c (e.g. `sh -c "git push"`) is NOT a message flag and is never stripped.
 scan="$hay"
-scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*'[^'\$\`]*'/\1 /g")"
-scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*\"[^\"\$\`]*\"/\1 /g")"
+case "$scan" in
+  *-m* | *-F*)
+    scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*'[^'\$\`]*'/\1 /g")"
+    scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*\"[^\"\$\`]*\"/\1 /g")"
+    ;;
+esac
 
 # Approximate shell token concatenation for executable-name classification. This copy is never
 # executed or used for argument validation; removing quotes/backslashes merely exposes spellings
@@ -176,8 +208,13 @@ esac
 q="[\"']"                    # an optional quote in front of a redirect target
 
 # 1) scoped remote workflow.
-branch="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+branch=""
+load_branch() {
+  [ -n "$branch" ] && return 0
+  branch="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+}
 is_work_branch() {
+  load_branch
   case "$branch" in dev | master | main | DETACHED) return 1 ;; *) return 0 ;; esac
 }
 
@@ -253,6 +290,7 @@ is_nonexecuting_search_data() {
 # exemption narrow preserves fail-closed handling for dynamic targets, pipelines, and extra commands.
 unsafe_protected_write_redirect() {
   local s="$1" stripped target
+  local wc_tmp_re="^[[:space:]]*wc([[:space:]]+-[[:alnum:]]+)*[[:space:]]+[^[:space:]\"'<>]+[[:space:]]+>[[:space:]]*[\"']?/tmp/[A-Za-z0-9._-]+[\"']?[[:space:]]*$"
   stripped="$(
     printf '%s' "$s" \
       | sed -E "s#(^|[[:space:]])[0-9]+>>?[[:space:]]*${q}?/dev/null${q}?#\\1#g; s/(^|[[:space:]])[0-9]+>\&[0-9-]+/\\1/g"
@@ -260,8 +298,7 @@ unsafe_protected_write_redirect() {
   case "$stripped" in *'>'*) ;; *) return 1 ;; esac
   case "$stripped" in *';'* | *'&'* | *'|'* | *'`'* | *'$'* | *'<'* | *'('* | *')'*) return 0 ;; esac
   [[ "$stripped" == *$'\n'* ]] && return 0
-  if printf '%s' "$stripped" \
-    | grep -Eq "^[[:space:]]*wc([[:space:]]+-[[:alnum:]]+)*[[:space:]]+[^[:space:]\"'<>]+[[:space:]]+>[[:space:]]*[\"']?/tmp/[A-Za-z0-9._-]+[\"']?[[:space:]]*$"; then
+  if [[ "$stripped" =~ $wc_tmp_re ]]; then
     target="${stripped##*>}"
     target="${target#"${target%%[![:space:]]*}"}"
     target="${target%"${target##*[![:space:]]}"}"
@@ -278,15 +315,22 @@ unsafe_protected_write_redirect() {
 
 git_push_re='(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+push([^[:alnum:]_]|$)'
 git_remote_rebase_re='(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+rebase([^[:alnum:]_]|$).*((origin|upstream)/|refs/remotes/)'
-if printf '%s' "$scan" | grep -Eq "$git_push_re"; then
+origin_dev_re='^[[:space:]]*git[[:space:]]+rebase[[:space:]]+origin/dev[[:space:]]*$'
+gh_command_re='(^|[^[:alnum:]_./-])gh([^[:alnum:]_./-]|$)|(^|[;&|][[:space:]]*)/[^[:space:]]*/gh([[:space:]]|$)'
+credential_path_re="(^|[[:space:]\"'=])(~?/)?(\\.gitconfig([^[:alnum:]]|$)|\\.config/(git|gh)/|\\.ssh/|\\.netrc([^[:alnum:]]|$))"
+token_env_re='(^|[^[:alnum:]_])(GH_TOKEN|GITHUB_TOKEN|GIT_ASKPASS|SSH_AUTH_SOCK)([^[:alnum:]_]|$)'
+bulk_env_re='^[[:space:]]*(printenv|env|set)[[:space:]]*$'
+mutating_rail_re='(^|[[:space:]])(tee|rm|mv|cp|ln|truncate|install)[[:space:]]|sed[[:space:]]+-i'
+
+if matches_line "$scan" "$git_push_re"; then
   validate_push || block "push is limited to the current non-protected branch on origin; plain force, deletion, mirrors, and protected targets are forbidden" "Autonomy boundary"
 fi
-if printf '%s' "$scan" | grep -Eq "$git_remote_rebase_re"; then
-  if ! { is_work_branch && printf '%s' "$scan" | grep -Eq '^[[:space:]]*git[[:space:]]+rebase[[:space:]]+origin/dev[[:space:]]*$'; }; then
+if matches_line "$scan" "$git_remote_rebase_re"; then
+  if ! { is_work_branch && matches_line "$scan" "$origin_dev_re"; }; then
     block "remote rebase is limited to rebasing the current work branch on origin/dev" "Autonomy boundary"
   fi
 fi
-if printf '%s' "$shell_scan" | grep -Eq '(^|[^[:alnum:]_./-])gh([^[:alnum:]_./-]|$)|(^|[;&|][[:space:]]*)/[^[:space:]]*/gh([[:space:]]|$)' \
+if matches_line "$shell_scan" "$gh_command_re" \
   && ! is_nonexecuting_search_data "$scan"; then
   validate_gh || block "GitHub access is limited to direct read-only PR commands and creating the current work branch PR with explicit base dev" "Autonomy boundary"
 fi
@@ -294,11 +338,11 @@ fi
 match_any "$scan" "$pol/deny.patterns" \
   && block "operation is outside the scoped remote workflow or would alter authentication, attribution, remote configuration, or integration state" "Autonomy boundary"
 
-printf '%s' "$scan" | grep -Eq '(^|[[:space:]"'"'"'=])(~?/)?(\.gitconfig([^[:alnum:]]|$)|\.config/(git|gh)/|\.ssh/|\.netrc([^[:alnum:]]|$))' \
+matches_line "$scan" "$credential_path_re" \
   && block "credential, authentication, and Git configuration file access is forbidden" "Autonomy boundary"
-printf '%s' "$scan" | grep -Eq '(^|[^[:alnum:]_])(GH_TOKEN|GITHUB_TOKEN|GIT_ASKPASS|SSH_AUTH_SOCK)([^[:alnum:]_]|$)' \
+matches_line "$scan" "$token_env_re" \
   && block "credential and token environment access is forbidden" "Autonomy boundary"
-printf '%s' "$scan" | grep -Eq '^[[:space:]]*(printenv|env|set)[[:space:]]*$' \
+matches_line "$scan" "$bulk_env_re" \
   && block "bulk environment disclosure is forbidden" "Autonomy boundary"
 
 # 2) destructive / integrity carve-out
@@ -306,28 +350,26 @@ match_any "$scan" "$pol/carveout.patterns" \
   && block "destructive/integrity operation is forbidden under autonomy — ask the human first" "Autonomy boundary"
 
 # 3) containment hard-stops (always on; not maintenance-gated) — kept verbatim from the substrate
-printf '%s' "$scan" | grep -Eq 'docker\.sock' \
+matches_line "$scan" 'docker\.sock' \
   && block "mounting the Docker socket is forbidden (host-escape surface)" "Autonomy boundary"
-printf '%s' "$scan" | grep -Eq '(--privileged|privileged[[:space:]]*:[[:space:]]*true)' \
+matches_line "$scan" '(--privileged|privileged[[:space:]]*:[[:space:]]*true)' \
   && block "privileged containers are forbidden" "Autonomy boundary"
-printf '%s' "$scan" | grep -Eq '(--network[=[:space:]]host|--net[=[:space:]]host|network_mode[[:space:]]*:[[:space:]]*.?host)' \
+matches_line "$scan" '(--network[=[:space:]]host|--net[=[:space:]]host|network_mode[[:space:]]*:[[:space:]]*.?host)' \
   && block "host networking is forbidden (breaks default-deny)" "Autonomy boundary"
 # secret/key material: agents developing the repository must not read or write secret-bearing paths.
 secret_path_re="(^|[[:space:]\"'=])([^[:space:]\"']*/)?(\\.env([^a-zA-Z]|$)|secrets/|[^[:space:]\"']*\\.(pem|key|kdbx)([^a-zA-Z]|$))"
-if printf '%s' "$scan" | grep -Eq "$secret_path_re"; then
+if matches_line "$scan" "$secret_path_re"; then
   block "reading or writing .env / secrets / key material is forbidden" "Autonomy boundary"
 fi
 
 # 4) control-plane / guardrail integrity (maintenance-gated): shell MUTATION of the rails.
 #    A "mutation" is a FILE-write redirect while a rail is referenced, a redirect whose TARGET is a
-#    rail, or a mutating command (tee/rm/mv/cp/truncate/install/sed -i) with a rail referenced. A bare
+#    rail, or a mutating command (tee/rm/mv/cp/ln/truncate/install/sed -i) with a rail referenced. A bare
 #    stderr redirect next to a rail token (e.g. `cat .claude/x 2>/dev/null`) is a read, not a mutation.
 if [ "$maint" != 1 ]; then
-  alt="$(protected_alternation)"
-  if [ -n "$alt" ] && printf '%s' "$shell_scan" | grep -Eq "($alt)"; then
+  if references_protected_path "$shell_scan"; then
     if unsafe_protected_write_redirect "$scan" \
-      || printf '%s' "$scan" | grep -Eq ">>?[[:space:]]*${q}?($alt)" \
-      || printf '%s' "$scan" | grep -Eq '(^|[[:space:]])(tee|rm|mv|cp|ln|truncate|install)[[:space:]]|sed[[:space:]]+-i'; then
+      || matches_line "$scan" "$mutating_rail_re"; then
       block "mutating a protected rail (config / guard / policy) via shell is a maintenance-only action — set AGENT_LAB_MAINTENANCE=1" "Authority"
     fi
   fi
@@ -335,8 +377,9 @@ fi
 
 # 5) branch backstop: never commit on dev/master/main (covers a skipped SessionStart bootstrap)
 git_commit_re='(^|[^[:alnum:]_])git([[:space:]]+[^[:space:]]+)*[[:space:]]+commit([^[:alnum:]_]|$)'
-if printf '%s' "$scan" | grep -Eq "$git_commit_re"; then
-  br="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+if matches_line "$scan" "$git_commit_re"; then
+  load_branch
+  br="$branch"
   case "$br" in
     dev | master | main | DETACHED) block "refusing to commit on protected or detached branch '$br' — create a work branch from dev first (SessionStart normally does this)" "Prime directives" ;;
   esac

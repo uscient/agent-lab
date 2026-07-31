@@ -28,6 +28,28 @@ set_guard_branch() {
 }
 set_guard_branch agent/test/guard
 
+probe_bin="$guard_git_work/process-probe-bin"
+probe_log="$guard_git_work/process-probe.log"
+mkdir -p "$probe_bin"
+cat > "$probe_bin/probe" <<'EOF'
+#!/usr/bin/env bash
+name="${0##*/}"
+printf '%s\n' "$name" >> "$AGENT_LAB_PROCESS_PROBE_LOG"
+case "$name" in
+  git) exec "$AGENT_LAB_REAL_GIT" "$@" ;;
+  grep) exec "$AGENT_LAB_REAL_GREP" "$@" ;;
+  sed) exec "$AGENT_LAB_REAL_SED" "$@" ;;
+  *) exit 127 ;;
+esac
+EOF
+chmod +x "$probe_bin/probe"
+ln -s probe "$probe_bin/git"
+ln -s probe "$probe_bin/grep"
+ln -s probe "$probe_bin/sed"
+real_git="$(command -v git)"
+real_grep="$(command -v grep)"
+real_sed="$(command -v sed)"
+
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
@@ -65,6 +87,28 @@ expect_payload() {
   printf '%s' "$payload" \
     | env AGENT_LAB_MAINTENANCE="$maint" "$guard" >/dev/null 2>&1 || rc=$?
   _check "$exp" "$name" "$rc"
+}
+expect_no_eager_helpers() {
+  local name="$1" payload="$2" rc=0
+  : > "$probe_log"
+  printf '%s' "$payload" \
+    | env -u AGENT_LAB_MAINTENANCE -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+        PATH="$probe_bin:$PATH" GIT_DIR="$guard_git_dir" \
+        AGENT_LAB_PROCESS_PROBE_LOG="$probe_log" \
+        AGENT_LAB_REAL_GIT="$real_git" AGENT_LAB_REAL_GREP="$real_grep" \
+        AGENT_LAB_REAL_SED="$real_sed" "$guard" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -s "$probe_log" ]; then
+    pass "$name"
+  else
+    fail "$name (rc=$rc eager=$(tr '\n' ',' < "$probe_log"))"
+  fi
+}
+expect_inherited_nocasematch_allow() {
+  local name="$1" cmd="$2" rc=0
+  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(jq -Rn --arg c "$cmd" '$c')" \
+    | env BASHOPTS=nocasematch GIT_DIR="$guard_git_dir" \
+        bash "$guard" >/dev/null 2>&1 || rc=$?
+  _check allow "$name" "$rc"
 }
 
 echo "== allow: local work + git (commit inversion fixed; local merge/rebase preserved) =="
@@ -231,6 +275,18 @@ expect_cmd allow "msg single-quoted rail"      "git commit -m 'tidy policy/ and 
 expect_cmd allow "--message long form"         'git commit --message "discuss tee and rm in policy/"'
 expect_cmd allow "search data names forge CLI" 'rg -n "gh" README.md'
 expect_cmd allow "rail read output to tmp"      'wc -l AGENTS.md > /tmp/agent-lab-rail-count'
+
+echo "== hot-path helpers are lazy =="
+expect_no_eager_helpers "allowed command avoids git/grep/sed" \
+  '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+expect_no_eager_helpers "normal edit avoids git/grep/sed" \
+  '{"tool_name":"Edit","tool_input":{"file_path":"README.md"}}'
+
+echo "== command regexes remain linewise =="
+expect_cmd block "second-line bulk environment" $'echo ok\nprintenv'
+expect_cmd allow "newline does not join git push" $'git\npush'
+expect_cmd allow "newline does not join destructive rm" $'rm\n-rf build'
+expect_inherited_nocasematch_allow "inherited nocasematch stays case-sensitive" 'PRINTENV'
 
 echo "== false-positive fixes: MUST STILL DENY (executable / substitution / real writes) =="
 expect_cmd block "actual forge command"         'gh pr merge 1'
