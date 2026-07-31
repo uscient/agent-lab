@@ -2,6 +2,15 @@
 # Sourced, not executed. Validates named allowlist recipes as pure data, then publishes
 # one immutable content-addressed policy for Squid.
 
+# shellcheck source=scripts/lib/domain.sh
+agent_lab_domain_lib_dir="${BASH_SOURCE[0]}"
+case "$agent_lab_domain_lib_dir" in
+  */*) agent_lab_domain_lib_dir="${agent_lab_domain_lib_dir%/*}" ;;
+  *) agent_lab_domain_lib_dir=. ;;
+esac
+source "$agent_lab_domain_lib_dir/domain.sh" || return 1
+unset agent_lab_domain_lib_dir
+
 AGENT_LAB_VALIDATED_RECIPES=()
 AGENT_LAB_VALIDATED_DOMAIN_RECIPES=()
 AGENT_LAB_VALIDATED_DOMAINS=()
@@ -39,10 +48,11 @@ agent_lab_sha256_file() {
 }
 
 agent_lab_allowlist_dir_identity() {
-  if stat -c '%d:%i' "$1" >/dev/null 2>&1; then
-    stat -c '%d:%i' "$1"
-  elif stat -f '%d:%i' "$1" >/dev/null 2>&1; then
-    stat -f '%d:%i' "$1"
+  local output
+  if output="$(stat -c '%d:%i' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
+  elif output="$(stat -f '%d:%i' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
   else
     printf 'FAIL stat with device/inode output is required\n' >&2
     return 1
@@ -50,10 +60,11 @@ agent_lab_allowlist_dir_identity() {
 }
 
 agent_lab_allowlist_file_mode() {
-  if stat -c '%a' "$1" >/dev/null 2>&1; then
-    stat -c '%a' "$1"
-  elif stat -f '%Lp' "$1" >/dev/null 2>&1; then
-    stat -f '%Lp' "$1"
+  local output
+  if output="$(stat -c '%a' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
+  elif output="$(stat -f '%Lp' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
   else
     return 1
   fi
@@ -93,29 +104,7 @@ agent_lab_preflight_allowlist_publication() {
 }
 
 agent_lab_allowlist_domain_valid() {
-  local value domain label labels
-  value="$1"
-  domain="${value#.}"
-  [ -n "$domain" ] && [ "${#domain}" -le 253 ] || return 1
-  case "$domain" in
-    *.*) ;;
-    *) return 1 ;;
-  esac
-  case "$domain" in
-    .*|*.|*..*|*[!a-z0-9.-]*) return 1 ;;
-  esac
-  case "$domain" in
-    *[!0-9.]*) ;;
-    *) return 1 ;;
-  esac
-  IFS=. read -r -a labels <<< "$domain"
-  for label in "${labels[@]}"; do
-    [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
-    case "$label" in
-      -*|*-|*[!a-z0-9-]*) return 1 ;;
-    esac
-  done
-  return 0
+  agent_lab_domain_valid "$1"
 }
 
 agent_lab_recipe_name_valid() {

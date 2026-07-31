@@ -28,6 +28,53 @@ trap 'rm -rf "$work"' EXIT
 export HOME="$work/home"
 mkdir -p "$HOME"
 
+# Identity helpers must capture the successful stat probe instead of reopening the
+# path immediately. The higher-level guards still repeat identity checks at their
+# security boundaries; this contract removes only duplicate calls within one snapshot.
+stat_log="$work/guard-stat.log"
+: > "$stat_log"
+gnu_identity=""
+gnu_rc=0
+gnu_identity="$(
+  stat() {
+    printf '%s|%s|%s\n' "${1:-}" "${2:-}" "${3:-}" >> "$stat_log"
+    if [ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = '%d:%i' ] && [ "$3" = /fixture ]; then
+      printf '7:11\n'
+    else
+      return 1
+    fi
+  }
+  agent_lab_dir_identity /fixture
+)" || gnu_rc=$?
+if [ "$gnu_rc" -eq 0 ] && [ "$gnu_identity" = 7:11 ] &&
+   [ "$(wc -l < "$stat_log")" -eq 1 ] &&
+   [ "$(cat "$stat_log")" = '-c|%d:%i|/fixture' ]; then
+  pass "directory identity captures one successful GNU stat snapshot"
+else
+  fail "directory identity captures one successful GNU stat snapshot"
+fi
+
+: > "$stat_log"
+bsd_identity=""
+bsd_rc=0
+bsd_identity="$(
+  stat() {
+    printf '%s|%s|%s\n' "${1:-}" "${2:-}" "${3:-}" >> "$stat_log"
+    case "$1|$2|$3" in
+      '-c|%d:%i|/fixture') return 1 ;;
+      '-f|%d:%i|/fixture') printf '7:11\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  agent_lab_dir_identity /fixture
+)" || bsd_rc=$?
+if [ "$bsd_rc" -eq 0 ] && [ "$bsd_identity" = 7:11 ] &&
+   [ "$(cat "$stat_log")" = $'-c|%d:%i|/fixture\n-f|%d:%i|/fixture' ]; then
+  pass "directory identity falls back with one BSD stat snapshot"
+else
+  fail "directory identity falls back with one BSD stat snapshot"
+fi
+
 clean="$work/clean";            mkdir -p "$clean"
 with_ssh="$work/with_ssh";      mkdir -p "$with_ssh/.ssh"
 npmrc_tok="$work/npmrc_tok";    mkdir -p "$npmrc_tok"; printf '//registry.npmjs.org/:_authToken=deadbeef\n' > "$npmrc_tok/.npmrc"
