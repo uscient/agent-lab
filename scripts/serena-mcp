@@ -36,34 +36,50 @@ docker compose version >/dev/null 2>&1 || {
   exit 125
 }
 
-if ! docker image inspect "$AGENT_LAB_SERENA_TAG" >/dev/null 2>&1; then
-  printf 'Serena MCP image is missing; run ./scripts/dev/serena-build\n' >&2
+image_metadata="$({
+  docker image inspect \
+    --format '{{json .Id}}{{println}}{{json (index .Config.Labels "org.agent-lab.serena.ref")}}{{println}}{{json (index .Config "Volumes")}}' \
+    "$AGENT_LAB_SERENA_TAG"
+} 2>/dev/null)" || {
+  printf 'Serena MCP: cannot inspect image metadata; image may be missing; run ./scripts/dev/serena-build\n' >&2
+  exit 125
+}
+
+case "$image_metadata" in
+  *$'\n'*) ;;
+  *)
+    printf 'Serena MCP: Docker returned malformed image metadata\n' >&2
+    exit 125
+    ;;
+esac
+image_id_json="${image_metadata%%$'\n'*}"
+image_metadata_rest="${image_metadata#*$'\n'}"
+case "$image_metadata_rest" in
+  *$'\n'*) ;;
+  *)
+    printf 'Serena MCP: Docker returned malformed image metadata\n' >&2
+    exit 125
+    ;;
+esac
+image_ref_json="${image_metadata_rest%%$'\n'*}"
+image_volumes="${image_metadata_rest#*$'\n'}"
+if [[ "$image_volumes" == *$'\n'* ]]; then
+  printf 'Serena MCP: Docker returned malformed image metadata\n' >&2
   exit 125
 fi
 
-image_id="$(
-  docker image inspect --format '{{.Id}}' "$AGENT_LAB_SERENA_TAG"
-)" || {
-  printf 'Serena MCP: cannot resolve image identity\n' >&2
-  exit 125
-}
-if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+if [[ ! "$image_id_json" =~ ^\"sha256:[0-9a-f]{64}\"$ ]]; then
   printf 'Serena MCP: Docker returned an invalid image identity\n' >&2
   exit 125
 fi
-image_ref="$(
-  docker image inspect \
-    --format '{{index .Config.Labels "org.agent-lab.serena.ref"}}' \
-    "$image_id"
-)" || image_ref=""
-if [ "$image_ref" != "$AGENT_LAB_SERENA_REF" ]; then
+image_id="${image_id_json#\"}"
+image_id="${image_id%\"}"
+expected_image_ref_json="\"${AGENT_LAB_SERENA_REF}\""
+if [ "$image_ref_json" != "$expected_image_ref_json" ]; then
   printf 'Serena MCP: image does not match pinned Serena ref %s\n' \
     "$AGENT_LAB_SERENA_REF" >&2
   exit 125
 fi
-image_volumes="$(
-  docker image inspect --format '{{json .Config.Volumes}}' "$image_id"
-)" || image_volumes=""
 if [ "$image_volumes" != "null" ]; then
   printf 'Serena MCP: image declares unexpected writable volumes\n' >&2
   exit 125

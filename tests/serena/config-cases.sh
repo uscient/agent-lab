@@ -135,6 +135,137 @@ else
   fail "Serena launcher accepts only canonical non-root UID/GID values"
 fi
 
+# Image identity, pin, and writable-volume metadata must come from one immutable
+# Docker inspection snapshot. The launcher keeps distinct operator diagnostics for
+# each rejected field and pins Compose to the inspected image ID on success.
+fake_docker_bin="$work/fake-docker-bin"
+mkdir -p "$fake_docker_bin" "$work/fake-home"
+cat > "$fake_docker_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG:?}"
+case "${1:-}" in
+  info)
+    exit 0
+    ;;
+  image)
+    [ "${2:-}" = inspect ] || exit 99
+    if [ "${FAKE_IMAGE_MODE:-}" = missing ]; then
+      exit 1
+    fi
+    if [ "${FAKE_IMAGE_MODE:-}" = inspect-error ]; then
+      exit 42
+    fi
+    # The old launcher first performs one unformatted existence probe.
+    [ "${3:-}" = --format ] || exit 0
+    format="${4:-}"
+    expected_format='{{json .Id}}{{println}}{{json (index .Config.Labels "org.agent-lab.serena.ref")}}{{println}}{{json (index .Config "Volumes")}}'
+    if [ "$format" = "$expected_format" ]; then
+      printf '%s\n%s\n%s\n' \
+        "$(jq -Rn --arg value "${FAKE_IMAGE_ID:?}" '$value')" \
+        "$(jq -Rn --arg value "${FAKE_IMAGE_REF:?}" '$value')" \
+        "${FAKE_IMAGE_VOLUMES:?}"
+    elif [ "$format" = '{{.Id}}' ]; then
+      printf '%s\n' "${FAKE_IMAGE_ID:?}"
+    elif [[ "$format" == *'org.agent-lab.serena.ref'* ]]; then
+      printf '%s\n' "${FAKE_IMAGE_REF:?}"
+    elif [[ "$format" == *'.Config.Volumes'* ]]; then
+      printf '%s\n' "${FAKE_IMAGE_VOLUMES:?}"
+    else
+      exit 98
+    fi
+    ;;
+  compose)
+    if [ "${2:-}" = version ]; then
+      exit 0
+    fi
+    printf 'ENV AGENT_LAB_SERENA_IMAGE=%s\n' \
+      "${AGENT_LAB_SERENA_IMAGE-<unset>}" >> "${FAKE_DOCKER_LOG:?}"
+    ;;
+  *)
+    exit 99
+    ;;
+esac
+EOF
+chmod +x "$fake_docker_bin/docker"
+
+valid_image_id="sha256:$(printf '%064d' 0)"
+run_serena_image_case() {
+  local case_id="$1" expected_rc="$2" mode="$3" image_id="$4"
+  local image_ref="$5" image_volumes="$6" marker="$7" expect_compose="$8"
+  local case_dir="$work/image-$case_id" docker_log output rc inspect_count
+  local formatted_count compose_seen=0 marker_seen=0 image_pin_seen=0 launch_ok=0
+  mkdir -p "$case_dir"
+  docker_log="$case_dir/docker.log"
+  output="$case_dir/output"
+  : > "$docker_log"
+  rc=0
+  env -i \
+    PATH="$fake_docker_bin:/usr/bin:/bin" \
+    HOME="$work/fake-home" \
+    FAKE_DOCKER_LOG="$docker_log" \
+    FAKE_IMAGE_MODE="$mode" \
+    FAKE_IMAGE_ID="$image_id" \
+    FAKE_IMAGE_REF="$image_ref" \
+    FAKE_IMAGE_VOLUMES="$image_volumes" \
+    COMPOSE_PROJECT_NAME="agent-lab-serena-metadata-$case_id" \
+    "$repo_root/scripts/serena-mcp" --context=codex >"$output" 2>&1 || rc=$?
+
+  inspect_count="$(grep -c '^image inspect' "$docker_log" || true)"
+  formatted_count="$(grep -c '^image inspect --format ' "$docker_log" || true)"
+  if grep -Eq '^compose --project-name ' "$docker_log"; then compose_seen=1; fi
+  if [ -z "$marker" ] || grep -Fq -- "$marker" "$output"; then marker_seen=1; fi
+  if grep -Fxq "ENV AGENT_LAB_SERENA_IMAGE=$valid_image_id" "$docker_log"; then
+    image_pin_seen=1
+  fi
+  if { [ "$expect_compose" = yes ] && [ "$compose_seen" -eq 1 ] &&
+       [ "$image_pin_seen" -eq 1 ]; } ||
+     { [ "$expect_compose" = no ] && [ "$compose_seen" -eq 0 ]; }; then
+    launch_ok=1
+  fi
+
+  if [ "$rc" -eq "$expected_rc" ] &&
+     [ "$inspect_count" -eq 1 ] && [ "$formatted_count" -eq 1 ] &&
+     [ "$marker_seen" -eq 1 ] && [ "$launch_ok" -eq 1 ]; then
+    pass "Serena image metadata snapshot: $case_id"
+  else
+    fail "Serena image metadata snapshot: $case_id (rc=$rc inspect=$inspect_count formatted=$formatted_count compose=$compose_seen pin=$image_pin_seen)"
+    sed 's/^/  /' "$output"
+  fi
+}
+
+run_serena_image_case \
+  missing 125 missing "$valid_image_id" "$AGENT_LAB_SERENA_REF" null \
+  'Serena MCP: cannot inspect image metadata; image may be missing' no
+run_serena_image_case \
+  inspect-error 125 inspect-error "$valid_image_id" "$AGENT_LAB_SERENA_REF" null \
+  'Serena MCP: cannot inspect image metadata; image may be missing' no
+run_serena_image_case \
+  invalid-id 125 present not-a-digest "$AGENT_LAB_SERENA_REF" null \
+  'Serena MCP: Docker returned an invalid image identity' no
+run_serena_image_case \
+  wrong-ref 125 present "$valid_image_id" wrong-ref null \
+  'Serena MCP: image does not match pinned Serena ref' no
+run_serena_image_case \
+  unexpected-volume 125 present "$valid_image_id" "$AGENT_LAB_SERENA_REF" \
+  '{"/data":{}}' 'Serena MCP: image declares unexpected writable volumes' no
+run_serena_image_case \
+  injected-record 125 present "$valid_image_id" "$AGENT_LAB_SERENA_REF"$'\nnull' \
+  '{"/data":{}}' 'Serena MCP: image does not match pinned Serena ref' no
+run_serena_image_case \
+  extra-record 125 present "$valid_image_id" "$AGENT_LAB_SERENA_REF" \
+  $'null\nextra' 'Serena MCP: Docker returned malformed image metadata' no
+run_serena_image_case \
+  valid 0 present "$valid_image_id" "$AGENT_LAB_SERENA_REF" null '' yes
+
+if grep -Eq '(^|[[:space:]])(mapfile|readarray)([[:space:]]|$)' \
+     "$repo_root/scripts/serena-mcp"; then
+  fail "Serena image metadata parser remains compatible with Bash 3.2 record readers"
+else
+  pass "Serena image metadata parser remains compatible with Bash 3.2 record readers"
+fi
+
 fixture="$work/project"
 mount_state="$work/mount-state"
 mkdir -p \

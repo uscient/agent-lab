@@ -6,6 +6,15 @@
 # and exported before Compose can consume it. Unsupported or ambiguous env-file syntax is
 # rejected instead of being interpreted differently by this script and Docker Compose.
 
+# shellcheck source=scripts/lib/domain.sh
+agent_lab_domain_lib_dir="${BASH_SOURCE[0]}"
+case "$agent_lab_domain_lib_dir" in
+  */*) agent_lab_domain_lib_dir="${agent_lab_domain_lib_dir%/*}" ;;
+  *) agent_lab_domain_lib_dir=. ;;
+esac
+source "$agent_lab_domain_lib_dir/domain.sh" || return 1
+unset agent_lab_domain_lib_dir
+
 AGENT_LAB_CONFIG_KEYS=(
   AGENT_LAB_AGENTS_SUBNET
   AGENT_LAB_EGRESS_SUBNET
@@ -326,29 +335,7 @@ agent_lab_validate_cidr24() {
 }
 
 agent_lab_validate_domain() {
-  local value domain label labels
-  value="$1"
-  domain="${value#.}"
-  [ -n "$domain" ] && [ "${#domain}" -le 253 ] || return 1
-  case "$domain" in
-    *.*) ;;
-    *) return 1 ;;
-  esac
-  case "$domain" in
-    .*|*.|*..*|*[!a-z0-9.-]*) return 1 ;;
-  esac
-  case "$domain" in
-    *[!0-9.]*) ;;
-    *) return 1 ;;
-  esac
-  IFS=. read -r -a labels <<< "$domain"
-  for label in "${labels[@]}"; do
-    [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
-    case "$label" in
-      -*|*-|*[!a-z0-9-]*) return 1 ;;
-    esac
-  done
-  return 0
+  agent_lab_domain_valid "$1"
 }
 
 agent_lab_validate_topology() {

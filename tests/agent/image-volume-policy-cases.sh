@@ -5,16 +5,50 @@ set -euo pipefail
 # makes image metadata deterministic and records whether Compose was reached.
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-work="$(mktemp -d)"
+if ! work="$(mktemp -d)"; then
+  printf 'INFRA image-volume policy cannot create isolated work directory\n' >&2
+  exit 125
+fi
+agent_root="$work/agent-root"
 secrets_rel=".image-volume-secrets-$$-${RANDOM}"
-secrets_path="$repo_root/$secrets_rel"
+secrets_path="$agent_root/$secrets_rel"
 cleanup() {
-  rmdir "$secrets_path" >/dev/null 2>&1 || true
-  rm -rf "$work"
+  find "$work" -xdev -depth -delete >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-mkdir -p "$work/bin"
+mkdir -p \
+  "$work/bin" "$work/home" \
+  "$agent_root/scripts/lib" "$agent_root/policies/recipes"
+cp "$repo_root/scripts/agent" "$repo_root/scripts/common" "$agent_root/scripts/"
+cp \
+  "$repo_root/scripts/lib/allowlist.sh" \
+  "$repo_root/scripts/lib/config.sh" \
+  "$repo_root/scripts/lib/domain.sh" \
+  "$repo_root/scripts/lib/egress.sh" \
+  "$repo_root/scripts/lib/guard.sh" \
+  "$repo_root/scripts/lib/image.sh" \
+  "$agent_root/scripts/lib/"
+cp "$repo_root"/policies/recipes/*.allowlist "$agent_root/policies/recipes/"
+cp \
+  "$repo_root/compose.yaml" \
+  "$repo_root/compose.egress.yaml" \
+  "$repo_root/compose.agent.yaml" \
+  "$repo_root/compose.agent.ephemeral.yaml" \
+  "$repo_root/compose.agent.persist.yaml" \
+  "$agent_root/"
+for fixture_input in \
+  scripts/agent scripts/common \
+  scripts/lib/allowlist.sh scripts/lib/config.sh scripts/lib/domain.sh \
+  scripts/lib/egress.sh scripts/lib/guard.sh scripts/lib/image.sh \
+  compose.yaml compose.egress.yaml compose.agent.yaml \
+  compose.agent.ephemeral.yaml compose.agent.persist.yaml; do
+  if [ ! -f "$agent_root/$fixture_input" ]; then
+    printf 'INFRA image-volume policy fixture is incomplete: %s\n' \
+      "$fixture_input" >&2
+    exit 125
+  fi
+done
 env_file="$work/agent.env"
 docker_log="$work/docker.log"
 : > "$env_file"
@@ -59,7 +93,7 @@ run_agent() {
   : > "$docker_log"
   env -i \
     PATH="$work/bin:/usr/bin:/bin" \
-    HOME="$HOME" \
+    HOME="$work/home" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_IMAGE_VOLUMES="$volumes" \
     AGENT_LAB_ENV_FILE="$env_file" \
@@ -72,7 +106,7 @@ run_agent() {
     AGENT_LAB_AGENT_GID="1000" \
     AGENT_LAB_AGENT_MEM="1g" \
     AGENT_LAB_AGENT_CPUS="1" \
-    "$repo_root/scripts/agent" -- true >"$out" 2>&1 || rc=$?
+    "$agent_root/scripts/agent" -- true >"$out" 2>&1 || rc=$?
   return "$rc"
 }
 

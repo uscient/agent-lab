@@ -41,6 +41,44 @@ has_mount_option() {
   esac
 }
 
+backend="${AGENT_LAB_RUNTIME_INSPECT_BACKEND:-bash}"
+case "$backend" in
+  bash) ;;
+  python)
+    helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/check-runtime-inspect.py"
+    command -v python3 >/dev/null 2>&1 || {
+      printf 'INFRA runtime-inspect Python helper requires python3\n' >&2
+      exit 125
+    }
+    [ -r "$helper" ] || {
+      printf 'INFRA runtime-inspect Python helper is unavailable\n' >&2
+      exit 125
+    }
+    helper_rc=0
+    python3 -I "$helper" \
+      "$inspect" "$mode" "$expected_uid" "$expected_gid" "$project" ||
+      helper_rc=$?
+    case "$helper_rc" in
+      64)
+        backend=bash
+        ;;
+      80|81|82|83|84|85|86|87|88|89|90|91|92)
+        failures=$((helper_rc - 80))
+        ;;
+      *)
+        printf 'INFRA runtime-inspect Python helper failed (status %s)\n' \
+          "$helper_rc" >&2
+        exit 125
+        ;;
+    esac
+    ;;
+  *)
+    printf 'FAIL unknown runtime-inspect backend: %s\n' "$backend" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$backend" = bash ]; then
 assert_jq "root filesystem is structurally read-only" \
   'length == 1 and .[0].HostConfig.ReadonlyRootfs == true'
 assert_jq "configured user is the exact numeric UID:GID" \
@@ -107,6 +145,7 @@ if [ "$mode" = persistent ]; then
   assert_jq "persistent HOME is a read-write named volume" \
     'any(.[0].Mounts[];
         .Destination == "/home/agent" and .Type == "volume" and .RW == true)'
+fi
 fi
 
 runtime_uid="$(evidence uid)"
