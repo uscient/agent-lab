@@ -19,6 +19,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 GATE = ROOT / "scripts/dev/security-gate"
 HELPER = ROOT / "scripts/dev/security-gate.py"
+# Expected-leak mutants report ready only after starting TERM-ignoring descendants.
+MUTANT_LEAK_OBSERVATION_SECONDS = 0.2
 failures = 0
 
 
@@ -974,6 +976,7 @@ def run_signal_case(
     descendant: bool = False,
     cleanup_delay: float = 0.0,
     repeat_signal: bool = False,
+    disappearance_timeout: float = 3.0,
 ) -> tuple[int, bytes, bytes, bool, float, Path]:
     signal_dir = work / f"signal-{label}-{signum.name}"
     signal_dir.mkdir(exist_ok=True)
@@ -1023,9 +1026,9 @@ def run_signal_case(
         process.kill()
         stdout, stderr = process.communicate()
     seconds = time.perf_counter() - started
-    clean = wait_gone(suite_pid)
+    clean = wait_gone(suite_pid, disappearance_timeout)
     if descendant_pid is not None:
-        clean = wait_gone(descendant_pid) and clean
+        clean = wait_gone(descendant_pid, disappearance_timeout) and clean
     clean = clean and not group_exists(pgid)
     if not clean:
         try:
@@ -1609,6 +1612,7 @@ def test_sensitivity_mutants(work: Path) -> None:
             signal.SIGTERM,
             helper=cleanup_mutant,
             descendant=True,
+            disappearance_timeout=MUTANT_LEAK_OBSERVATION_SECONDS,
         )
         check(not clean, "descendant-cleanup sensitivity mutation turns RED")
 
@@ -1774,6 +1778,7 @@ def test_sensitivity_mutants(work: Path) -> None:
             helper=repeated_signal_mutant,
             descendant=True,
             repeat_signal=True,
+            disappearance_timeout=MUTANT_LEAK_OBSERVATION_SECONDS,
         )
         check(
             rc != 143 and not clean,

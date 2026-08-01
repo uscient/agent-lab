@@ -130,17 +130,56 @@ else
   printf '%s\n' "$no_python_out"
 fi
 
+real_python="$(command -v python3)"
+counting_python_bin="$work/counting-python-bin"
+counting_python_log="$work/counting-python.log"
+counting_python_expected="Usage: $gate [fast|docker] [--manifest PATH]"
+mkdir -p "$counting_python_bin"
+ln -s "$(command -v bash)" "$counting_python_bin/bash"
+ln -s "$(command -v dirname)" "$counting_python_bin/dirname"
+cat > "$counting_python_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf 'launch\n' >> "$PYTHON_LAUNCH_LOG"
+exec "$REAL_PYTHON" "$@"
+EOF
+chmod +x "$counting_python_bin/python3"
+: > "$counting_python_log"
+counting_python_rc=0
+counting_python_out="$({
+  PATH="$counting_python_bin" \
+    PYTHON_LAUNCH_LOG="$counting_python_log" \
+    REAL_PYTHON="$real_python" \
+    "$gate" --help
+} 2>&1)" || counting_python_rc=$?
+if [ "$counting_python_rc" -eq 0 ] &&
+  [ "$(wc -l < "$counting_python_log")" -eq 1 ] &&
+  [ "$counting_python_out" = "$counting_python_expected" ]; then
+  pass "stable entrypoint starts one Python interpreter"
+else
+  fail "stable entrypoint starts one Python interpreter (rc=$counting_python_rc)"
+  printf '%s\n' "$counting_python_out"
+fi
+
 old_python_bin="$work/old-python-bin"
 mkdir -p "$old_python_bin"
 ln -s "$(command -v bash)" "$old_python_bin/bash"
 ln -s "$(command -v dirname)" "$old_python_bin/dirname"
 cat > "$old_python_bin/python3" <<'EOF'
 #!/usr/bin/env bash
-exit 1
+set -eu
+[ "$1" = "-I" ] && [ "$2" = "-c" ]
+shift 2
+bootstrap="$1"
+shift
+exec "$REAL_PYTHON" -I -c \
+  'import sys; code = sys.argv.pop(1); sys.version_info = (3, 10, 0); exec(code)' \
+  "$bootstrap" "$@"
 EOF
 chmod +x "$old_python_bin/python3"
 old_python_rc=0
-old_python_out="$(PATH="$old_python_bin" "$gate" --help 2>&1)" || old_python_rc=$?
+old_python_out="$(
+  PATH="$old_python_bin" REAL_PYTHON="$real_python" "$gate" --help 2>&1
+)" || old_python_rc=$?
 if [ "$old_python_rc" -eq 125 ] &&
   [ "$old_python_out" = "INFRA security-gate requires Python 3.11 or newer" ]; then
   pass "stable entrypoint fails closed below Python 3.11"

@@ -8,14 +8,19 @@ if ! command -v python3 >/dev/null 2>&1; then
   printf 'INFRA security-gate requires python3\n' >&2
   exit 125
 fi
-if ! python3 -I -c \
-  'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  printf 'INFRA security-gate requires Python 3.11 or newer\n' >&2
-  exit 125
-fi
 if [ ! -f "$helper" ] || [ ! -r "$helper" ]; then
   printf 'INFRA security-gate Python helper is unavailable: %s\n' "$helper" >&2
   exit 125
 fi
 
-exec python3 -I "$helper" "$@"
+exec python3 -I -c '
+import runpy
+import sys
+
+if sys.version_info < (3, 11):
+    sys.stderr.write("INFRA security-gate requires Python 3.11 or newer\n")
+    raise SystemExit(125)
+helper = sys.argv[1]
+sys.argv = sys.argv[1:]
+runpy.run_path(helper, run_name="__main__")
+' "$helper" "$@"
