@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 coord_source="$repo_root/scripts/dev/coord"
-full_expected_assertions=50
+full_expected_assertions=54
 assertions=0
 failures=0
 
@@ -328,6 +328,19 @@ else
   fail "a post-init symlink swap is rejected without following it"
 fi
 
+ancestor_fixture="$work/ancestor-symlink/repo"
+ancestor_link="$work/ancestor-symlink/repo-link"
+ancestor_state="$ancestor_link/coord-state"
+mkdir -p "$(dirname "$ancestor_fixture")"
+make_fixture "$ancestor_fixture"
+ln -s "$ancestor_fixture" "$ancestor_link"
+capture_coord "$ancestor_fixture" "$ancestor_state" init coordinator
+if ((capture_rc == 1)) && [[ ! -e "$ancestor_fixture/coord-state" ]]; then
+  pass "a symlink ancestor cannot redirect state into a tracked checkout path"
+else
+  fail "a symlink ancestor cannot redirect state into a tracked checkout path"
+fi
+
 pin_case() {
   local drift="$1"
   local operation="$2"
@@ -383,6 +396,9 @@ pin_case() {
     close)
       capture_coord "$pin_fixture" "$pin_state" close coordinator
       ;;
+    status)
+      capture_coord "$pin_fixture" "$pin_state" status
+      ;;
     *)
       return 125
       ;;
@@ -400,7 +416,7 @@ pinning_rejects_mutations() {
   local operation
   local rc
 
-  for operation in claim handoff resolve close; do
+  for operation in claim handoff resolve close status; do
     if pin_case "$drift" "$operation"; then
       continue
     else
@@ -428,8 +444,76 @@ assert_pinning() {
   fail "$name"
 }
 
-assert_pinning "branch drift rejects claim, handoff, resolve, and close" branch
-assert_pinning "HEAD drift rejects claim, handoff, resolve, and close" head
+assert_pinning "branch drift rejects every session operation" branch
+assert_pinning "HEAD drift rejects operations until the coordinator advances it" head
+
+status_lock_fixture="$work/status-lock/repo"
+status_lock_state="$work/status-lock/state"
+status_lock_result="$work/status-lock/result"
+status_lock_output="$work/status-lock/output"
+mkdir -p "$(dirname "$status_lock_fixture")"
+make_fixture "$status_lock_fixture"
+run_coord "$status_lock_fixture" "$status_lock_state" init coordinator >/dev/null
+mkdir "$status_lock_state/.lock"
+(
+  status_rc=0
+  run_coord "$status_lock_fixture" "$status_lock_state" status \
+    >"$status_lock_output" 2>&1 || status_rc=$?
+  printf '%d\n' "$status_rc" >"$status_lock_result"
+) &
+status_lock_pid=$!
+sleep 0.1
+status_returned_early=0
+[[ -e "$status_lock_result" ]] && status_returned_early=1
+rmdir "$status_lock_state/.lock"
+wait "$status_lock_pid" || true
+if ((status_returned_early == 0)) && [[ "$(<"$status_lock_result")" == 0 ]]; then
+  pass "status takes the coordination lock for a consistent snapshot"
+else
+  fail "status takes the coordination lock for a consistent snapshot"
+fi
+
+advance_fixture="$work/advance/repo"
+advance_state="$work/advance/state"
+advance_summary="$work/advance/summary.txt"
+mkdir -p "$(dirname "$advance_fixture")"
+make_fixture "$advance_fixture"
+printf 'ready to advance\n' >"$advance_summary"
+run_coord "$advance_fixture" "$advance_state" init coordinator >/dev/null
+run_coord "$advance_fixture" "$advance_state" \
+  claim actor advance-task --read-only >/dev/null
+run_coord "$advance_fixture" "$advance_state" \
+  handoff actor advance-task "done" "$advance_summary" >/dev/null
+printf 'advance head\n' >"$advance_fixture/advance.txt"
+git -C "$advance_fixture" add advance.txt
+git -C "$advance_fixture" commit -qm "move fixture head"
+capture_coord "$advance_fixture" "$advance_state" resolve coordinator advance-task
+advance_before_rc=$capture_rc
+capture_coord "$advance_fixture" "$advance_state" advance coordinator
+advance_rc=$capture_rc
+capture_coord "$advance_fixture" "$advance_state" resolve coordinator advance-task
+advance_resolve_rc=$capture_rc
+capture_coord "$advance_fixture" "$advance_state" close coordinator
+advance_close_rc=$capture_rc
+if ((advance_before_rc == 1 && advance_rc == 0 && \
+  advance_resolve_rc == 0 && advance_close_rc == 0)); then
+  pass "coordinator can advance the HEAD pin after every task hands off"
+else
+  fail "coordinator can advance the HEAD pin after every task hands off"
+fi
+
+advance_guard_fixture="$work/advance-guard/repo"
+advance_guard_state="$work/advance-guard/state"
+mkdir -p "$(dirname "$advance_guard_fixture")"
+make_fixture "$advance_guard_fixture"
+run_coord "$advance_guard_fixture" "$advance_guard_state" init coordinator >/dev/null
+run_coord "$advance_guard_fixture" "$advance_guard_state" \
+  claim actor active-task --read-only >/dev/null
+printf 'advance guard head\n' >"$advance_guard_fixture/advance.txt"
+git -C "$advance_guard_fixture" add advance.txt
+git -C "$advance_guard_fixture" commit -qm "move fixture head"
+expect_failure "coordinator cannot advance while a task lacks a handoff" \
+  "$advance_guard_fixture" "$advance_guard_state" advance coordinator
 
 clean_fixture="$work/clean/repo"
 clean_state="$work/clean/state"
