@@ -67,6 +67,21 @@ capabilities their documented task requires.
 
 See [Development](development.md) and [development-agent configuration](agent-config.md).
 
+## Experiment request preflight
+
+`scripts/experiment check [--] MANIFEST` validates the closed `agent-lab/v0alpha1` request with the
+repository-pinned CUE contract and emits one canonical, digest-bound `RequestedExperimentPlan`.
+`scripts/experiment authorize install [--] MANIFEST` reads the manifest once, derives that same plan
+in-process, and asks the repository-pinned Cedar policy whether the fixed local compatibility
+principal may submit the exact plan digest.
+
+Both commands are no-effect preflights: they make no container-engine, network, registration, or
+runtime changes. A requested name is correlation data, not an installed Experiment identity or
+scope. Start, stop, and remove authorization require a future Broker-minted Experiment identity and
+Broker-owned ledger, so they are deliberately outside this requested-plan seam. An install permit
+only clears the exact requested intent for a future Broker-controlled install path; it neither
+actuates the plan nor waives Agent Lab's containment envelope.
+
 ## Workload launch sequence
 
 The launcher is intentionally ordered so that untrusted or persistent state appears only after
@@ -221,6 +236,7 @@ For formal assumptions and limits, read [Security](../SECURITY.md) and the
 | Squid and test service | `compose.egress.yaml`, `gateway/squid/` |
 | workload container | `compose.agent.yaml` and HOME overlays |
 | workload orchestration | `scripts/agent` |
+| Experiment request planning and authorization | `scripts/experiment`, `contracts/experiment/`, `authorization/experiment/` |
 | config parsing and validation | `scripts/lib/config.sh` |
 | project and secret guards | `scripts/lib/guard.sh` |
 | recipe publication | `scripts/lib/allowlist.sh` |

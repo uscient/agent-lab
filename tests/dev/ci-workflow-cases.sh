@@ -152,13 +152,14 @@ require_job_text fast 'merge_group) base="$MERGE_GROUP_BASE_SHA"' \
   "fast job resolves the immutable merge-group base"
 if [ -x "$ci_fast" ] &&
    awk '
-     /scripts\/dev\/cue-tool provision/ { provision=NR }
+     /scripts\/dev\/cue-tool provision/ { cue=NR }
+     /scripts\/dev\/cedar-tool provision/ { cedar=NR }
      /scripts\/dev\/check default quick/ { check=NR }
-     END { exit !(provision > 0 && check > provision) }
+     END { exit !(cue > 0 && cedar > cue && check > cedar) }
    ' "$ci_fast"; then
-  pass "canonical Fast replay provisions pinned CUE before the gate"
+  pass "canonical Fast replay provisions pinned CUE and Cedar before the gate"
 else
-  fail "canonical Fast replay provisions pinned CUE before the gate"
+  fail "canonical Fast replay provisions pinned CUE and Cedar before the gate"
 fi
 
 require_job_text static '    name: Static' "static job has a stable display name"

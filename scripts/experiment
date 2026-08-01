@@ -5,7 +5,9 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 helper="$script_dir/experiment.py"
 
 usage() {
-  printf 'Usage: scripts/experiment check [--] MANIFEST\n' >&2
+  printf '%s\n' \
+    'Usage: scripts/experiment check [--] MANIFEST' \
+    'Usage: scripts/experiment authorize install [--] MANIFEST' >&2
 }
 
 case "${1:-}" in
@@ -29,6 +31,28 @@ case "${1:-}" in
       usage
       exit 2
     }
+    command_name=check
+    manifest=$1
+    ;;
+  authorize)
+    shift
+    [ "${1:-}" = install ] || {
+      usage
+      exit 2
+    }
+    shift
+    if [ "${1:-}" = -- ]; then
+      shift
+    elif [[ "${1:-}" == -* ]]; then
+      usage
+      exit 2
+    fi
+    [ "$#" -eq 1 ] || {
+      usage
+      exit 2
+    }
+    command_name=authorize
+    manifest=$1
     ;;
   *)
     usage
@@ -45,4 +69,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 125
 }
 
-exec python3 -I "$helper" check "$1"
+if [ "$command_name" = authorize ]; then
+  exec python3 -I "$helper" authorize install "$manifest"
+fi
+exec python3 -I "$helper" check "$manifest"
