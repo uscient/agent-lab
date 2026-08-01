@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly expected_author_name="xormania"
+readonly expected_author_email="127287135+xormania@users.noreply.github.com"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/dev/workflow-check branch [name]
+       scripts/dev/workflow-check commit <subject>
+       scripts/dev/workflow-check commits [base]
+       scripts/dev/workflow-check pr-title <title>
+       scripts/dev/workflow-check pr-body <file>
+       scripts/dev/workflow-check pr-base <base>
+       scripts/dev/workflow-check all [base]
+EOF
+  return 2
+}
+
+fail() {
+  printf 'FAIL workflow %s\n' "$*" >&2
+  return 1
+}
+
+infra() {
+  printf 'INFRA workflow %s\n' "$*" >&2
+  return 125
+}
+
+subject_reason=""
+validate_subject() {
+  local subject="$1" lower length
+
+  subject_reason=""
+  if [[ "$subject" == *$'\n'* || "$subject" == *$'\r'* ]] \
+    || LC_ALL=C grep -q '[^ -~]' <<<"$subject"; then
+    subject_reason="must be one printable line"
+    return 1
+  fi
+
+  lower="${subject,,}"
+  if [[ "$lower" =~ ^\[?wip([]:[:space:]-]|$) ]] \
+    || [[ "$lower" =~ ^(draft|do[[:space:]]+not[[:space:]]+merge)([]:[:space:]-]|$) ]]; then
+    subject_reason="is marked unfinished"
+    return 1
+  fi
+  if [[ "$lower" =~ ^merge([[:space:]]|$) ]]; then
+    subject_reason="contains merge boilerplate"
+    return 1
+  fi
+  if [[ "$lower" =~ ^(co-authored|generated|assisted)[[:space:]-]+by([[:space:]]|$) ]]; then
+    subject_reason="contains disallowed attribution text"
+    return 1
+  fi
+  if [[ "$subject" =~ ^[[:alnum:]_.-]+/[[:alnum:]_.@/-]+$ ]]; then
+    subject_reason="looks branch-derived"
+    return 1
+  fi
+  if [[ "$lower" =~ ^(task|issue|ticket|pr)[[:space:]#:/-]*[0-9]+([[:space:]]+(changes?|updates?|fix(es)?))?$ ]]; then
+    subject_reason="is a task-only label"
+    return 1
+  fi
+  if [[ "$lower" =~ ^(dev|update([:][[:space:]]*.*)?|misc(ellaneous)?([[:space:]]+changes?)?|changes?|work|now|agent|codex|claude|grok)$ ]]; then
+    subject_reason="is generic"
+    return 1
+  fi
+
+  length="$(LC_ALL=C printf '%s' "$subject" | wc -c | tr -d '[:space:]')"
+  if ((length < 12 || length > 72)); then
+    subject_reason="must be 12 to 72 characters"
+    return 1
+  fi
+  if [[ "$subject" != "${subject#"${subject%%[![:space:]]*}"}" ]] \
+    || [[ "$subject" != "${subject%"${subject##*[![:space:]]}"}" ]]; then
+    subject_reason="must not have leading or trailing whitespace"
+    return 1
+  fi
+  if [[ "$subject" == *. ]]; then
+    subject_reason="must not have a trailing period"
+    return 1
+  fi
+
+  return 0
+}
+
+check_branch() {
+  local branch_name="$1" lower normalized
+
+  if [[ -z "$branch_name" ]]; then
+    fail "branch is detached or empty"
+    return
+  fi
+  case "$branch_name" in
+    dev | master | main)
+      fail "branch is protected: $branch_name"
+      return
+      ;;
+  esac
+  lower="${branch_name,,}"
+  case "$lower" in
+    agent | changes | codex | claude | grok | now | work)
+      fail "branch name is generic: $branch_name"
+      return
+      ;;
+  esac
+  if [[ "$branch_name" == *'@{'* ]]; then
+    fail "branch uses Git magic syntax: $branch_name"
+    return
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    infra "cannot validate branch without git"
+    return
+  fi
+  if ! normalized="$(git check-ref-format --branch "$branch_name" 2>/dev/null)"; then
+    fail "invalid Git branch: $branch_name"
+    return
+  fi
+  if [[ "$normalized" != "$branch_name" ]]; then
+    fail "branch uses non-literal Git syntax: $branch_name"
+    return
+  fi
+
+  printf 'PASS workflow branch=%s\n' "$branch_name"
+}
+
+check_current_or_named_branch() {
+  local branch_name
+
+  if (($# == 1)); then
+    branch_name="$1"
+  else
+    if ! command -v git >/dev/null 2>&1; then
+      infra "cannot inspect current branch without git"
+      return
+    fi
+    if ! branch_name="$(git branch --show-current 2>/dev/null)"; then
+      infra "cannot inspect current branch"
+      return
+    fi
+  fi
+  check_branch "$branch_name"
+}
+
+check_commit_subject() {
+  local subject="$1"
+
+  if ! validate_subject "$subject"; then
+    fail "commit subject $subject_reason"
+    return
+  fi
+  printf 'PASS workflow commit subject\n'
+}
+
+check_pr_title() {
+  local title="$1" head_branch=""
+
+  if command -v git >/dev/null 2>&1; then
+    if ! head_branch="$(git branch --show-current 2>/dev/null)"; then
+      infra "cannot inspect the head branch for the PR title"
+      return
+    fi
+    if [[ -z "$head_branch" ]]; then
+      infra "cannot inspect the head branch for the PR title"
+      return
+    fi
+  fi
+  if [[ -n "$head_branch" && "$title" == "$head_branch" ]]; then
+    fail "PR title must not copy the head branch"
+    return
+  fi
+  if ! validate_subject "$title"; then
+    fail "PR title $subject_reason"
+    return
+  fi
+  printf 'PASS workflow PR title\n'
+}
+
+check_pr_base() {
+  local base="$1"
+
+  if [[ "$base" != dev ]]; then
+    fail "PR base must be dev"
+    return
+  fi
+  printf 'PASS workflow PR base=dev\n'
+}
+
+strip_nonprose_markdown() {
+  awk '
+    BEGIN { fenced = 0; comment = 0; fence_char = ""; fence_length = 0 }
+    {
+      line = $0
+      indent = 0
+      while (substr(line, indent + 1, 1) == " " && indent < 4) indent++
+      rest = substr(line, indent + 1)
+      marker = substr(rest, 1, 1)
+      marker_length = 0
+      if (indent <= 3 && (marker == "`" || marker == "~")) {
+        while (substr(rest, marker_length + 1, 1) == marker) marker_length++
+      }
+      if (fenced) {
+        remainder = substr(rest, marker_length + 1)
+        if (marker == fence_char && marker_length >= fence_length \
+            && remainder ~ /^[[:space:]]*$/) {
+          fenced = 0
+          fence_char = ""
+          fence_length = 0
+        }
+        next
+      }
+      if (!comment && marker_length >= 3) {
+        fenced = 1
+        fence_char = marker
+        fence_length = marker_length
+        next
+      }
+
+      while (1) {
+        if (comment) {
+          if (match(line, /-->/)) {
+            line = substr(line, RSTART + RLENGTH)
+            comment = 0
+            continue
+          }
+          next
+        }
+        if (match(line, /<!--/)) {
+          before = substr(line, 1, RSTART - 1)
+          line = substr(line, RSTART + RLENGTH)
+          if (before != "") print before
+          comment = 1
+          continue
+        }
+        print line
+        next
+      }
+    }
+  ' "$1"
+}
+
+section_count() {
+  awk -v heading="## $2" '$0 == heading { count++ } END { print count + 0 }' "$1"
+}
+
+section_line() {
+  awk -v heading="## $2" '$0 == heading { print NR; exit }' "$1"
+}
+
+section_has_content() {
+  awk -v heading="## $2" '
+    $0 == heading { found = 1; next }
+    found && /^## / { exit }
+    found && /[^[:space:]]/ { content = 1 }
+    END { exit(content ? 0 : 1) }
+  ' "$1"
+}
+
+extract_section() {
+  awk -v heading="## $2" '
+    $0 == heading { found = 1; next }
+    found && /^## / { exit }
+    found { print }
+  ' "$1"
+}
+
+check_pr_body() {
+  local body_file="$1" parsed_file section count
+  local summary_line motivation_line changes_line testing_line testing_text testing_prose
+  local -a required_sections=("Summary" "Motivation / Context" "Changes" "Testing")
+
+  if [[ ! -f "$body_file" || ! -r "$body_file" ]]; then
+    infra "cannot read PR body: $body_file"
+    return
+  fi
+  if grep -Eiq '^[[:space:]]*>[[:space:]]+\*\*.*Important policy notice\*\*[[:space:]]*$|^## Checklist \(members only\)[[:space:]]*$|^If you are not a member, please close this PR instead of submitting\.[[:space:]]*$' "$body_file"; then
+    fail "PR body retains the member notice"
+    return
+  fi
+
+  parsed_file="$(mktemp)" || {
+    infra "cannot create temporary PR body state"
+    return
+  }
+  if ! strip_nonprose_markdown "$body_file" >"$parsed_file"; then
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    infra "cannot parse PR body: $body_file"
+    return
+  fi
+
+  if grep -Eq '^[[:space:]]*[-*+][[:space:]]+\[[[:space:]]\]' "$parsed_file"; then
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    fail "PR body contains an unchecked placeholder"
+    return
+  fi
+  if grep -Eiq '(One line summary of the change|Why is this change needed|Bullet list of what was done|How was this tested|<!--[[:space:]]*(TODO|TBD|placeholder))' "$body_file"; then
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    fail "PR body retains placeholder text"
+    return
+  fi
+
+  for section in "${required_sections[@]}"; do
+    count="$(section_count "$parsed_file" "$section")"
+    if ((count == 0)); then
+      find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+      fail "PR body missing section: $section"
+      return
+    fi
+    if ((count > 1)); then
+      find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+      fail "PR body has duplicate section: $section"
+      return
+    fi
+  done
+
+  summary_line="$(section_line "$parsed_file" "Summary")"
+  motivation_line="$(section_line "$parsed_file" "Motivation / Context")"
+  changes_line="$(section_line "$parsed_file" "Changes")"
+  testing_line="$(section_line "$parsed_file" "Testing")"
+  if ! ((summary_line < motivation_line && motivation_line < changes_line && changes_line < testing_line)); then
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    fail "PR body section order must be Summary, Motivation / Context, Changes, Testing"
+    return
+  fi
+
+  for section in "${required_sections[@]}"; do
+    if ! section_has_content "$parsed_file" "$section"; then
+      find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+      fail "PR body has empty section: $section"
+      return
+    fi
+  done
+
+  testing_text="$(extract_section "$parsed_file" "Testing")"
+  find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+  testing_prose="$(sed -E 's/`[^`]*`//g' <<<"$testing_text")"
+  if grep -Eq 'Not run[[:space:]]+[-—:][[:space:]]+.*[[:alnum:]]' <<<"$testing_prose"; then
+    printf 'PASS workflow PR body\n'
+    return
+  fi
+  if grep -Eq 'Not run([[:space:]]|$)' <<<"$testing_prose"; then
+    fail "PR body Testing Not run requires a reason"
+    return
+  fi
+  if grep -Eq '`[^`]+`' <<<"$testing_text"; then
+    if grep -Eiq '(^|[[:space:]:—-])(pass(ed)?|fail(ed)?|result[[:space:]]*:|rc[=:[:space:]]|exit[[:space:]]+[0-9]+|blocked|skipped)([[:space:].,;:()=—-]|$)' <<<"$testing_prose"; then
+      printf 'PASS workflow PR body\n'
+      return
+    fi
+    fail "PR body Testing command requires an observed result"
+    return
+  fi
+
+  fail "PR body Testing must list an exact command or Not run — reason"
+}
+
+check_commits() {
+  local base="$1" base_oid integration_oid revisions hash author_name author_email
+  local subject message trailers ancestry_rc=0 count=0
+
+  if ! command -v git >/dev/null 2>&1; then
+    infra "cannot inspect commits without git"
+    return
+  fi
+  if ! base_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify "${base}^{commit}" 2>/dev/null)"; then
+    infra "invalid base: $base"
+    return
+  fi
+  if ! integration_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'origin/dev^{commit}' 2>/dev/null)"; then
+    infra "cannot resolve origin/dev"
+    return
+  fi
+  if [[ "$base_oid" != "$integration_oid" ]]; then
+    fail "commit base must resolve to origin/dev: $base"
+    return
+  fi
+  if ! GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+    infra "cannot resolve HEAD"
+    return
+  fi
+  GIT_NO_REPLACE_OBJECTS=1 git merge-base --is-ancestor "$base_oid" HEAD >/dev/null 2>&1 \
+    || ancestry_rc=$?
+  case "$ancestry_rc" in
+    0) ;;
+    1)
+      fail "commit base is not an ancestor of HEAD: $base"
+      return
+      ;;
+    *)
+      infra "cannot compare commit base with HEAD: $base"
+      return
+      ;;
+  esac
+  if ! revisions="$(GIT_NO_REPLACE_OBJECTS=1 git rev-list --reverse --no-merges "${base_oid}..HEAD" 2>/dev/null)"; then
+    infra "cannot enumerate introduced commits from base: $base"
+    return
+  fi
+
+  while IFS= read -r hash; do
+    [[ -n "$hash" ]] || continue
+    if ! author_name="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%an "$hash" 2>/dev/null)" \
+      || ! author_email="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%ae "$hash" 2>/dev/null)" \
+      || ! subject="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%s "$hash" 2>/dev/null)" \
+      || ! message="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%B "$hash" 2>/dev/null)"; then
+      infra "cannot inspect commit: $hash"
+      return
+    fi
+    if [[ "$author_name" != "$expected_author_name" || "$author_email" != "$expected_author_email" ]]; then
+      fail "commit $hash sole author must be $expected_author_name <$expected_author_email>"
+      return
+    fi
+    if ! validate_subject "$subject"; then
+      fail "invalid commit subject in $hash: $subject_reason"
+      return
+    fi
+    if ! trailers="$(git interpret-trailers --parse <<<"$message" 2>/dev/null)"; then
+      infra "cannot parse commit trailers in $hash"
+      return
+    fi
+    if grep -Eiq '^[[:space:]]*(Co-authored-by|Generated-by|Assisted-by)[[:space:]]*:' <<<"$trailers"; then
+      fail "commit $hash contains a disallowed attribution trailer"
+      return
+    fi
+    count=$((count + 1))
+  done <<<"$revisions"
+
+  printf 'PASS workflow commits=%s\n' "$count"
+}
+
+check_all() {
+  local base="$1" branch_name
+
+  if ! command -v git >/dev/null 2>&1; then
+    infra "cannot inspect workflow without git"
+    return
+  fi
+  if ! branch_name="$(git branch --show-current 2>/dev/null)"; then
+    infra "cannot inspect current branch"
+    return
+  fi
+  check_branch "$branch_name" || return
+  check_commits "$base"
+}
+
+main() {
+  local command="${1:-}"
+  if (($# > 0)); then
+    shift
+  fi
+
+  case "$command" in
+    branch)
+      (($# <= 1)) || { usage; return; }
+      check_current_or_named_branch "$@"
+      ;;
+    commit)
+      (($# == 1)) || { usage; return; }
+      check_commit_subject "$1"
+      ;;
+    commits)
+      (($# <= 1)) || { usage; return; }
+      check_commits "${1:-origin/dev}"
+      ;;
+    pr-title)
+      (($# == 1)) || { usage; return; }
+      check_pr_title "$1"
+      ;;
+    pr-body)
+      (($# == 1)) || { usage; return; }
+      check_pr_body "$1"
+      ;;
+    pr-base)
+      (($# == 1)) || { usage; return; }
+      check_pr_base "$1"
+      ;;
+    all)
+      (($# <= 1)) || { usage; return; }
+      check_all "${1:-origin/dev}"
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+main "$@"

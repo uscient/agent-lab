@@ -18,7 +18,7 @@ Pull requests and issues from anyone who is not a member of the organization wil
 
 ## For organization members
 
-- Follow the documented internal workflow.
+- Follow the [branch, metadata, and integration workflow](../docs/development.md#branch-and-integration-workflow).
 - Publish only the current work branch and open its PR to `dev`.
 - Humans review and merge; agents never write protected branches or merge their own PRs.
 

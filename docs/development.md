@@ -44,6 +44,73 @@ attribution configuration.
 The rails—`AGENTS.md`, `policy/`, guards, and development-client configuration—require an explicit
 maintenance session. Ordinary feature and documentation work does not mutate them.
 
+### Workflow metadata
+
+Branch naming is a review convention, not a new authorization rail. Prefer a descriptive
+`<lane>/<lower-kebab-topic>` name for manual work. The automated bootstrap form
+`agent/<tool>/<slug>` remains valid. The checker rejects protected, generic, invalid, and Git-magic
+names, but `AGENTS.md` remains authoritative about which branch operations are allowed.
+
+Introduced non-merge commits use the exact author
+`xormania <127287135+xormania@users.noreply.github.com>`. Subjects are one printable ASCII line,
+12–72 characters, and describe one reviewable outcome without a trailing period, draft marker,
+merge boilerplate, branch reference, or generic update text. Plain imperative subjects and scoped
+Conventional Commit subjects are both valid. Do not add additional attribution trailers.
+
+Pull requests use base `dev` and an outcome-focused title under the same subject rules. The body
+keeps the template sections `Summary`, `Motivation / Context`, `Changes`, and `Testing` in that
+order. Testing entries name an exact command in backticks and its observed result. If no command
+ran, write `Not run — reason`. Check or remove every template checklist item before validation.
+
+Run the local convention checks from the repository root:
+
+```bash
+./scripts/dev/workflow-check branch
+./scripts/dev/workflow-check commit 'Describe one reviewable outcome'
+./scripts/dev/workflow-check commits origin/dev
+./scripts/dev/workflow-check pr-title 'Describe the pull request outcome'
+./scripts/dev/workflow-check pr-base dev
+./scripts/dev/workflow-check pr-body .cache/dev/pr-body.md
+./scripts/dev/workflow-check all origin/dev
+```
+
+An explicit commit base must resolve to the current `origin/dev`; callers cannot narrow the range
+to hide introduced commits. `all` checks only the current branch and every introduced non-merge
+commit. Run the three `pr-*` commands separately. The fast gate exercises the checker's executable
+contract; it cannot inspect hosted pull-request metadata.
+
+### Shared-checkout coordination
+
+`scripts/dev/coord` provides local cooperative bookkeeping when several workers share one checkout:
+
+```text
+./scripts/dev/coord init <coordinator>
+./scripts/dev/coord claim <actor> <task> --read-only
+./scripts/dev/coord claim <actor> <task> --write <path>...
+./scripts/dev/coord handoff <actor> <task> <done|blocked> <summary-file>
+./scripts/dev/coord advance <coordinator>
+./scripts/dev/coord resolve <coordinator> <task>
+./scripts/dev/coord status
+./scripts/dev/coord recover <coordinator>
+./scripts/dev/coord close <coordinator>
+```
+
+One coordinator owns the branch, commits, rebase, publication, and final evidence. A write claim
+conflicts with another writer on an exact path, ancestor, or descendant; read-only tasks may
+overlap. A `done` or `blocked` handoff retains its claim until the coordinator resolves it. The
+coordinator reviews the handoff before resolution.
+
+The session pins its repository, branch, and HEAD. Claims, handoffs, resolution, close, and status
+fail on drift. If the coordinator intentionally commits or rebases after every active task has
+handed off, `advance` is the controlled exception that records the new HEAD before resolution
+continues. After an abrupt process termination, `recover` can clear a stale local mutex but refuses
+an owner PID that is still alive.
+
+State and archived sessions remain below ignored `.cache/dev/coord`. Overrides must be absolute and
+cannot place state in tracked checkout paths. The harness never changes Git state and does not
+authenticate actor labels or grant authority; `AGENTS.md`, the guards, and human review keep those
+roles.
+
 ## Local evidence
 
 The three local gate entry points corresponding to the required-gates workers are:
