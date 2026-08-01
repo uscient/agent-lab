@@ -37,6 +37,7 @@ tool-any sha256sum shasum
 
 suite lint scripts/dev/lint-scripts PASS lint-scripts
 suite cue-tool-contract tests/dev/cue-tool-cases.sh SUMMARY failures=0
+suite cedar-tool-contract tests/dev/cedar-tool-cases.sh SUMMARY failures=0
 suite gate-contract tests/dev/security-gate-cases.sh SUMMARY failures=0
 suite gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY failures=0
 suite ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
@@ -49,6 +50,7 @@ suite guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
 suite guard-mount tests/guard/cases.sh SUMMARY failures=0
 suite config-authority tests/agent/config-guard.sh SUMMARY failures=0
 suite experiment-contract tests/experiment/contract-cases.sh SUMMARY failures=0
+suite experiment-authorization tests/experiment/authorization-cases.sh SUMMARY failures=0
 suite config-matrix tests/agent/config-matrix.sh SUMMARY failures=0
 suite allowlist-schema tests/agent/allowlist-cases.sh SUMMARY failures=0
 suite image-volume-policy tests/agent/image-volume-policy-cases.sh SUMMARY failures=0

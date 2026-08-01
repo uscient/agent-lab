@@ -15,7 +15,7 @@ for the branch workflow.
 
 | Check | Claim | Exact local replay |
 | --- | --- | --- |
-| `CI / Fast` | pinned CUE provisioning, changed-file guard, shell/unit contracts, and Docker-free security gate | `AGENT_LAB_DIFF_BASE=THE_SHA_FROM_GATE_SUMMARY ./scripts/dev/ci-fast` |
+| `CI / Fast` | pinned CUE and Cedar provisioning, changed-file guard, shell/unit contracts, and Docker-free security gate | `AGENT_LAB_DIFF_BASE=THE_SHA_FROM_GATE_SUMMARY ./scripts/dev/ci-fast` |
 | `CI / Static` | strict Compose rendering and static configuration invariants | `./tools/validate.sh --strict` |
 | `CI / Docker security` | deterministic runtime containment evidence | `./scripts/dev/docker-gate` |
 

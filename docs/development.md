@@ -123,13 +123,13 @@ The three local gate entry points corresponding to the required-gates workers ar
 
 | Gate | What it establishes | Important prerequisites |
 |---|---|---|
-| fast | pinned CUE provisioning, changed-file guard, shell lint, unit/security contracts, adapter consistency | Network access on first CUE provision, Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
+| fast | pinned CUE and Cedar provisioning, changed-file guard, shell lint, unit/security contracts, adapter consistency | Network access on first CUE or Cedar provision, Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
 | strict static | Compose rendering and static configuration/containment invariants | Docker CLI and Compose v2 |
 | Docker runtime | deterministic network, mount, secret, image, and runtime-hardening evidence | reachable Docker daemon, Compose v2, build prerequisites |
 
-The pinned CUE cache provides reproducibility and corruption detection within the trusted host
-development plane. It is not a process-isolation boundary against a hostile same-UID host process;
-host control remains outside the workload-containment guarantee in `THREAT_MODEL.md`.
+The pinned CUE and Cedar caches provide reproducibility and corruption detection within the trusted
+host development plane. They are not process-isolation boundaries against a hostile same-UID host
+process; host control remains outside the workload-containment guarantee in `THREAT_MODEL.md`.
 
 `./scripts/dev/check default full` adds strict static validation to the fast gate. It still does not
 run the Docker runtime gate.

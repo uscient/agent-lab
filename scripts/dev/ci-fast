@@ -10,4 +10,5 @@ if [ "$#" -ne 0 ]; then
 fi
 
 ./scripts/dev/cue-tool provision
+./scripts/dev/cedar-tool provision
 exec ./scripts/dev/check default quick
