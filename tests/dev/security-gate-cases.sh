@@ -214,6 +214,8 @@ fi
 expected_suites="$work/expected-fast-suites"
 cat > "$expected_suites" <<'EOF'
 lint scripts/dev/lint-scripts
+cue-tool-contract tests/dev/cue-tool-cases.sh
+cedar-tool-contract tests/dev/cedar-tool-cases.sh
 gate-contract tests/dev/security-gate-cases.sh
 gate-concurrency tests/dev/security-gate-concurrency-cases.sh
 ci-workflow-contract tests/dev/ci-workflow-cases.sh
@@ -225,6 +227,8 @@ docker-harness-contract tests/dev/docker-harness-cases.sh
 guard-command tests/guard/pretooluse-cases.sh
 guard-mount tests/guard/cases.sh
 config-authority tests/agent/config-guard.sh
+experiment-contract tests/experiment/contract-cases.sh
+experiment-authorization tests/experiment/authorization-cases.sh
 config-matrix tests/agent/config-matrix.sh
 allowlist-schema tests/agent/allowlist-cases.sh
 image-volume-policy tests/agent/image-volume-policy-cases.sh

@@ -1,0 +1,6 @@
+{
+  "apiVersion": "agent-lab/v0alpha1",
+  "kind": "Experiment",
+  "metadata": {"name": "first-experiment"},
+  "spec": {"members": []}
+}

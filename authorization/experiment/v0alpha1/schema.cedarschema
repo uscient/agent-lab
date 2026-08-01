@@ -1,0 +1,26 @@
+namespace AgentLab {
+    entity Principal = {
+        authenticated: Bool,
+        assurance: String,
+        source: String,
+    };
+
+    entity RequestedExperimentPlan = {
+        planDigest: String,
+        contractDigest: String,
+        contractVersion: String,
+        requestedName: String,
+        memberCount: Long,
+        resourceClasses: Set<String>,
+    };
+
+    action "experiment.install" appliesTo {
+        principal: [Principal],
+        resource: [RequestedExperimentPlan],
+        context: {
+            bindingVersion: String,
+            planDigest: String,
+            contractDigest: String,
+        },
+    };
+}

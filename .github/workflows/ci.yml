@@ -78,7 +78,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$CI_LOG_DIR"
-          ./scripts/dev/check default quick 2>&1 | tee "$CI_LOG_DIR/fast.log"
+          ./scripts/dev/ci-fast 2>&1 | tee "$CI_LOG_DIR/fast.log"
 
       - name: Summarize fast gate
         if: ${{ always() }}
@@ -92,7 +92,7 @@ jobs:
             printf '| Result | Diff base | Tested head |\n'
             printf '|---|---|---|\n'
             printf '| `%s` | `%s` | `%s` |\n\n' "$RESULT" "$DIFF_BASE" "$HEAD_SHA"
-            printf 'Replay: `AGENT_LAB_DIFF_BASE=%s ./scripts/dev/check default quick`\n' \
+            printf 'Replay: `AGENT_LAB_DIFF_BASE=%s ./scripts/dev/ci-fast`\n' \
               "$DIFF_BASE"
           } >> "$GITHUB_STEP_SUMMARY"
 

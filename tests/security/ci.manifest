@@ -4,6 +4,6 @@
 #   gate <needs-key> <local replay command...>
 
 version 1
-gate fast ./scripts/dev/check default quick
+gate fast ./scripts/dev/ci-fast
 gate static ./tools/validate.sh --strict
 gate docker ./scripts/dev/docker-gate

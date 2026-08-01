@@ -95,7 +95,7 @@ fi
 expected_manifest="$work/expected.manifest"
 cat > "$expected_manifest" <<'EOF'
 version 1
-gate fast ./scripts/dev/check default quick
+gate fast ./scripts/dev/ci-fast
 gate static ./tools/validate.sh --strict
 gate docker ./scripts/dev/docker-gate
 EOF
@@ -125,7 +125,7 @@ cat > "$expected_summary" <<'EOF'
 
 | Gate | Result | Local replay command |
 | --- | --- | --- |
-| `fast` | `success` | `AGENT_LAB_DIFF_BASE=1111111111111111111111111111111111111111 ./scripts/dev/check default quick` |
+| `fast` | `success` | `AGENT_LAB_DIFF_BASE=1111111111111111111111111111111111111111 ./scripts/dev/ci-fast` |
 | `static` | `success` | `./tools/validate.sh --strict` |
 | `docker` | `success` | `./scripts/dev/docker-gate` |
 
@@ -216,7 +216,7 @@ upper64="${zero64//0/A}"
 
 expected_success40="$work/exact-success-40.md"
 write_default_summary "$expected_success40" success success success \
-  "AGENT_LAB_DIFF_BASE=$base40 ./scripts/dev/check default quick" \
+  "AGENT_LAB_DIFF_BASE=$base40 ./scripts/dev/ci-fast" \
   pass "all required jobs completed successfully." "REQUIRED GATES PASS"
 exact_summary_path="$work/exact-step-summary.md"
 capture_reducer exact_success_40 "$success_json" "$exact_summary_path"
@@ -232,7 +232,7 @@ fi
 success64_json="{\"fast\":{\"result\":\"success\",\"outputs\":{\"diff-base\":\"$base64\"}},\"static\":{\"result\":\"success\"},\"docker\":{\"result\":\"success\"}}"
 expected_success64="$work/exact-success-64.md"
 write_default_summary "$expected_success64" success success success \
-  "AGENT_LAB_DIFF_BASE=$base64 ./scripts/dev/check default quick" \
+  "AGENT_LAB_DIFF_BASE=$base64 ./scripts/dev/ci-fast" \
   pass "all required jobs completed successfully." "REQUIRED GATES PASS"
 capture_reducer exact_success_64 "$success64_json"
 expect_capture_files "64-character lowercase SHA is accepted exactly" 0 \

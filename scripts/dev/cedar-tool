@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+helper="$script_dir/cedar-tool.py"
+
+command -v python3 >/dev/null 2>&1 || {
+  printf 'INFRA pinned Cedar tool requires python3\n' >&2
+  exit 125
+}
+[ -f "$helper" ] && [ ! -L "$helper" ] || {
+  printf 'INFRA pinned Cedar tool helper is missing or unsafe\n' >&2
+  exit 125
+}
+
+exec python3 -I "$helper" "$@"
