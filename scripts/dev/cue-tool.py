@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision and descriptor-execute the repository-pinned CUE release."""
+"""Provision and verified-execute the repository-pinned CUE release."""
 
 from __future__ import annotations
 
@@ -371,6 +371,35 @@ def provision(repo_root: Path, lock: Lock, key: tuple[str, str]) -> None:
     print(f"PASS provisioned CUE {lock.version} for {key[0]}/{key[1]}")
 
 
+def execute_verified(
+    descriptor: int,
+    target: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+) -> NoReturn:
+    argv = [str(target), *arguments]
+    try:
+        if os.execve in os.supports_fd:
+            os.execve(descriptor, argv, environment)
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.stat(target, follow_symlinks=False)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(descriptor_stat) != identity(path_stat):
+            raise ToolError("verified CUE binary path changed before execution")
+        os.execve(str(target), argv, environment)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    raise AssertionError("unreachable")
+
+
 def execute(repo_root: Path, lock: Lock, key: tuple[str, str], arguments: list[str]) -> NoReturn:
     root = cache_root(repo_root)
     target = binary_path(root, lock, key)
@@ -379,12 +408,7 @@ def execute(repo_root: Path, lock: Lock, key: tuple[str, str], arguments: list[s
         descriptor = verified_descriptor(parent, target.name, lock.artifacts[key].binary_sha256)
     finally:
         os.close(parent)
-    if os.execve not in os.supports_fd:
-        os.close(descriptor)
-        raise ToolError("descriptor-bound CUE execution is unsupported")
-    argv = [str(target), *arguments]
-    os.execve(descriptor, argv, os.environ.copy())
-    raise AssertionError("unreachable")
+    execute_verified(descriptor, target, arguments, os.environ.copy())
 
 
 def main(argv: list[str]) -> int:

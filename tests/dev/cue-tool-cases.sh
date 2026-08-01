@@ -195,10 +195,45 @@ except ExecObserved:
     pass
 else:
     raise AssertionError("descriptor execution was not attempted")
-assert closed == [71]
+assert closed == [71, 73]
 assert observed["target"] == 73
 assert observed["arguments"] == ["/cache/cue", "version"]
 assert observed["environment"] == {"SAFE": "1"}
+
+module = load("cue_tool_path_fallback_contract")
+target = work / "fallback-cue"
+target.write_bytes(b"reviewed fallback bytes")
+target.chmod(0o555)
+descriptor = os.open(target, os.O_RDONLY)
+observed = {}
+real_execve = module.os.execve
+real_supports_fd = module.os.supports_fd
+module.os.execve = fake_execve
+module.os.supports_fd = set()
+try:
+    module.execute_verified(descriptor, target, ["version"], {"SAFE": "1"})
+except ExecObserved:
+    pass
+else:
+    raise AssertionError("verified-path execution fallback was not attempted")
+assert observed["target"] == str(target)
+assert observed["arguments"] == [str(target), "version"]
+
+descriptor = os.open(target, os.O_RDONLY)
+replacement = work / "replacement-cue"
+replacement.write_bytes(b"substituted fallback bytes")
+replacement.chmod(0o555)
+os.replace(replacement, target)
+observed.clear()
+try:
+    module.execute_verified(descriptor, target, ["version"], {"SAFE": "1"})
+except module.ToolError:
+    pass
+else:
+    raise AssertionError("verified-path identity substitution was accepted")
+assert observed == {}
+module.os.execve = real_execve
+module.os.supports_fd = real_supports_fd
 
 module = load("cue_tool_directory_contract")
 checked = work / "checked-platform"
@@ -252,9 +287,9 @@ assert target.stat().st_mode & 0o777 == 0o555
 assert (platform_directory / ".cue.interrupted").read_bytes() == b"orphan"
 PY
 then
-  pass "execution and provisioning stay bound to checked descriptors"
+  pass "execution uses checked descriptors or the verified-inode fallback"
 else
-  fail "execution or provisioning escaped its checked descriptors"
+  fail "execution or provisioning escaped its verified binary identity"
 fi
 
 printf 'SUMMARY failures=%s\n' "$failures"
