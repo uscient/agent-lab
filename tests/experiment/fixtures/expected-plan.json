@@ -1,0 +1,28 @@
+{
+  "apiVersion": "agent-lab.request/v0alpha1",
+  "kind": "RequestedExperimentPlan",
+  "contract": {
+    "digest": "sha256:__CONTRACT_DIGEST__",
+    "name": "agent-lab.experiment",
+    "version": "v0alpha1"
+  },
+  "metadata": {
+    "requestedName": "first-experiment"
+  },
+  "spec": {
+    "members": [
+      {
+        "name": "coordinator",
+        "image": "registry.example/team/coordinator@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "command": ["serve", "--bind=0.0.0.0:8080"],
+        "resourceClass": "standard"
+      },
+      {
+        "name": "hub",
+        "image": "registry.example/team/hub@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "command": [],
+        "resourceClass": "small"
+      }
+    ]
+  }
+}

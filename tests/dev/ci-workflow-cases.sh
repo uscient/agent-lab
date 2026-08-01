@@ -8,6 +8,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 ci="$repo_root/.github/workflows/ci.yml"
 codeql="$repo_root/.github/workflows/codeql.yml"
+ci_fast="$repo_root/scripts/dev/ci-fast"
 failures=0
 
 pass() { printf 'PASS %s\n' "$1"; }
@@ -141,7 +142,7 @@ require_job_text fast '    name: Fast' "fast job has a stable display name"
 require_job_text fast '    timeout-minutes: 15' "fast job has a bounded runtime"
 require_job_text fast '      diff-base: ${{ steps.diff-base.outputs.base }}' \
   "fast job publishes its immutable base to the aggregate"
-require_job_text fast './scripts/dev/check default quick' \
+require_job_text fast './scripts/dev/ci-fast' \
   "fast job exposes the canonical local replay command"
 require_job_text fast 'git merge-base --is-ancestor "$base" HEAD' \
   "fast job proves the diff base is an ancestor"
@@ -149,6 +150,16 @@ require_job_text fast '^([0-9a-f]{40}|[0-9a-f]{64})$' \
   "fast job validates the event SHA grammar"
 require_job_text fast 'merge_group) base="$MERGE_GROUP_BASE_SHA"' \
   "fast job resolves the immutable merge-group base"
+if [ -x "$ci_fast" ] &&
+   awk '
+     /scripts\/dev\/cue-tool provision/ { provision=NR }
+     /scripts\/dev\/check default quick/ { check=NR }
+     END { exit !(provision > 0 && check > provision) }
+   ' "$ci_fast"; then
+  pass "canonical Fast replay provisions pinned CUE before the gate"
+else
+  fail "canonical Fast replay provisions pinned CUE before the gate"
+fi
 
 require_job_text static '    name: Static' "static job has a stable display name"
 require_job_text static '    timeout-minutes: 15' "static job has a bounded runtime"

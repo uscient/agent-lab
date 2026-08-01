@@ -116,16 +116,20 @@ roles.
 The three local gate entry points corresponding to the required-gates workers are:
 
 ```bash
-./scripts/dev/check default quick
+./scripts/dev/ci-fast
 ./tools/validate.sh --strict
 ./scripts/dev/docker-gate
 ```
 
 | Gate | What it establishes | Important prerequisites |
 |---|---|---|
-| fast | changed-file guard, shell lint, unit/security contracts, adapter consistency | Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
+| fast | pinned CUE provisioning, changed-file guard, shell lint, unit/security contracts, adapter consistency | Network access on first CUE provision, Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
 | strict static | Compose rendering and static configuration/containment invariants | Docker CLI and Compose v2 |
 | Docker runtime | deterministic network, mount, secret, image, and runtime-hardening evidence | reachable Docker daemon, Compose v2, build prerequisites |
+
+The pinned CUE cache provides reproducibility and corruption detection within the trusted host
+development plane. It is not a process-isolation boundary against a hostile same-UID host process;
+host control remains outside the workload-containment guarantee in `THREAT_MODEL.md`.
 
 `./scripts/dev/check default full` adds strict static validation to the fast gate. It still does not
 run the Docker runtime gate.
@@ -178,7 +182,7 @@ the kernel cannot promptly terminate are outside the cleanup guarantee.
 CI's workflow-faithful fast replay adds the immutable event base:
 
 ```bash
-AGENT_LAB_DIFF_BASE=THE_SHA_FROM_CI_SUMMARY ./scripts/dev/check default quick
+AGENT_LAB_DIFF_BASE=THE_SHA_FROM_CI_SUMMARY ./scripts/dev/ci-fast
 ```
 
 See [CI as an agent-facing gate](ci.md) for the required worker names, aggregate contract, artifacts,

@@ -1,0 +1,12 @@
+{
+  "apiVersion": "agent-lab/v0alpha1",
+  "kind": "Experiment",
+  "metadata": {"name": "first-experiment"},
+  "spec": {
+    "members": [{
+      "name": "hub",
+      "image": "registry.example/team/hub@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "environment": {"HTTP_PROXY": "http://untrusted.invalid:1"}
+    }]
+  }
+}

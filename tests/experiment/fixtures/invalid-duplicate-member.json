@@ -1,0 +1,17 @@
+{
+  "apiVersion": "agent-lab/v0alpha1",
+  "kind": "Experiment",
+  "metadata": {"name": "first-experiment"},
+  "spec": {
+    "members": [
+      {
+        "name": "hub",
+        "image": "registry.example/team/hub@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "name": "hub",
+        "image": "registry.example/team/hub@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ]
+  }
+}
