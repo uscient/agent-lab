@@ -13,7 +13,11 @@ guard="${GUARD_OVERRIDE:-$repo_root/tools/pretooluse-guard.sh}"
 infra() { printf 'INFRA %s\n' "$1" >&2; exit 125; }
 guard_git_work="$(mktemp -d)" || infra "could not create guard Git fixture"
 guard_git_repo="$guard_git_work/repo"
-cleanup() { find "$guard_git_work" -depth -delete >/dev/null 2>&1 || true; }
+guard_tmp_link="/tmp/agent-lab-guard-link-$$"
+cleanup() {
+  find "$guard_git_work" -depth -delete >/dev/null 2>&1 || true
+  find "$guard_tmp_link" -maxdepth 0 -delete >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git init -q "$guard_git_repo" \
   || infra "could not initialize guard Git fixture"
@@ -23,6 +27,28 @@ set_guard_branch() {
     || infra "could not select guard test branch $1"
 }
 set_guard_branch agent/test/guard
+
+probe_bin="$guard_git_work/process-probe-bin"
+probe_log="$guard_git_work/process-probe.log"
+mkdir -p "$probe_bin"
+cat > "$probe_bin/probe" <<'EOF'
+#!/usr/bin/env bash
+name="${0##*/}"
+printf '%s\n' "$name" >> "$AGENT_LAB_PROCESS_PROBE_LOG"
+case "$name" in
+  git) exec "$AGENT_LAB_REAL_GIT" "$@" ;;
+  grep) exec "$AGENT_LAB_REAL_GREP" "$@" ;;
+  sed) exec "$AGENT_LAB_REAL_SED" "$@" ;;
+  *) exit 127 ;;
+esac
+EOF
+chmod +x "$probe_bin/probe"
+ln -s probe "$probe_bin/git"
+ln -s probe "$probe_bin/grep"
+ln -s probe "$probe_bin/sed"
+real_git="$(command -v git)"
+real_grep="$(command -v grep)"
+real_sed="$(command -v sed)"
 
 failures=0
 pass() { printf 'PASS %s\n' "$1"; }
@@ -61,6 +87,28 @@ expect_payload() {
   printf '%s' "$payload" \
     | env AGENT_LAB_MAINTENANCE="$maint" "$guard" >/dev/null 2>&1 || rc=$?
   _check "$exp" "$name" "$rc"
+}
+expect_no_eager_helpers() {
+  local name="$1" payload="$2" rc=0
+  : > "$probe_log"
+  printf '%s' "$payload" \
+    | env -u AGENT_LAB_MAINTENANCE -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+        PATH="$probe_bin:$PATH" GIT_DIR="$guard_git_dir" \
+        AGENT_LAB_PROCESS_PROBE_LOG="$probe_log" \
+        AGENT_LAB_REAL_GIT="$real_git" AGENT_LAB_REAL_GREP="$real_grep" \
+        AGENT_LAB_REAL_SED="$real_sed" "$guard" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -s "$probe_log" ]; then
+    pass "$name"
+  else
+    fail "$name (rc=$rc eager=$(tr '\n' ',' < "$probe_log"))"
+  fi
+}
+expect_inherited_nocasematch_allow() {
+  local name="$1" cmd="$2" rc=0
+  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(jq -Rn --arg c "$cmd" '$c')" \
+    | env BASHOPTS=nocasematch GIT_DIR="$guard_git_dir" \
+        bash "$guard" >/dev/null 2>&1 || rc=$?
+  _check allow "$name" "$rc"
 }
 
 echo "== allow: local work + git (commit inversion fixed; local merge/rebase preserved) =="
@@ -218,6 +266,7 @@ expect_cmd allow "read AGENTS.md (cat)"       'cat AGENTS.md'
 echo "== false-positive fixes: data / non-write redirects (secret access remains blocked) =="
 expect_cmd allow "ls rail, stderr->null"       'ls ~/.codex 2>/dev/null'
 expect_cmd allow "cat rail, stderr->null"      'cat .claude/settings.json 2>/dev/null'
+expect_cmd allow "execute Serena rail, stdout->null" './scripts/dev/serena-smoke >/dev/null'
 expect_cmd allow "git status 2>&1"             'git status 2>&1'
 expect_cmd block "cat .env, stderr->null"      'cat .env 2>/dev/null'
 expect_cmd allow "msg mentions rail+verb"      'git commit -m "update policy/ and the guard"'
@@ -225,8 +274,32 @@ expect_cmd allow "msg mentions git push"       'git commit -m "block git push in
 expect_cmd allow "msg mentions pull"           'git commit -m "fix pull handling"'
 expect_cmd allow "msg single-quoted rail"      "git commit -m 'tidy policy/ and the guard'"
 expect_cmd allow "--message long form"         'git commit --message "discuss tee and rm in policy/"'
+expect_cmd allow "search data names forge CLI" 'rg -n "gh" README.md'
+expect_cmd allow "rail read output to tmp"      'wc -l AGENTS.md > /tmp/agent-lab-rail-count'
+
+echo "== hot-path helpers are lazy =="
+expect_no_eager_helpers "allowed command avoids git/grep/sed" \
+  '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+expect_no_eager_helpers "normal edit avoids git/grep/sed" \
+  '{"tool_name":"Edit","tool_input":{"file_path":"README.md"}}'
+
+echo "== command regexes remain linewise =="
+expect_cmd block "second-line bulk environment" $'echo ok\nprintenv'
+expect_cmd allow "newline does not join git push" $'git\npush'
+expect_cmd allow "newline does not join destructive rm" $'rm\n-rf build'
+expect_inherited_nocasematch_allow "inherited nocasematch stays case-sensitive" 'PRINTENV'
 
 echo "== false-positive fixes: MUST STILL DENY (executable / substitution / real writes) =="
+expect_cmd block "actual forge command"         'gh pr merge 1'
+expect_cmd block "quoted absolute forge command" '"/usr/bin/gh" pr merge 1'
+expect_cmd block "constructed forge command"    '"g""h" pr merge 1'
+expect_cmd block "ANSI-constructed forge command" 'g$'\''h'\'' pr merge 1'
+expect_cmd block "glob-constructed forge command" '/usr/bin/g[h] pr merge 1'
+expect_cmd block "search then forge command"    'rg -n "gh" README.md; gh pr merge 1'
+expect_cmd block "search preprocessor command"  'rg --pre "gh pr merge 1" needle README.md'
+expect_cmd block "brace search preprocessor"    'rg --p{re,re}=gh needle README.md'
+expect_cmd block "constructed preprocessor payload" 'rg --pre "g""h auth status" needle README.md'
+expect_cmd block "constructed search preprocessor" 'rg --p"re" "gh auth status" needle README.md'
 expect_cmd block "sh -c push (not a msg flag)" 'sh -c "git push"'
 expect_cmd block "bash -c push"                "bash -c 'git push'"
 expect_cmd block "eval push"                   'eval "git push"'
@@ -238,7 +311,26 @@ expect_cmd block "real rail append write"      'echo x >> AGENTS.md'
 expect_cmd block "tee rail (piped)"            'echo x | tee .claude/settings.json'
 expect_cmd block "sed -i rail"                 'sed -i s/a/b/ policy/deny.patterns'
 expect_cmd block "stderr redirected INTO rail" 'run 2> policy/err.log'
+expect_cmd block "variable redirect into rail"  'target=AGENTS.md; echo x > "$target"'
+expect_cmd block "variable fd redirect into rail" 'target=AGENTS.md; echo x 3> "$target"'
+expect_cmd block "variable all-output redirect into rail" 'target=AGENTS.md; echo x &> "$target"'
+expect_cmd block "literal fd redirect into rail" ': 3> ./AGENTS.md'
+expect_cmd block "prefixed variable fd redirect" 'target=AGENTS.md; : 3> "./$target"'
+expect_cmd block "nested fd redirect into rail"  'sh -c '\'' : 3> "$1"'\'' _ AGENTS.md'
+expect_cmd block "substituted fd redirect into rail" ': 3> "$(printf ./AGENTS.md)"'
+expect_cmd block "glob fd redirect into rail"    ': 3> ./*AGENTS.md'
+expect_cmd block "absolute fd redirect into rail" ': 3> "/home/work/projects/uscient/agent-lab/AGENTS.md"'
+expect_cmd block "quoted rail target construction" 'echo x > AGENTS"."md'
+expect_cmd block "ANSI rail target construction" 'echo x > AGENTS$'\''.md'\'''
+expect_cmd block "appended rail target construction" 'target=AGENTS; target+=.md; echo x > "$target"'
+expect_cmd block "symlink setup names rail"      'ln -sf AGENTS.md /tmp/agent-lab-rail-link'
+ln -s "$repo_root/AGENTS.md" "$guard_tmp_link" || infra "could not create rail-link fixture"
+expect_cmd block "wc tmp symlink into rail"      "wc -l AGENTS.md > $guard_tmp_link"
 expect_cmd block "real rm after stripped msg"  'git commit -m "tidy"; rm policy/x'
+
+echo "== malformed hook envelopes fail closed =="
+expect_payload block "malformed JSON" '{'
+expect_payload block "Bash missing command" '{"tool_name":"Bash","tool_input":{}}'
 
 printf '\nSUMMARY failures=%s\n' "$failures"
 [ "$failures" -eq 0 ]

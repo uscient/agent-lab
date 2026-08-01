@@ -45,7 +45,8 @@ printf 'TIMING devbox-%s=%ss\n' "$build_mode" "$((SECONDS - build_started))"
 
 suites_started="$SECONDS"
 gate_rc=0
-./scripts/dev/security-gate docker || gate_rc=$?
+AGENT_LAB_RUNTIME_INSPECT_BACKEND=python \
+  ./scripts/dev/security-gate docker || gate_rc=$?
 printf 'TIMING docker-suites=%ss total=%ss\n' \
   "$((SECONDS - suites_started))" "$((SECONDS - total_started))"
 exit "$gate_rc"

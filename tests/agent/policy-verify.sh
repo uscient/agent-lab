@@ -7,14 +7,22 @@ set -uo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 cd "$root" || exit 1
 guard="tools/pretooluse-guard.sh"
-policy_git_work="$(mktemp -d)"
+policy_git_work=""
+if ! policy_git_work="$(mktemp -d)"; then
+  printf 'INFRA policy verification cannot create isolated work directory\n' >&2
+  exit 125
+fi
 policy_git_repo="$policy_git_work/repo"
-mkdir -p "$policy_git_repo"
-git -C "$policy_git_repo" init -q
-git --git-dir="$policy_git_repo/.git" symbolic-ref HEAD refs/heads/agent/test/policy
-policy_git_dir="$policy_git_repo/.git"
+policy_render_out="$policy_git_work/render-adapters.out"
 cleanup() { find "$policy_git_work" -depth -delete >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+if ! mkdir -p "$policy_git_repo" ||
+   ! git -C "$policy_git_repo" init -q ||
+   ! git --git-dir="$policy_git_repo/.git" symbolic-ref HEAD refs/heads/agent/test/policy; then
+  printf 'INFRA policy verification cannot initialize isolated Git state\n' >&2
+  exit 125
+fi
+policy_git_dir="$policy_git_repo/.git"
 
 P=0 F=0 S=0
 pass() { printf 'PASS %s\n' "$1"; P=$((P + 1)); }
@@ -35,13 +43,6 @@ echo "== token budget =="
 n=$(wc -c < AGENTS.md)
 [ "$n" -le 6000 ] && pass "AGENTS.md <= 6000 bytes ($n)" || fail "AGENTS.md token budget ($n/6000)"
 
-echo "== guard unit matrix (delegate) =="
-if bash tests/guard/pretooluse-cases.sh >/tmp/pol_guard.out 2>&1; then
-  pass "tests/guard/pretooluse-cases.sh ($(grep -c '^PASS' /tmp/pol_guard.out) cases)"
-else
-  fail "tests/guard/pretooluse-cases.sh — see /tmp/pol_guard.out"
-fi
-
 echo "== guard-fired & adversarial stdin (string forms) =="
 for c in 'git push' 'git push --force origin HEAD' 'git push origin dev' 'git -C . push' 'sh -c "git push"' 'env git push' \
          'nohup git push &' 'python3 -c "import subprocess;subprocess.run([\"git\",\"push\"])"' \
@@ -60,9 +61,12 @@ probe_cmd allow "control: PR create to dev"      'gh pr create --base dev --titl
 
 echo "== shim adversarial (variable indirection — argv level) =="
 if [ -x tools/bin/git ]; then
-  shim_work="$(mktemp -d)"
+  shim_work="$policy_git_work/shim"
   shim_bin="$shim_work/bin"
-  mkdir -p "$shim_bin"
+  if ! mkdir -p "$shim_bin"; then
+    printf 'INFRA policy verification cannot create isolated shim state\n' >&2
+    exit 125
+  fi
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [ "${1:-}" = symbolic-ref ]; then echo agent/test/guard; exit 0; fi' \
@@ -86,7 +90,6 @@ if [ -x tools/bin/git ]; then
   [ "$rc" -eq 2 ] && pass "gh shim blocks PR mutation after global options" || fail "gh shim missed PR mutation after global options"
   rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh auth status >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks authentication access" || fail "gh shim should block auth access"
-  find "$shim_work" -depth -delete >/dev/null 2>&1 || true
 else
   skip "tools/bin/git shim missing"
 fi
@@ -114,8 +117,12 @@ fi
 echo "== generator: idempotent + valid =="
 if [ -x tools/render-adapters.sh ]; then
   jq -e . .claude/settings.json >/dev/null 2>&1 && pass "Claude settings.json valid JSON" || fail "Claude settings.json invalid JSON"
-  bash tests/agent/render-adapters-idempotence.sh >/tmp/pol_render.out 2>&1 \
-    && pass "generated adapters are idempotent" || fail "generated adapters drifted — see /tmp/pol_render.out"
+  if bash tests/agent/render-adapters-idempotence.sh >"$policy_render_out" 2>&1; then
+    pass "generated adapters are idempotent"
+  else
+    fail "generated adapters drifted"
+    sed 's/^/  /' "$policy_render_out"
+  fi
 else
   skip "tools/render-adapters.sh missing"
 fi
@@ -136,15 +143,18 @@ grep -q 'sole operating-policy source' AGENTS.md \
   && pass "AGENTS.md declares one operating-policy source" || fail "AGENTS.md lacks sole-source declaration"
 
 echo "== SessionStart: protected branches leave from dev =="
-boot_work="$(mktemp -d)"
+boot_work="$policy_git_work/boot"
 boot_repo="$boot_work/repo"
-mkdir -p "$boot_repo/tools"
-cp tools/session-bootstrap.sh "$boot_repo/tools/session-bootstrap.sh"
-git -C "$boot_repo" init -q
-git -C "$boot_repo" -c user.name=test -c user.email=test@example.invalid \
-  commit --allow-empty -qm base
-git -C "$boot_repo" branch -M dev
-git -C "$boot_repo" update-ref refs/remotes/origin/dev HEAD
+if ! mkdir -p "$boot_repo/tools" ||
+   ! cp tools/session-bootstrap.sh "$boot_repo/tools/session-bootstrap.sh" ||
+   ! git -C "$boot_repo" init -q ||
+   ! git -C "$boot_repo" -c user.name=test -c user.email=test@example.invalid \
+       commit --allow-empty -qm base ||
+   ! git -C "$boot_repo" branch -M dev ||
+   ! git -C "$boot_repo" update-ref refs/remotes/origin/dev HEAD; then
+  printf 'INFRA policy verification cannot initialize isolated bootstrap state\n' >&2
+  exit 125
+fi
 if (cd "$boot_repo" && AGENT_LAB_TASK_SLUG=policy-probe bash tools/session-bootstrap.sh test >/dev/null 2>&1) \
   && [ "$(git -C "$boot_repo" branch --show-current)" = agent/test/policy-probe ] \
   && git -C "$boot_repo" merge-base --is-ancestor refs/remotes/origin/dev HEAD; then
@@ -152,7 +162,5 @@ if (cd "$boot_repo" && AGENT_LAB_TASK_SLUG=policy-probe bash tools/session-boots
 else
   fail "SessionStart did not create the required origin/dev-based work branch"
 fi
-find "$boot_work" -depth -delete >/dev/null 2>&1 || true
-
 printf '\nSUMMARY pass=%s fail=%s skip=%s\n' "$P" "$F" "$S"
 [ "$F" -eq 0 ] && [ "$S" -eq 0 ]

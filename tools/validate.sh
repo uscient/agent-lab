@@ -23,6 +23,7 @@ if [ "$strict" -eq 1 ]; then
     compose.serena.yaml
     .serena/project.yml
     tests/agent/invariants.sh
+    tests/dev/fast-suite-isolation-cases.sh
   )
   missing_inputs=0
   for input in "${required_inputs[@]}"; do
@@ -101,6 +102,17 @@ echo ">> containment-lint"
 if [ -f tests/agent/config-guard.sh ]; then
   echo ">> tests/agent/config-guard.sh"
   bash tests/agent/config-guard.sh || rc=1
+fi
+
+if [ "$strict" -eq 1 ]; then
+  echo ">> tests/dev/fast-suite-isolation-cases.sh"
+  isolation_rc=0
+  bash tests/dev/fast-suite-isolation-cases.sh || isolation_rc=$?
+  if [ "$isolation_rc" -eq 125 ]; then
+    [ "$rc" -ne 0 ] || rc=125
+  elif [ "$isolation_rc" -ne 0 ]; then
+    rc=1
+  fi
 fi
 
 echo "----"; [ "$rc" -eq 0 ] && echo "validate: PASS" || echo "validate: FAIL"

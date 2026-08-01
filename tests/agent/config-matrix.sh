@@ -2,9 +2,43 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/bin" "$work/home" "$work/secrets"
+if ! work="$(mktemp -d)"; then
+  printf 'INFRA config matrix cannot create isolated work directory\n' >&2
+  exit 125
+fi
+agent_root="$work/agent-root"
+trap 'find "$work" -xdev -depth -delete >/dev/null 2>&1 || true' EXIT
+mkdir -p \
+  "$work/bin" "$work/home" "$work/secrets" \
+  "$agent_root/scripts/lib" "$agent_root/policies/recipes"
+cp "$repo_root/scripts/agent" "$repo_root/scripts/common" "$agent_root/scripts/"
+cp \
+  "$repo_root/scripts/lib/allowlist.sh" \
+  "$repo_root/scripts/lib/config.sh" \
+  "$repo_root/scripts/lib/domain.sh" \
+  "$repo_root/scripts/lib/egress.sh" \
+  "$repo_root/scripts/lib/guard.sh" \
+  "$repo_root/scripts/lib/image.sh" \
+  "$agent_root/scripts/lib/"
+cp "$repo_root"/policies/recipes/*.allowlist "$agent_root/policies/recipes/"
+cp \
+  "$repo_root/compose.yaml" \
+  "$repo_root/compose.egress.yaml" \
+  "$repo_root/compose.agent.yaml" \
+  "$repo_root/compose.agent.ephemeral.yaml" \
+  "$repo_root/compose.agent.persist.yaml" \
+  "$agent_root/"
+for fixture_input in \
+  scripts/agent scripts/common \
+  scripts/lib/allowlist.sh scripts/lib/config.sh scripts/lib/domain.sh \
+  scripts/lib/egress.sh scripts/lib/guard.sh scripts/lib/image.sh \
+  compose.yaml compose.egress.yaml compose.agent.yaml \
+  compose.agent.ephemeral.yaml compose.agent.persist.yaml; do
+  if [ ! -f "$agent_root/$fixture_input" ]; then
+    printf 'INFRA config matrix fixture is incomplete: %s\n' "$fixture_input" >&2
+    exit 125
+  fi
+done
 docker_log="$work/docker.log"
 
 cat > "$work/bin/docker" <<'EOF'
@@ -40,7 +74,7 @@ run_check() {
     AGENT_LAB_AGENT_GID="1000" \
     AGENT_LAB_AGENT_MEM="1g" \
     AGENT_LAB_AGENT_CPUS="1" \
-    "$@" "$repo_root/scripts/agent" --check
+    "$@" "$agent_root/scripts/agent" --check
 }
 
 empty_env="$work/empty.env"
@@ -131,7 +165,7 @@ expect_env_file() {
       AGENT_LAB_AGENT_GID="1000" \
       AGENT_LAB_AGENT_MEM="1g" \
       AGENT_LAB_AGENT_CPUS="1" \
-      "$repo_root/scripts/agent" --check 2>&1
+      "$agent_root/scripts/agent" --check 2>&1
   )" || rc=$?
   if { [ "$expected" = pass ] && [ "$rc" -eq 0 ] &&
        printf '%s\n' "$out" | grep -Fq "$marker"; } ||
@@ -267,7 +301,7 @@ out="$(
     AGENT_LAB_AGENT_GID="1000" \
     AGENT_LAB_AGENT_MEM="1g" \
     AGENT_LAB_AGENT_CPUS="1" \
-    "$repo_root/scripts/agent" --check 2>&1
+    "$agent_root/scripts/agent" --check 2>&1
 )" || rc=$?
 if [ "$rc" -eq 0 ] &&
    printf '%s\n' "$out" |
@@ -308,7 +342,7 @@ env -i \
   AGENT_LAB_AGENT_GID="1000" \
   AGENT_LAB_AGENT_MEM="1g" \
   AGENT_LAB_AGENT_CPUS="1" \
-  "$repo_root/scripts/agent" -- true >/dev/null 2>&1 || rc=$?
+  "$agent_root/scripts/agent" -- true >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 99 ] && [ -s "$docker_log" ]; then
   pass "valid normal-run configuration reaches the Docker spy"
 else
@@ -331,7 +365,7 @@ env -i \
   AGENT_LAB_AGENT_GID="1000" \
   AGENT_LAB_AGENT_MEM="1g" \
   AGENT_LAB_AGENT_CPUS="1" \
-  "$repo_root/scripts/agent" -- true >/dev/null 2>&1 || rc=$?
+  "$agent_root/scripts/agent" -- true >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 1 ] && [ ! -s "$docker_log" ]; then
   pass "malformed normal-run configuration is rejected before Docker"
 else
@@ -349,7 +383,7 @@ env -i \
   AGENT_LAB_AGENT_MEM="not-a-limit" \
   AGENT_LAB_AGENT_IMAGE="--hostile-option" \
   AGENT_LAB_PROJECT_DIR='$HOME' \
-  "$repo_root/scripts/agent" down >/dev/null 2>&1 || rc=$?
+  "$agent_root/scripts/agent" down >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 99 ] &&
    grep -Fq "compose --project-name agent-lab --env-file /dev/null" "$docker_log" &&
    grep -Fq "down" "$docker_log" &&

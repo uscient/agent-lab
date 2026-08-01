@@ -9,10 +9,11 @@ AGENT_LAB_PROJECT_IDENTITY=""
 AGENT_LAB_SECRETS_IDENTITY=""
 
 agent_lab_dir_identity() {
-  if stat -c '%d:%i' "$1" >/dev/null 2>&1; then
-    stat -c '%d:%i' "$1"
-  elif stat -f '%d:%i' "$1" >/dev/null 2>&1; then
-    stat -f '%d:%i' "$1"
+  local output
+  if output="$(stat -c '%d:%i' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
+  elif output="$(stat -f '%d:%i' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
   else
     printf 'FAIL stat with device/inode output is required\n' >&2
     return 1

@@ -44,6 +44,22 @@ if [ ! -f "$manifest" ]; then
   exit 125
 fi
 
+manifest_bytes="$(wc -c 2>/dev/null < "$manifest")" || {
+  printf 'INFRA required-gates manifest cannot be read: %s\n' "$manifest" >&2
+  exit 125
+}
+manifest_without_nul_bytes="$(
+  LC_ALL=C tr -d '\000' 2>/dev/null < "$manifest" | wc -c 2>/dev/null
+)" || {
+  printf 'INFRA required-gates manifest cannot be read: %s\n' "$manifest" >&2
+  exit 125
+}
+if [ "$manifest_bytes" -ne "$manifest_without_nul_bytes" ]; then
+  printf 'INFRA required-gates manifest contains a NUL byte: %s\n' \
+    "$manifest" >&2
+  exit 125
+fi
+
 line_no=0
 while IFS= read -r line || [ -n "$line" ]; do
   line_no=$((line_no + 1))
@@ -125,11 +141,24 @@ fast_diff_base=""
 
 markdown_escape_cell() {
   local value="$1"
-  value="${value//\\/\\\\}"
   value="${value//|/\\|}"
   value="${value//$'\r'/ }"
   value="${value//$'\n'/ }"
   printf '%s' "$value"
+}
+
+markdown_code_cell() {
+  local value fence='`'
+  value="$(markdown_escape_cell "$1")"
+  if [[ "$value" == *'`'* ]]; then
+    fence='``'
+    while [[ "$value" == *"$fence"* ]]; do
+      fence+='`'
+    done
+    printf '%s %s %s' "$fence" "$value" "$fence"
+  else
+    printf '`%s`' "$value"
+  fi
 }
 
 render_summary() {
@@ -140,8 +169,8 @@ render_summary() {
     printf '| Gate | Result | Local replay command |\n'
     printf '| --- | --- | --- |\n'
     for i in "${!gate_ids[@]}"; do
-      gate_id="$(markdown_escape_cell "${gate_ids[$i]}")"
-      result="$(markdown_escape_cell "${gate_results[$i]:-unknown}")"
+      gate_id="$(markdown_code_cell "${gate_ids[$i]}")"
+      result="$(markdown_code_cell "${gate_results[$i]:-unknown}")"
       replay="${replay_commands[$i]}"
       if [ "${gate_ids[$i]}" = "fast" ]; then
         if [ -n "$fast_diff_base" ]; then
@@ -150,8 +179,8 @@ render_summary() {
           replay="unavailable: immutable diff base did not resolve"
         fi
       fi
-      replay="$(markdown_escape_cell "$replay")"
-      printf '| `%s` | `%s` | `%s` |\n' "$gate_id" "$result" "$replay"
+      replay="$(markdown_code_cell "$replay")"
+      printf '| %s | %s | %s |\n' "$gate_id" "$result" "$replay"
     done
     printf '\nOutcome: **%s**' "$summary_outcome"
     if [ -n "$summary_detail" ]; then
@@ -162,7 +191,7 @@ render_summary() {
 
   printf '%s\n' "$summary"
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    if ! printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"; then
+    if ! { printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"; } 2>/dev/null; then
       printf 'INFRA could not append required-gates summary: %s\n' \
         "$GITHUB_STEP_SUMMARY" >&2
       return 125

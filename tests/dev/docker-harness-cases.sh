@@ -5,6 +5,7 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 gate="$repo_root/scripts/dev/security-gate"
+fast_manifest="$repo_root/tests/security/fast.manifest"
 docker_manifest="$repo_root/tests/security/docker.manifest"
 docker_lib="$repo_root/tests/docker/lib.sh"
 docker_gate="$repo_root/scripts/dev/docker-gate"
@@ -37,6 +38,7 @@ image-volume tests/docker/image-volume.sh
 wrapper-context-runtime tests/docker/wrapper-context.sh
 network-boundary tests/docker/network-boundary.sh
 dns-contract tests/docker/dns-contract.sh
+runtime-inspect-differential tests/docker/runtime-inspect-differential.sh
 runtime-hardening tests/docker/runtime-hardening.sh
 secret-nondisclosure tests/docker/secret-nondisclosure.sh
 serena-runtime tests/docker/serena-runtime.sh
@@ -49,10 +51,19 @@ else
   fail "versioned Docker gate has the exact required suite contract"
   diff -u "$expected_suites" "$actual_suites" || true
 fi
+if grep -Fxq 'tool python3' "$fast_manifest" &&
+   ! grep -Fxq 'tool timeout' "$fast_manifest" &&
+   grep -Fxq 'tool python3' "$docker_manifest" &&
+   grep -Fxq 'tool timeout' "$docker_manifest"; then
+  pass "Python is explicit for both gates while timeout stays Docker-only"
+else
+  fail "Python is explicit for both gates while timeout stays Docker-only"
+fi
 
 if [ -x "$docker_gate" ] &&
    grep -Fq "docker buildx build \\" "$docker_gate" &&
    grep -Fq "docker build \\" "$docker_gate" &&
+   grep -Fq 'AGENT_LAB_RUNTIME_INSPECT_BACKEND=python' "$docker_gate" &&
    grep -Fq './scripts/dev/security-gate docker || gate_rc=$?' "$docker_gate" &&
    grep -Fq 'exit "$gate_rc"' "$docker_gate"; then
   pass "canonical Docker replay builds the devbox before running the strict gate"
@@ -91,6 +102,8 @@ cat > "$docker_gate_fixture/scripts/dev/security-gate" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${FAKE_SECURITY_GATE_LOG:?}"
+printf 'runtime-inspect-backend=%s\n' \
+  "${AGENT_LAB_RUNTIME_INSPECT_BACKEND-<unset>}" >> "${FAKE_SECURITY_GATE_LOG:?}"
 printf 'FAKE SECURITY GATE rc=%s\n' "${FAKE_SECURITY_GATE_RC:-0}"
 exit "${FAKE_SECURITY_GATE_RC:-0}"
 EOF
@@ -143,6 +156,8 @@ if [ "$docker_gate_fixture_rc" -eq 0 ] &&
    ! grep -Eq '^(image inspect|buildx build)( |$)' \
      "$work/docker-gate-docker.log" &&
    grep -Fxq 'docker' "$work/docker-gate-security.log" &&
+   grep -Fxq 'runtime-inspect-backend=python' \
+     "$work/docker-gate-security.log" &&
    printf '%s\n' "$docker_gate_fixture_out" |
      grep -Fq 'TIMING devbox-local-build='; then
   pass "Docker gate mode 0 builds before running the security suites"
