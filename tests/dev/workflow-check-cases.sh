@@ -347,6 +347,18 @@ EOF
 expect_reject "Testing command without an observed result is rejected" "observed result" \
   pr-body "$command_only_body"
 
+status_word_command_body="$work/status-word-command-body.md"
+sed 's#`bash tests/dev/workflow-check-cases.sh` — pass.#`printf pass`#' \
+  "$good_body" > "$status_word_command_body"
+expect_reject "status word inside a command is not an observed result" "observed result" \
+  pr-body "$status_word_command_body"
+
+not_run_command_body="$work/not-run-command-body.md"
+sed "s#\`bash tests/dev/workflow-check-cases.sh\` — pass.#\`printf 'Not run — fake'\`#" \
+  "$good_body" > "$not_run_command_body"
+expect_reject "not-run text inside a command is not evidence" "observed result" \
+  pr-body "$not_run_command_body"
+
 reasonless_not_run_body="$work/reasonless-not-run-body.md"
 cat > "$reasonless_not_run_body" <<'EOF'
 ## Summary
@@ -669,7 +681,7 @@ else
   printf '%s\n' "$checker_out"
 fi
 
-expected_passes=99
+expected_passes=101
 if [ "$passes" -ne "$expected_passes" ]; then
   fail "contract executed the exact expected assertions ($passes/$expected_passes)"
 fi
