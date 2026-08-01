@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 gate="$repo_root/scripts/dev/security-gate"
+gate_helper="$repo_root/scripts/dev/security-gate.py"
 lint="$repo_root/scripts/dev/lint-scripts"
 policy_probe="$repo_root/tests/agent/policy-verify.sh"
 default_manifest="$repo_root/tests/security/fast.manifest"
@@ -47,6 +48,40 @@ expect_rc() {
   fi
 }
 
+expect_nul_manifest_failure() {
+  local name="$1" manifest="$2" rc=0
+  "$gate" --manifest "$manifest" >"$manifest.stdout" 2>"$manifest.stderr" || rc=$?
+  printf 'INFRA security-gate manifest contains a NUL byte: %s\n' "$manifest" \
+    >"$manifest.expected"
+  if [ "$rc" -eq 125 ] && [ ! -s "$manifest.stdout" ] \
+    && cmp -s "$manifest.expected" "$manifest.stderr"; then
+    pass "$name"
+  else
+    fail "$name (rc=$rc)"
+    printf '%s\n' '--- stdout ---'
+    cat "$manifest.stdout"
+    printf '%s\n' '--- stderr ---'
+    cat "$manifest.stderr"
+  fi
+}
+
+expect_invalid_utf8_manifest_failure() {
+  local name="$1" manifest="$2" rc=0
+  "$gate" --manifest "$manifest" >"$manifest.stdout" 2>"$manifest.stderr" || rc=$?
+  printf 'INFRA required manifest cannot be read: %s: invalid UTF-8\n' "$manifest" \
+    >"$manifest.expected"
+  if [ "$rc" -eq 125 ] && [ ! -s "$manifest.stdout" ] \
+    && cmp -s "$manifest.expected" "$manifest.stderr"; then
+    pass "$name"
+  else
+    fail "$name (rc=$rc)"
+    printf '%s\n' '--- stdout ---'
+    cat "$manifest.stdout"
+    printf '%s\n' '--- stderr ---'
+    cat "$manifest.stderr"
+  fi
+}
+
 policy_has_literal_guard_matrix_reference() {
   [ -r "$1" ] || return 2
   awk '
@@ -61,11 +96,87 @@ if [ ! -x "$gate" ]; then
   printf 'SUMMARY failures=%s\n' "$failures"
   exit 1
 fi
+if [ -r "$gate_helper" ]; then
+  pass "stdlib security-gate helper exists and is readable"
+else
+  fail "stdlib security-gate helper exists and is readable"
+fi
+
+wrapper_only="$work/wrapper-only"
+mkdir -p "$wrapper_only"
+cp "$gate" "$wrapper_only/security-gate"
+wrapper_only_rc=0
+wrapper_only_out="$("$wrapper_only/security-gate" --help 2>&1)" || wrapper_only_rc=$?
+if [ "$wrapper_only_rc" -eq 125 ] &&
+  printf '%s\n' "$wrapper_only_out" | grep -Fq \
+    "INFRA security-gate Python helper is unavailable: $wrapper_only/security-gate.py"; then
+  pass "stable entrypoint fails closed without its Python helper"
+else
+  fail "stable entrypoint fails closed without its Python helper (rc=$wrapper_only_rc)"
+  printf '%s\n' "$wrapper_only_out"
+fi
+
+no_python_bin="$work/no-python-bin"
+mkdir -p "$no_python_bin"
+ln -s "$(command -v bash)" "$no_python_bin/bash"
+ln -s "$(command -v dirname)" "$no_python_bin/dirname"
+no_python_rc=0
+no_python_out="$(PATH="$no_python_bin" "$gate" --help 2>&1)" || no_python_rc=$?
+if [ "$no_python_rc" -eq 125 ] &&
+  [ "$no_python_out" = "INFRA security-gate requires python3" ]; then
+  pass "stable entrypoint fails closed without python3"
+else
+  fail "stable entrypoint fails closed without python3 (rc=$no_python_rc)"
+  printf '%s\n' "$no_python_out"
+fi
+
+old_python_bin="$work/old-python-bin"
+mkdir -p "$old_python_bin"
+ln -s "$(command -v bash)" "$old_python_bin/bash"
+ln -s "$(command -v dirname)" "$old_python_bin/dirname"
+cat > "$old_python_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$old_python_bin/python3"
+old_python_rc=0
+old_python_out="$(PATH="$old_python_bin" "$gate" --help 2>&1)" || old_python_rc=$?
+if [ "$old_python_rc" -eq 125 ] &&
+  [ "$old_python_out" = "INFRA security-gate requires Python 3.11 or newer" ]; then
+  pass "stable entrypoint fails closed below Python 3.11"
+else
+  fail "stable entrypoint fails closed below Python 3.11 (rc=$old_python_rc)"
+  printf '%s\n' "$old_python_out"
+fi
+
+minimum_rc=0
+minimum_out="$({ python3 -I - "$gate_helper" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("agent_lab_security_gate", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.sys.version_info = (3, 10, 0)
+raise SystemExit(module.main([]))
+PY
+} 2>&1)" || minimum_rc=$?
+if [ "$minimum_rc" -eq 125 ] &&
+  [ "$minimum_out" = "INFRA security-gate requires Python 3.11 or newer" ]; then
+  pass "security-gate enforces its explicit Python 3.11 minimum"
+else
+  fail "security-gate enforces its explicit Python 3.11 minimum (rc=$minimum_rc)"
+  printf '%s\n' "$minimum_out"
+fi
 
 expected_suites="$work/expected-fast-suites"
 cat > "$expected_suites" <<'EOF'
 lint scripts/dev/lint-scripts
 gate-contract tests/dev/security-gate-cases.sh
+gate-concurrency tests/dev/security-gate-concurrency-cases.sh
 ci-workflow-contract tests/dev/ci-workflow-cases.sh
 required-gates-contract tests/dev/required-gates-cases.sh
 guard-diff tests/dev/guard-diff-cases.sh
@@ -116,10 +227,12 @@ required_tools=(
   mkdir
   mktemp
   mv
+  python3
   readlink
   rmdir
   sed
   shellcheck
+  sleep
   sort
   stat
   tr
@@ -154,6 +267,49 @@ tool bash
 suite fixture-pass $work/pass.sh PASS fixture
 EOF
 expect_rc 0 "all-pass manifest succeeds" "$work/pass.manifest" "SECURITY GATE PASS"
+
+for invalid_jobs in 0 5 nope; do
+  invalid_jobs_rc=0
+  invalid_jobs_out="$(
+    AGENT_LAB_SECURITY_GATE_JOBS="$invalid_jobs" \
+      "$gate" --manifest "$work/pass.manifest" 2>&1
+  )" || invalid_jobs_rc=$?
+  if [ "$invalid_jobs_rc" -eq 125 ] &&
+    [ "$invalid_jobs_out" = \
+      "INFRA AGENT_LAB_SECURITY_GATE_JOBS must be an integer from 1 through 4" ]; then
+    pass "invalid fast worker count $invalid_jobs fails closed"
+  else
+    fail "invalid fast worker count $invalid_jobs fails closed (rc=$invalid_jobs_rc)"
+    printf '%s\n' "$invalid_jobs_out"
+  fi
+done
+
+cat > "$work/cwd.sh" <<EOF
+#!/usr/bin/env bash
+if [ "\$PWD" != "$repo_root" ]; then
+  printf 'FAIL fixture cwd=%s\n' "\$PWD"
+  exit 1
+fi
+printf 'PASS fixture cwd\n'
+EOF
+chmod +x "$work/cwd.sh"
+cat > "$work/cwd.manifest" <<EOF
+tool bash
+suite fixture-cwd $work/cwd.sh PASS fixture cwd
+EOF
+foreign_cwd="$work/foreign-cwd"
+mkdir -p "$foreign_cwd"
+foreign_cwd_rc=0
+foreign_cwd_out="$(
+  cd "$foreign_cwd" && "$gate" --manifest "$work/cwd.manifest" 2>&1
+)" || foreign_cwd_rc=$?
+if [ "$foreign_cwd_rc" -eq 0 ] &&
+  printf '%s\n' "$foreign_cwd_out" | grep -Fq 'SECURITY GATE PASS'; then
+  pass "security-gate suites execute from the repository root"
+else
+  fail "security-gate suites execute from the repository root (rc=$foreign_cwd_rc)"
+  printf '%s\n' "$foreign_cwd_out"
+fi
 
 cat > "$work/empty.manifest" <<EOF
 tool bash
@@ -239,10 +395,52 @@ suite duplicate $work/pass.sh PASS fixture
 EOF
 expect_rc 125 "duplicate suite ID is infrastructure failure" "$work/duplicate.manifest" "INFRA"
 
+printf 'tool ba\0sh\nsuite fixture-pass %s PASS fixture\n' "$work/pass.sh" \
+  > "$work/nul-tool.manifest"
+expect_nul_manifest_failure \
+  "NUL in a tool entry is an exact infrastructure failure" "$work/nul-tool.manifest"
+
+printf 'tool bash\nsuite fixture-pass %s PASS\0 fixture\n' "$work/pass.sh" \
+  > "$work/nul-marker.manifest"
+expect_nul_manifest_failure \
+  "NUL in a suite marker is an exact infrastructure failure" "$work/nul-marker.manifest"
+
+printf 'tool ba\377sh\nsuite fixture-pass %s PASS fixture\n' "$work/pass.sh" \
+  > "$work/invalid-utf8.manifest"
+expect_invalid_utf8_manifest_failure \
+  "invalid UTF-8 in a manifest is an exact infrastructure failure" \
+  "$work/invalid-utf8.manifest"
+
+printf 'tool\302\240bash\nsuite fixture-pass %s PASS fixture\n' "$work/pass.sh" \
+  > "$work/nbsp-separator.manifest"
+expect_rc 125 "NBSP is not accepted as manifest field whitespace" \
+  "$work/nbsp-separator.manifest" "INFRA"
+
+printf 'tool\vbash\nsuite fixture-pass %s PASS fixture\n' "$work/pass.sh" \
+  > "$work/vertical-tab-separator.manifest"
+expect_rc 125 "vertical tab is not accepted as manifest field whitespace" \
+  "$work/vertical-tab-separator.manifest" "INFRA"
+
+printf 'tool\fbash\nsuite fixture-pass %s PASS fixture\n' "$work/pass.sh" \
+  > "$work/form-feed-separator.manifest"
+expect_rc 125 "form feed is not accepted as manifest field whitespace" \
+  "$work/form-feed-separator.manifest" "INFRA"
+
+printf 'tool\tbash \t\nsuite  fixture-pass\t%s  PASS fixture \t\n' \
+  "$work/pass.sh" > "$work/ascii-whitespace.manifest"
+expect_rc 0 "ASCII space and tab parsing retains legacy trailing-whitespace semantics" \
+  "$work/ascii-whitespace.manifest" "SECURITY GATE PASS"
+
+printf 'tool bash\r\nsuite fixture-pass %s PASS fixture\r\n' "$work/pass.sh" \
+  > "$work/crlf.manifest"
+expect_rc 125 "CRLF is not silently normalized by the manifest parser" \
+  "$work/crlf.manifest" "missing required tool"
+
 runner_repo="$work/runner-repo"
 mkdir -p "$runner_repo/scripts/dev" "$runner_repo/scripts/lib"
 cp "$repo_root/scripts/dev/test" "$runner_repo/scripts/dev/test"
 cp "$repo_root/scripts/dev/security-gate" "$runner_repo/scripts/dev/security-gate"
+cp "$repo_root/scripts/dev/security-gate.py" "$runner_repo/scripts/dev/security-gate.py"
 cp "$repo_root/scripts/dev/lint-scripts" "$runner_repo/scripts/dev/lint-scripts"
 cp "$repo_root/scripts/lib/dev-common.sh" "$runner_repo/scripts/lib/dev-common.sh"
 git -C "$runner_repo" init -q

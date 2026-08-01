@@ -23,10 +23,12 @@ tool ln
 tool mkdir
 tool mktemp
 tool mv
+tool python3
 tool readlink
 tool rmdir
 tool sed
 tool shellcheck
+tool sleep
 tool sort
 tool stat
 tool tr
@@ -35,6 +37,7 @@ tool-any sha256sum shasum
 
 suite lint scripts/dev/lint-scripts PASS lint-scripts
 suite gate-contract tests/dev/security-gate-cases.sh SUMMARY failures=0
+suite gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY failures=0
 suite ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
 suite required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
 suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0

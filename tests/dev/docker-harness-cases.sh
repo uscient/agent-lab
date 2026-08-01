@@ -51,13 +51,13 @@ else
   fail "versioned Docker gate has the exact required suite contract"
   diff -u "$expected_suites" "$actual_suites" || true
 fi
-if ! grep -Fxq 'tool python3' "$fast_manifest" &&
+if grep -Fxq 'tool python3' "$fast_manifest" &&
    ! grep -Fxq 'tool timeout' "$fast_manifest" &&
    grep -Fxq 'tool python3' "$docker_manifest" &&
    grep -Fxq 'tool timeout' "$docker_manifest"; then
-  pass "runtime-inspect pilot prerequisites remain Docker-gate-only"
+  pass "Python is explicit for both gates while timeout stays Docker-only"
 else
-  fail "runtime-inspect pilot prerequisites remain Docker-gate-only"
+  fail "Python is explicit for both gates while timeout stays Docker-only"
 fi
 
 if [ -x "$docker_gate" ] &&

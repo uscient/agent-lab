@@ -56,12 +56,57 @@ The three local gate entry points corresponding to the required-gates workers ar
 
 | Gate | What it establishes | Important prerequisites |
 |---|---|---|
-| fast | changed-file guard, shell lint, unit/security contracts, adapter consistency | Bash toolchain plus every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
+| fast | changed-file guard, shell lint, unit/security contracts, adapter consistency | Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
 | strict static | Compose rendering and static configuration/containment invariants | Docker CLI and Compose v2 |
 | Docker runtime | deterministic network, mount, secret, image, and runtime-hardening evidence | reachable Docker daemon, Compose v2, build prerequisites |
 
 `./scripts/dev/check default full` adds strict static validation to the fast gate. It still does not
 run the Docker runtime gate.
+
+The stable `scripts/dev/security-gate` Bash entrypoint uses a standard-library-only Python 3.11+
+helper to run at most four fast suites concurrently. Each suite receives only its private socket
+transmit endpoint; the parent retains the receive endpoints and emits results in manifest order, so
+completion timing cannot reorder the evidence. On Linux the parent sets and verifies
+`PR_SET_DUMPABLE=0`; inability to establish that boundary fails as infrastructure. Cross-suite
+descriptor protection still depends on host ptrace and procfs policy. This is evidence separation
+for unprivileged repository tests, not containment against permissive same-UID ptrace, root,
+`CAP_SYS_PTRACE`, equivalent process-inspection authority, or a non-Linux platform without an
+equivalent boundary.
+
+The runner rejects a suite once captured payload exceeds 8 MiB, or retained plus currently captured
+payload exceeds 32 MiB. Overflow is an infrastructure failure (`125`), stops registered groups
+immediately, and emits no transcript. These are logical payload thresholds, not hard memory
+ceilings. A receive can overshoot by one 64 KiB chunk, kernel socket buffers are outside the
+counters, and allocation, conversion, decoding, optional persistence, interpreter state, and
+temporary copies can raise RSS above 32 MiB. No `RLIMIT`, cgroup, or hard RSS cap is installed. The
+Docker security gate is always serial. For differential diagnosis, a maintainer can set
+`AGENT_LAB_SECURITY_GATE_JOBS=1` through `4` on the fast gate; values outside that bound fail as
+infrastructure, and Docker remains fixed at one worker.
+
+Result precedence is explicit: (1) a handled cancellation returns `128 + signal`, including when
+capture fails during cleanup; (2) a runner capture, persistence-integrity, or output-limit failure
+returns `125` before suite classification and emits no transcript; (3) after successful collection,
+a suite assertion or skip returns `1` and outranks suite-reported infrastructure; (4) otherwise a
+pure suite-infrastructure result returns `125`. Only an all-pass result returns `0`. A suite that
+exits zero while leaving a process-group member is recorded as infrastructure even if that member
+prints the expected marker during cleanup.
+
+Set `AGENT_LAB_SECURITY_GATE_EVIDENCE_DIR` to preserve per-suite `.out` and `.status` files for
+diagnosis. The directory must be empty so stale files cannot be mistaken for current results.
+Evidence directory identity, exclusive file creation, writes, sync, and readback fail closed as
+infrastructure errors. Preserved evidence is diagnostic: it is not immutable or an integrity
+guarantee after the runner exits, and platforms that reject directory `fsync` rely on file `fsync`
+plus exact readback. Cancellation during persistence may leave a prefix of those diagnostic files.
+
+During suite execution, cancellation by `HUP`, `INT`, `QUIT`, or `TERM` emits no partial transcript,
+sends `TERM` to every registered process group, and returns `128 + signal`. Cooperative cleanup gets
+three seconds in the fast gate and 15 seconds in the Docker gate before escalation to `KILL`; an
+active Docker preflight command gets one second. Output remains monitored during cleanup. During
+final transcript replay, already-buffered output is streamed, so cancellation can leave a transcript
+prefix even though the signal status and diagnostic remain exact. There is no automatic per-suite
+deadline; a silent hung suite requires cancellation. Direct `KILL` of the runner, descendants that
+escape the registered session or process group, privileged process-control authority, and processes
+the kernel cannot promptly terminate are outside the cleanup guarantee.
 
 CI's workflow-faithful fast replay adds the immutable event base:
 
