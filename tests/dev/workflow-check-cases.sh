@@ -98,6 +98,8 @@ expect_ok "scoped conventional subject is accepted" \
   commit "fix(ci): reject branch-derived PR titles"
 expect_ok "test-first subject is accepted" \
   commit "test(dev): define workflow metadata contract"
+expect_ok "outcome may name rejected attribution syntax" \
+  commit "Reject generated-by attribution trailers"
 expect_reject "short subject is rejected" "12 to 72" commit "Fix it"
 expect_reject "long subject is rejected" "12 to 72" commit \
   "Document a deliberately overlong workflow subject that exceeds the accepted limit now"
@@ -131,6 +133,8 @@ expect_reject "protected master is rejected" "protected" branch master
 expect_reject "protected main is rejected" "protected" branch main
 expect_reject "empty branch is rejected" "detached or empty" branch ""
 expect_reject "invalid Git ref is rejected" "invalid Git branch" branch "bad branch"
+expect_reject "generic branch name is rejected" "generic" branch work
+expect_reject "Git previous-branch syntax is rejected" "magic syntax" branch '@{-1}'
 
 echo "== pull request metadata =="
 expect_ok "outcome PR title is accepted" pr-title \
@@ -284,6 +288,29 @@ commented_body="$work/commented-body.md"
   printf '%s\n' '<!--' '## Summary' 'Not a real section.' '-->'
 } > "$commented_body"
 expect_ok "heading inside an HTML comment is ignored" pr-body "$commented_body"
+
+fully_fenced_body="$work/fully-fenced-body.md"
+{
+  printf '%s\n' '````markdown'
+  cat "$good_body"
+  printf '%s\n' '````'
+} > "$fully_fenced_body"
+expect_reject "required sections inside a four-backtick fence are ignored" \
+  "missing section: Summary" pr-body "$fully_fenced_body"
+
+nested_fence_body="$work/nested-fence-body.md"
+{
+  cat "$good_body"
+  printf '%s\n' '````markdown' '```' '## Summary' '```' '````'
+} > "$nested_fence_body"
+expect_ok "shorter fence markers do not close a four-backtick fence" \
+  pr-body "$nested_fence_body"
+
+notice_explanation_body="$work/notice-explanation-body.md"
+sed 's/Add deterministic development-workflow checks\./Remove the Important policy notice from the template./' \
+  "$good_body" > "$notice_explanation_body"
+expect_ok "prose may explain removal of the old member notice" \
+  pr-body "$notice_explanation_body"
 
 not_run_body="$work/not-run-body.md"
 cat > "$not_run_body" <<'EOF'
@@ -493,6 +520,22 @@ else
   printf '%s\n' "$checker_out"
 fi
 
+run_in_repo "$valid_repo" commits HEAD
+if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "must resolve to origin/dev"; then
+  pass "caller cannot exclude introduced commits with a HEAD base"
+else
+  fail "caller cannot exclude introduced commits with a HEAD base (rc=$checker_rc)"
+  printf '%s\n' "$checker_out"
+fi
+
+run_in_repo "$valid_repo" all HEAD
+if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "must resolve to origin/dev"; then
+  pass "all check rejects a bypassing HEAD base"
+else
+  fail "all check rejects a bypassing HEAD base (rc=$checker_rc)"
+  printf '%s\n' "$checker_out"
+fi
+
 git -C "$valid_repo" switch --detach -q
 run_in_repo "$valid_repo" branch
 if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "detached or empty"; then
@@ -501,7 +544,24 @@ else
   fail "detached checkout is rejected (rc=$checker_rc)"
   printf '%s\n' "$checker_out"
 fi
+run_in_repo "$valid_repo" pr-title "Standardize development workflow"
+if [ "$checker_rc" -eq 125 ] && printf '%s\n' "$checker_out" | grep -Fq "cannot inspect the head branch"; then
+  pass "PR title check fails as infrastructure on a detached checkout"
+else
+  fail "PR title check fails as infrastructure on a detached checkout (rc=$checker_rc)"
+  printf '%s\n' "$checker_out"
+fi
 git -C "$valid_repo" switch -q xor/workflow
+
+no_repo="$work/no-repo"
+mkdir -p "$no_repo"
+run_in_repo "$no_repo" pr-title "Standardize development workflow"
+if [ "$checker_rc" -eq 125 ] && printf '%s\n' "$checker_out" | grep -Fq "cannot inspect the head branch"; then
+  pass "PR title check fails as infrastructure outside a repository"
+else
+  fail "PR title check fails as infrastructure outside a repository (rc=$checker_rc)"
+  printf '%s\n' "$checker_out"
+fi
 
 bad_subject_repo="$work/bad-subject-repo"
 make_repo "$bad_subject_repo"
@@ -583,6 +643,42 @@ if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "invalid c
   pass "invalid non-merge side commit is scanned"
 else
   fail "invalid non-merge side commit is scanned (rc=$checker_rc)"
+  printf '%s\n' "$checker_out"
+fi
+
+replacement_repo="$work/replacement-repo"
+make_repo "$replacement_repo"
+commit_file "$replacement_repo" "Dev"
+replacement_bad="$(git -C "$replacement_repo" rev-parse HEAD)"
+replacement_base="$(git -C "$replacement_repo" rev-parse origin/dev)"
+replacement_tree="$(git -C "$replacement_repo" show -s --format=%T "$replacement_bad")"
+replacement_good="$(printf '%s\n' 'Implement workflow metadata checks' | \
+  git -C "$replacement_repo" commit-tree "$replacement_tree" -p "$replacement_base")"
+git -C "$replacement_repo" replace "$replacement_bad" "$replacement_good"
+run_in_repo "$replacement_repo" commits origin/dev
+if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "invalid commit subject"; then
+  pass "Git replacement objects cannot mask introduced metadata"
+else
+  fail "Git replacement objects cannot mask introduced metadata (rc=$checker_rc)"
+  printf '%s\n' "$checker_out"
+fi
+
+trailer_prose_repo="$work/trailer-prose-repo"
+make_repo "$trailer_prose_repo"
+printf 'trailer prose\n' >> "$trailer_prose_repo/file.txt"
+git -C "$trailer_prose_repo" add file.txt
+git -C "$trailer_prose_repo" commit -q -F - <<'EOF'
+Implement workflow metadata checks
+
+Generated-by: prose example
+
+This paragraph makes the example part of the body rather than a trailer block.
+EOF
+run_in_repo "$trailer_prose_repo" commits origin/dev
+if [ "$checker_rc" -eq 0 ] && printf '%s\n' "$checker_out" | grep -Fq "commits=1"; then
+  pass "trailer-shaped explanatory prose is not attribution"
+else
+  fail "trailer-shaped explanatory prose is not attribution (rc=$checker_rc)"
   printf '%s\n' "$checker_out"
 fi
 
@@ -681,7 +777,7 @@ else
   printf '%s\n' "$checker_out"
 fi
 
-expected_passes=101
+expected_passes=113
 if [ "$passes" -ne "$expected_passes" ]; then
   fail "contract executed the exact expected assertions ($passes/$expected_passes)"
 fi
