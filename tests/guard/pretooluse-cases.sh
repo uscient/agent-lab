@@ -266,6 +266,7 @@ expect_cmd allow "read AGENTS.md (cat)"       'cat AGENTS.md'
 echo "== false-positive fixes: data / non-write redirects (secret access remains blocked) =="
 expect_cmd allow "ls rail, stderr->null"       'ls ~/.codex 2>/dev/null'
 expect_cmd allow "cat rail, stderr->null"      'cat .claude/settings.json 2>/dev/null'
+expect_cmd allow "execute Serena rail, stdout->null" './scripts/dev/serena-smoke >/dev/null'
 expect_cmd allow "git status 2>&1"             'git status 2>&1'
 expect_cmd block "cat .env, stderr->null"      'cat .env 2>/dev/null'
 expect_cmd allow "msg mentions rail+verb"      'git commit -m "update policy/ and the guard"'

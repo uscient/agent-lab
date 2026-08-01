@@ -285,15 +285,15 @@ is_nonexecuting_search_data() {
   return 0
 }
 
-# unsafe_protected_write_redirect <command>: true for every file-write redirect except the exact
-# demonstrated false positive: one direct wc read writing to one literal /tmp file. Keeping this
-# exemption narrow preserves fail-closed handling for dynamic targets, pipelines, and extra commands.
+# unsafe_protected_write_redirect <command>: true for every file-write redirect except literal
+# /dev/null sinks and the exact demonstrated wc-to-/tmp false positive. Keeping these exemptions
+# narrow preserves fail-closed handling for dynamic targets, pipelines, and extra commands.
 unsafe_protected_write_redirect() {
   local s="$1" stripped target
   local wc_tmp_re="^[[:space:]]*wc([[:space:]]+-[[:alnum:]]+)*[[:space:]]+[^[:space:]\"'<>]+[[:space:]]+>[[:space:]]*[\"']?/tmp/[A-Za-z0-9._-]+[\"']?[[:space:]]*$"
   stripped="$(
     printf '%s' "$s" \
-      | sed -E "s#(^|[[:space:]])[0-9]+>>?[[:space:]]*${q}?/dev/null${q}?#\\1#g; s/(^|[[:space:]])[0-9]+>\&[0-9-]+/\\1/g"
+      | sed -E "s#(^|[[:space:]])[0-9]*>>?[[:space:]]*${q}?/dev/null${q}?#\\1#g; s/(^|[[:space:]])[0-9]+>\&[0-9-]+/\\1/g"
   )"
   case "$stripped" in *'>'*) ;; *) return 1 ;; esac
   case "$stripped" in *';'* | *'&'* | *'|'* | *'`'* | *'$'* | *'<'* | *'('* | *')'*) return 0 ;; esac
