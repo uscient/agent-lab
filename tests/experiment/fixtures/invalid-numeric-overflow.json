@@ -1,0 +1,10 @@
+{
+  "apiVersion": "agent-lab/v0alpha1",
+  "kind": "Experiment",
+  "metadata": {"name": "first-experiment"},
+  "spec": {
+    "members": [
+      {"name": "agent", "image": "agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "command": [1e400]}
+    ]
+  }
+}
