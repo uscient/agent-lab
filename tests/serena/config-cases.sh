@@ -160,7 +160,7 @@ case "${1:-}" in
     # The old launcher first performs one unformatted existence probe.
     [ "${3:-}" = --format ] || exit 0
     format="${4:-}"
-    expected_format='{{json .Id}}{{println}}{{json (index .Config.Labels "org.agent-lab.serena.ref")}}{{println}}{{json .Config.Volumes}}'
+    expected_format='{{json .Id}}{{println}}{{json (index .Config.Labels "org.agent-lab.serena.ref")}}{{println}}{{json (index .Config "Volumes")}}'
     if [ "$format" = "$expected_format" ]; then
       printf '%s\n%s\n%s\n' \
         "$(jq -Rn --arg value "${FAKE_IMAGE_ID:?}" '$value')" \

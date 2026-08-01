@@ -38,7 +38,7 @@ docker compose version >/dev/null 2>&1 || {
 
 image_metadata="$({
   docker image inspect \
-    --format '{{json .Id}}{{println}}{{json (index .Config.Labels "org.agent-lab.serena.ref")}}{{println}}{{json .Config.Volumes}}' \
+    --format '{{json .Id}}{{println}}{{json (index .Config.Labels "org.agent-lab.serena.ref")}}{{println}}{{json (index .Config "Volumes")}}' \
     "$AGENT_LAB_SERENA_TAG"
 } 2>/dev/null)" || {
   printf 'Serena MCP: cannot inspect image metadata; image may be missing; run ./scripts/dev/serena-build\n' >&2
