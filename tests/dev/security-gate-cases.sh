@@ -219,6 +219,8 @@ gate-concurrency tests/dev/security-gate-concurrency-cases.sh
 ci-workflow-contract tests/dev/ci-workflow-cases.sh
 required-gates-contract tests/dev/required-gates-cases.sh
 guard-diff tests/dev/guard-diff-cases.sh
+workflow-metadata tests/dev/workflow-check-cases.sh
+coordination tests/dev/coord-cases.sh
 docker-harness-contract tests/dev/docker-harness-cases.sh
 guard-command tests/guard/pretooluse-cases.sh
 guard-mount tests/guard/cases.sh

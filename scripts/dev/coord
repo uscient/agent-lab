@@ -1,0 +1,737 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+command_name="${0##*/}"
+lock_held=0
+lock_dir=""
+
+release_lock() {
+  if ((lock_held == 1)); then
+    if [[ -f "$lock_dir/pid" && ! -L "$lock_dir/pid" ]]; then
+      find "$lock_dir/pid" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    fi
+    rmdir -- "$lock_dir" >/dev/null 2>&1 || true
+    lock_held=0
+  fi
+}
+
+unexpected_error() {
+  local rc="$1"
+  local line="$2"
+
+  release_lock
+  printf 'INFRA %s unexpected failure rc=%d line=%s\n' \
+    "$command_name" "$rc" "$line" >&2
+  exit 125
+}
+
+trap release_lock EXIT
+trap 'unexpected_error "$?" "$LINENO"' ERR
+
+fail() {
+  printf 'FAIL %s %s\n' "$command_name" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<EOF
+Usage:
+  $command_name init <coordinator>
+  $command_name claim <actor> <task> --read-only
+  $command_name claim <actor> <task> --write <path> [<path> ...]
+  $command_name handoff <actor> <task> <done|blocked> <summary-file>
+  $command_name advance <coordinator>
+  $command_name recover <coordinator>
+  $command_name resolve <coordinator> <task>
+  $command_name status
+  $command_name close <coordinator>
+EOF
+  exit 2
+}
+
+infra() {
+  printf 'INFRA %s %s\n' "$command_name" "$*" >&2
+  exit 125
+}
+
+git_output() {
+  local description="$1"
+  shift
+  local output
+
+  if ! output="$(git "$@" 2>/dev/null)"; then
+    infra "cannot determine $description"
+  fi
+  printf '%s\n' "$output"
+}
+
+repo_root="$(git_output 'repository root' rev-parse --show-toplevel)"
+if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
+  infra "repository root is unavailable"
+fi
+if ! cd -- "$repo_root"; then
+  infra "cannot enter repository root"
+fi
+if ! repo_root="$(pwd -P)"; then
+  infra "cannot resolve the physical repository root"
+fi
+
+if [[ -v AGENT_LAB_COORD_ROOT ]]; then
+  state_root="$AGENT_LAB_COORD_ROOT"
+  if [[ "$state_root" != /* ]]; then
+    fail "coordination root override must be absolute"
+  fi
+else
+  state_root="$repo_root/.cache/dev/coord"
+fi
+if [[ -z "$state_root" || "$state_root" == "/" || "$state_root" == */ || \
+  "$state_root" == *//* || "$state_root" =~ [[:cntrl:]] ]]; then
+  fail "coordination root is unsafe"
+fi
+case "/${state_root#/}/" in
+  */./* | */../*)
+    fail "coordination root must not contain dot traversal"
+    ;;
+esac
+case "$state_root" in
+  "$repo_root/.cache/dev/coord" | "$repo_root/.cache/dev/coord/"*) ;;
+  "$repo_root" | "$repo_root/"*)
+    fail "coordination state inside the checkout must stay under .cache/dev/coord"
+    ;;
+esac
+
+assert_no_symlink_components() {
+  local remainder="${state_root#/}"
+  local component
+  local current=""
+  local -a components=()
+
+  IFS='/' read -r -a components <<<"$remainder"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="$current/$component"
+    if [[ -L "$current" ]]; then
+      fail "coordination root cannot contain symlink components"
+    fi
+  done
+}
+
+assert_no_symlink_components
+lock_dir="${state_root%/}/.lock"
+
+validate_label() {
+  local kind="$1"
+  local value="$2"
+
+  if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    fail "$kind label is invalid: $value"
+  fi
+}
+
+validate_write_path() {
+  local path="$1"
+
+  if [[ -z "$path" || "$path" == /* || "$path" == "." || \
+    "$path" == */ || "$path" == *//* || \
+    "$path" =~ [[:cntrl:]] ]]; then
+    fail "write path must be a clean repository-relative path: $path"
+  fi
+
+  case "/$path/" in
+    */./* | */../*)
+      fail "write path cannot contain dot traversal: $path"
+      ;;
+  esac
+}
+
+ensure_state_root() {
+  assert_no_symlink_components
+  if [[ -L "$state_root" ]]; then
+    fail "coordination root cannot be a symlink"
+  fi
+  if [[ -e "$state_root" && ! -d "$state_root" ]]; then
+    fail "coordination root must be a directory"
+  fi
+  if [[ ! -e "$state_root" ]]; then
+    if ! mkdir -p -- "$state_root"; then
+      infra "cannot create coordination root"
+    fi
+  fi
+  assert_no_symlink_components
+  if [[ -L "$state_root" || ! -d "$state_root" ]]; then
+    fail "coordination root is not a safe directory"
+  fi
+}
+
+assert_state_tree_safe() {
+  local symlink
+
+  if [[ -L "$state_root" || ! -d "$state_root" ]]; then
+    fail "coordination root is not a safe directory"
+  fi
+  if ! symlink="$(find -P "$state_root" -type l -print -quit 2>/dev/null)"; then
+    infra "cannot inspect coordination state"
+  fi
+  if [[ -n "$symlink" ]]; then
+    fail "coordination state cannot contain symlinks"
+  fi
+}
+
+acquire_lock() {
+  local attempt
+
+  ensure_state_root
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    if mkdir -- "$lock_dir" 2>/dev/null; then
+      lock_held=1
+      write_state_line "$lock_dir/pid" "$$"
+      assert_state_tree_safe
+      return
+    fi
+    if [[ -L "$state_root" || ! -d "$state_root" ]]; then
+      fail "coordination root changed while acquiring its lock"
+    fi
+    sleep 0.01
+  done
+  infra "coordination state is locked"
+}
+
+read_state_line() {
+  local file="$1"
+  local description="$2"
+  local -a lines=()
+
+  if [[ -L "$file" || ! -f "$file" ]]; then
+    fail "coordination state is missing $description"
+  fi
+  if ! mapfile -t lines <"$file"; then
+    infra "cannot read $description"
+  fi
+  if ((${#lines[@]} != 1)) || [[ -z "${lines[0]}" ]]; then
+    fail "coordination state has invalid $description"
+  fi
+  printf '%s\n' "${lines[0]}"
+}
+
+write_state_line() {
+  local file="$1"
+  local value="$2"
+
+  if ! printf '%s\n' "$value" >"$file"; then
+    infra "cannot write coordination state"
+  fi
+}
+
+require_active_session() {
+  if [[ -L "$state_root/current" || ! -d "$state_root/current" ]]; then
+    fail "no active coordination session"
+  fi
+  if [[ -L "$state_root/current/meta" || \
+    ! -d "$state_root/current/meta" || \
+    -L "$state_root/current/tasks" || \
+    ! -d "$state_root/current/tasks" || \
+    -L "$state_root/current/resolved" || \
+    ! -d "$state_root/current/resolved" ]]; then
+    fail "active coordination session is invalid"
+  fi
+}
+
+current_branch() {
+  local branch
+
+  branch="$(git_output 'current branch' branch --show-current)"
+  if [[ -z "$branch" ]]; then
+    fail "detached HEAD cannot anchor a coordination session"
+  fi
+  printf '%s\n' "$branch"
+}
+
+current_head() {
+  git_output 'current HEAD' rev-parse --verify 'HEAD^{commit}'
+}
+
+verify_session_pin() {
+  local stored_repo
+  local stored_branch
+  local stored_head
+  local actual_branch
+  local actual_head
+
+  require_active_session
+  stored_repo="$(read_state_line \
+    "$state_root/current/meta/repository" 'repository pin')"
+  stored_branch="$(read_state_line \
+    "$state_root/current/meta/branch" 'branch pin')"
+  stored_head="$(read_state_line \
+    "$state_root/current/meta/head" 'HEAD pin')"
+
+  if [[ "$stored_repo" != "$repo_root" ]]; then
+    fail "coordination session belongs to a different repository"
+  fi
+  actual_branch="$(current_branch)"
+  actual_head="$(current_head)"
+  if [[ "$actual_branch" != "$stored_branch" ]]; then
+    fail "current branch drifted from coordination session"
+  fi
+  if [[ "$actual_head" != "$stored_head" ]]; then
+    fail "current HEAD drifted from coordination session"
+  fi
+}
+
+verify_session_branch() {
+  local stored_repo
+  local stored_branch
+  local actual_branch
+
+  require_active_session
+  stored_repo="$(read_state_line \
+    "$state_root/current/meta/repository" 'repository pin')"
+  stored_branch="$(read_state_line \
+    "$state_root/current/meta/branch" 'branch pin')"
+  if [[ "$stored_repo" != "$repo_root" ]]; then
+    fail "coordination session belongs to a different repository"
+  fi
+  actual_branch="$(current_branch)"
+  if [[ "$actual_branch" != "$stored_branch" ]]; then
+    fail "current branch drifted from coordination session"
+  fi
+}
+
+paths_conflict() {
+  local left="$1"
+  local right="$2"
+
+  [[ "$left" == "$right" || "$left" == "$right/"* || \
+    "$right" == "$left/"* ]]
+}
+
+check_write_conflicts() {
+  local candidate
+  local task_dir
+  local mode
+  local claimed
+
+  for candidate in "$@"; do
+    for task_dir in "$state_root/current/tasks"/[A-Za-z0-9]*; do
+      [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+      mode="$(read_state_line "$task_dir/mode" 'task mode')"
+      [[ "$mode" == "write" ]] || continue
+      if [[ -L "$task_dir/paths" || ! -f "$task_dir/paths" ]]; then
+        fail "coordination state has invalid task paths"
+      fi
+      while IFS= read -r claimed || [[ -n "$claimed" ]]; do
+        if paths_conflict "$candidate" "$claimed"; then
+          fail "write path conflicts with active task: $candidate"
+        fi
+      done <"$task_dir/paths"
+    done
+  done
+}
+
+init_session() {
+  local coordinator="$1"
+  local branch
+  local head
+  local staging
+
+  validate_label "coordinator" "$coordinator"
+  branch="$(current_branch)"
+  head="$(current_head)"
+  acquire_lock
+  if [[ -e "$state_root/current" || -L "$state_root/current" ]]; then
+    fail "an active coordination session already exists"
+  fi
+  if [[ -L "$state_root/archive" ]]; then
+    fail "coordination archive cannot be a symlink"
+  fi
+  if ! mkdir -p -- "$state_root/archive"; then
+    infra "cannot create coordination archive"
+  fi
+  if ! staging="$(mktemp -d "$state_root/.init.XXXXXX")"; then
+    infra "cannot stage coordination session"
+  fi
+  if ! mkdir -- "$staging/meta" "$staging/tasks" "$staging/resolved"; then
+    infra "cannot create coordination session"
+  fi
+  write_state_line "$staging/meta/coordinator" "$coordinator"
+  write_state_line "$staging/meta/repository" "$repo_root"
+  write_state_line "$staging/meta/branch" "$branch"
+  write_state_line "$staging/meta/head" "$head"
+  if ! mv -- "$staging" "$state_root/current"; then
+    infra "cannot activate coordination session"
+  fi
+  printf 'PASS %s initialized coordinator=%s branch=%s head=%s\n' \
+    "$command_name" "$coordinator" "$branch" "$head"
+}
+
+claim_task() {
+  local actor="$1"
+  local task="$2"
+  local mode="$3"
+  shift 3
+  local -a paths=("$@")
+  local path
+  local other
+  local staging
+
+  validate_label "actor" "$actor"
+  validate_label "task" "$task"
+  case "$mode" in
+    read-only)
+      if ((${#paths[@]} != 0)); then
+        usage
+      fi
+      ;;
+    write)
+      if ((${#paths[@]} == 0)); then
+        usage
+      fi
+      for path in "${paths[@]}"; do
+        validate_write_path "$path"
+      done
+      for ((other = 0; other < ${#paths[@]}; other++)); do
+        for ((path = other + 1; path < ${#paths[@]}; path++)); do
+          if paths_conflict "${paths[other]}" "${paths[path]}"; then
+            fail "a task cannot claim overlapping write paths"
+          fi
+        done
+      done
+      ;;
+    *)
+      usage
+      ;;
+  esac
+
+  acquire_lock
+  verify_session_pin
+  if [[ -e "$state_root/current/tasks/$task" || \
+    -L "$state_root/current/tasks/$task" || \
+    -e "$state_root/current/resolved/$task" || \
+    -L "$state_root/current/resolved/$task" ]]; then
+    fail "task identifier is already in use: $task"
+  fi
+  if [[ "$mode" == "write" ]]; then
+    check_write_conflicts "${paths[@]}"
+  fi
+
+  if ! staging="$(mktemp -d \
+    "$state_root/current/tasks/.claim.XXXXXX")"; then
+    infra "cannot stage task claim"
+  fi
+  write_state_line "$staging/actor" "$actor"
+  write_state_line "$staging/mode" "$mode"
+  if [[ "$mode" == "write" ]]; then
+    if ! printf '%s\n' "${paths[@]}" >"$staging/paths"; then
+      infra "cannot write task paths"
+    fi
+  fi
+  if ! mv -- "$staging" "$state_root/current/tasks/$task"; then
+    infra "cannot activate task claim"
+  fi
+  printf 'PASS %s claimed task=%s actor=%s mode=%s\n' \
+    "$command_name" "$task" "$actor" "$mode"
+}
+
+handoff_task() {
+  local actor="$1"
+  local task="$2"
+  local status="$3"
+  local summary="$4"
+  local owner
+  local task_dir
+  local staging
+
+  validate_label "actor" "$actor"
+  validate_label "task" "$task"
+  if [[ "$status" != "done" && "$status" != "blocked" ]]; then
+    fail "handoff status must be done or blocked"
+  fi
+  if [[ -L "$summary" || ! -f "$summary" ]]; then
+    fail "handoff summary must be a regular file"
+  fi
+
+  acquire_lock
+  verify_session_pin
+  task_dir="$state_root/current/tasks/$task"
+  if [[ -L "$task_dir" || ! -d "$task_dir" ]]; then
+    fail "task is not active: $task"
+  fi
+  owner="$(read_state_line "$task_dir/actor" 'task actor')"
+  if [[ "$owner" != "$actor" ]]; then
+    fail "only the claiming actor may hand off task: $task"
+  fi
+  if [[ -e "$task_dir/handoff" || -L "$task_dir/handoff" ]]; then
+    fail "task already has a handoff: $task"
+  fi
+  if ! staging="$(mktemp -d "$task_dir/.handoff.XXXXXX")"; then
+    infra "cannot stage task handoff"
+  fi
+  if ! cp -- "$summary" "$staging/summary"; then
+    infra "cannot copy task handoff summary"
+  fi
+  write_state_line "$staging/status" "$status"
+  if ! mv -- "$staging" "$task_dir/handoff"; then
+    infra "cannot activate task handoff"
+  fi
+  printf 'PASS %s handed-off task=%s actor=%s status=%s\n' \
+    "$command_name" "$task" "$actor" "$status"
+}
+
+advance_session() {
+  local coordinator="$1"
+  local expected
+  local task_dir
+  local head
+  local staged_head
+
+  validate_label "coordinator" "$coordinator"
+  acquire_lock
+  verify_session_branch
+  expected="$(read_state_line \
+    "$state_root/current/meta/coordinator" 'coordinator')"
+  if [[ "$coordinator" != "$expected" ]]; then
+    fail "only the named coordinator may advance the HEAD pin"
+  fi
+  for task_dir in "$state_root/current/tasks"/[A-Za-z0-9]*; do
+    [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+    if [[ -L "$task_dir/handoff" || ! -d "$task_dir/handoff" ]]; then
+      fail "every active task must hand off before advancing the HEAD pin"
+    fi
+  done
+  head="$(current_head)"
+  if ! staged_head="$(mktemp \
+    "$state_root/current/meta/.head.XXXXXX")"; then
+    infra "cannot stage the new HEAD pin"
+  fi
+  write_state_line "$staged_head" "$head"
+  if ! mv -- "$staged_head" "$state_root/current/meta/head"; then
+    infra "cannot advance the HEAD pin"
+  fi
+  printf 'PASS %s advanced coordinator=%s head=%s\n' \
+    "$command_name" "$coordinator" "$head"
+}
+
+recover_lock() {
+  local coordinator="$1"
+  local expected
+  local owner_pid=""
+  local unexpected_entry
+
+  validate_label "coordinator" "$coordinator"
+  ensure_state_root
+  assert_state_tree_safe
+  if [[ -L "$lock_dir" || ! -d "$lock_dir" ]]; then
+    fail "no coordination lock is available for recovery"
+  fi
+  if [[ -d "$state_root/current" && ! -L "$state_root/current" ]]; then
+    verify_session_branch
+    expected="$(read_state_line \
+      "$state_root/current/meta/coordinator" 'coordinator')"
+    if [[ "$coordinator" != "$expected" ]]; then
+      fail "only the named coordinator may recover the session lock"
+    fi
+  elif [[ -e "$state_root/current" || -L "$state_root/current" ]]; then
+    fail "active coordination session is invalid"
+  fi
+
+  if [[ -e "$lock_dir/pid" || -L "$lock_dir/pid" ]]; then
+    owner_pid="$(read_state_line "$lock_dir/pid" 'lock owner PID')"
+    if [[ ! "$owner_pid" =~ ^[1-9][0-9]*$ ]]; then
+      fail "coordination lock has an invalid owner PID"
+    fi
+    if kill -0 "$owner_pid" 2>/dev/null; then
+      fail "coordination lock owner still appears active: $owner_pid"
+    fi
+  fi
+  if ! unexpected_entry="$(find -P "$lock_dir" -mindepth 1 -maxdepth 1 \
+    ! -name pid -print -quit 2>/dev/null)"; then
+    infra "cannot inspect the coordination lock"
+  fi
+  if [[ -n "$unexpected_entry" ]]; then
+    fail "coordination lock contains unexpected state"
+  fi
+  if [[ -f "$lock_dir/pid" && ! -L "$lock_dir/pid" ]]; then
+    if ! find "$lock_dir/pid" -maxdepth 0 -delete; then
+      infra "cannot remove the stale lock owner record"
+    fi
+  fi
+  if ! rmdir -- "$lock_dir"; then
+    infra "cannot remove the stale coordination lock"
+  fi
+  printf 'PASS %s recovered coordinator=%s\n' \
+    "$command_name" "$coordinator"
+}
+
+resolve_task() {
+  local coordinator="$1"
+  local task="$2"
+  local expected
+  local task_dir
+
+  validate_label "coordinator" "$coordinator"
+  validate_label "task" "$task"
+  acquire_lock
+  verify_session_pin
+  expected="$(read_state_line \
+    "$state_root/current/meta/coordinator" 'coordinator')"
+  if [[ "$coordinator" != "$expected" ]]; then
+    fail "only the named coordinator may resolve tasks"
+  fi
+  task_dir="$state_root/current/tasks/$task"
+  if [[ -L "$task_dir" || ! -d "$task_dir" ]]; then
+    fail "task is not active: $task"
+  fi
+  if [[ -L "$task_dir/handoff" || ! -d "$task_dir/handoff" ]]; then
+    fail "task must be handed off before resolution: $task"
+  fi
+  if [[ -e "$state_root/current/resolved/$task" || \
+    -L "$state_root/current/resolved/$task" ]]; then
+    fail "resolved task already exists: $task"
+  fi
+  if ! mv -- "$task_dir" "$state_root/current/resolved/$task"; then
+    infra "cannot resolve task"
+  fi
+  printf 'PASS %s resolved task=%s coordinator=%s\n' \
+    "$command_name" "$task" "$coordinator"
+}
+
+status_session() {
+  local coordinator
+  local branch
+  local head
+  local task_dir
+  local task
+  local actor
+  local mode
+  local state
+  local -a task_ids=()
+
+  acquire_lock
+  verify_session_pin
+  coordinator="$(read_state_line \
+    "$state_root/current/meta/coordinator" 'coordinator')"
+  branch="$(read_state_line "$state_root/current/meta/branch" 'branch pin')"
+  head="$(read_state_line "$state_root/current/meta/head" 'HEAD pin')"
+  printf 'SESSION coordinator=%s branch=%s head=%s\n' \
+    "$coordinator" "$branch" "$head"
+
+  for task_dir in "$state_root/current/tasks"/[A-Za-z0-9]*; do
+    [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+    task_ids+=("${task_dir##*/}")
+  done
+  if ((${#task_ids[@]} > 0)); then
+    if ! mapfile -t task_ids < <(
+      printf '%s\n' "${task_ids[@]}" | LC_ALL=C sort
+    ); then
+      infra "cannot sort coordination tasks"
+    fi
+  fi
+  for task in "${task_ids[@]}"; do
+    task_dir="$state_root/current/tasks/$task"
+    actor="$(read_state_line "$task_dir/actor" 'task actor')"
+    mode="$(read_state_line "$task_dir/mode" 'task mode')"
+    state="active"
+    if [[ -d "$task_dir/handoff" && ! -L "$task_dir/handoff" ]]; then
+      state="$(read_state_line "$task_dir/handoff/status" \
+        'handoff status')"
+    fi
+    printf 'TASK id=%s actor=%s mode=%s state=%s\n' \
+      "$task" "$actor" "$mode" "$state"
+  done
+}
+
+close_session() {
+  local coordinator="$1"
+  local expected
+  local task_dir
+  local archive_number=1
+  local archive_destination
+
+  validate_label "coordinator" "$coordinator"
+  acquire_lock
+  verify_session_pin
+  expected="$(read_state_line \
+    "$state_root/current/meta/coordinator" 'coordinator')"
+  if [[ "$coordinator" != "$expected" ]]; then
+    fail "only the named coordinator may close the session"
+  fi
+  for task_dir in "$state_root/current/tasks"/[A-Za-z0-9]*; do
+    if [[ -d "$task_dir" && ! -L "$task_dir" ]]; then
+      fail "cannot close a session with unresolved tasks"
+    fi
+  done
+  while :; do
+    printf -v archive_destination '%s/archive/%06d' \
+      "$state_root" "$archive_number"
+    if [[ ! -e "$archive_destination" && \
+      ! -L "$archive_destination" ]]; then
+      break
+    fi
+    archive_number=$((archive_number + 1))
+  done
+  if ! mv -- "$state_root/current" "$archive_destination"; then
+    infra "cannot archive coordination session"
+  fi
+  printf 'PASS %s closed coordinator=%s archive=%06d\n' \
+    "$command_name" "$coordinator" "$archive_number"
+}
+
+if (($# == 0)); then
+  usage
+fi
+
+subcommand="$1"
+shift
+case "$subcommand" in
+  init)
+    (($# == 1)) || usage
+    init_session "$1"
+    ;;
+  claim)
+    (($# >= 3)) || usage
+    actor="$1"
+    task="$2"
+    claim_kind="$3"
+    shift 3
+    case "$claim_kind" in
+      --read-only)
+        (($# == 0)) || usage
+        claim_task "$actor" "$task" read-only
+        ;;
+      --write)
+        (($# >= 1)) || usage
+        claim_task "$actor" "$task" write "$@"
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ;;
+  handoff)
+    (($# == 4)) || usage
+    handoff_task "$1" "$2" "$3" "$4"
+    ;;
+  advance)
+    (($# == 1)) || usage
+    advance_session "$1"
+    ;;
+  recover)
+    (($# == 1)) || usage
+    recover_lock "$1"
+    ;;
+  resolve)
+    (($# == 2)) || usage
+    resolve_task "$1" "$2"
+    ;;
+  status)
+    (($# == 0)) || usage
+    status_session
+    ;;
+  close)
+    (($# == 1)) || usage
+    close_session "$1"
+    ;;
+  *)
+    usage
+    ;;
+esac
