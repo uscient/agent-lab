@@ -48,7 +48,7 @@ validate_subject() {
     subject_reason="contains merge boilerplate"
     return 1
   fi
-  if [[ "$lower" =~ (^|[[:space:]])(co-authored|generated|assisted)[[:space:]-]+by([[:space:]]|$) ]]; then
+  if [[ "$lower" =~ ^(co-authored|generated|assisted)[[:space:]-]+by([[:space:]]|$) ]]; then
     subject_reason="contains disallowed attribution text"
     return 1
   fi
@@ -84,7 +84,7 @@ validate_subject() {
 }
 
 check_branch() {
-  local branch_name="$1"
+  local branch_name="$1" lower normalized
 
   if [[ -z "$branch_name" ]]; then
     fail "branch is detached or empty"
@@ -96,12 +96,27 @@ check_branch() {
       return
       ;;
   esac
+  lower="${branch_name,,}"
+  case "$lower" in
+    agent | changes | codex | claude | grok | now | work)
+      fail "branch name is generic: $branch_name"
+      return
+      ;;
+  esac
+  if [[ "$branch_name" == *'@{'* ]]; then
+    fail "branch uses Git magic syntax: $branch_name"
+    return
+  fi
   if ! command -v git >/dev/null 2>&1; then
     infra "cannot validate branch without git"
     return
   fi
-  if ! git check-ref-format --branch "$branch_name" >/dev/null 2>&1; then
+  if ! normalized="$(git check-ref-format --branch "$branch_name" 2>/dev/null)"; then
     fail "invalid Git branch: $branch_name"
+    return
+  fi
+  if [[ "$normalized" != "$branch_name" ]]; then
+    fail "branch uses non-literal Git syntax: $branch_name"
     return
   fi
 
@@ -144,6 +159,10 @@ check_pr_title() {
       infra "cannot inspect the head branch for the PR title"
       return
     fi
+    if [[ -z "$head_branch" ]]; then
+      infra "cannot inspect the head branch for the PR title"
+      return
+    fi
   fi
   if [[ -n "$head_branch" && "$title" == "$head_branch" ]]; then
     fail "PR title must not copy the head branch"
@@ -168,15 +187,31 @@ check_pr_base() {
 
 strip_nonprose_markdown() {
   awk '
-    BEGIN { fenced = 0; comment = 0 }
+    BEGIN { fenced = 0; comment = 0; fence_char = ""; fence_length = 0 }
     {
       line = $0
+      indent = 0
+      while (substr(line, indent + 1, 1) == " " && indent < 4) indent++
+      rest = substr(line, indent + 1)
+      marker = substr(rest, 1, 1)
+      marker_length = 0
+      if (indent <= 3 && (marker == "`" || marker == "~")) {
+        while (substr(rest, marker_length + 1, 1) == marker) marker_length++
+      }
       if (fenced) {
-        if (line ~ /^[[:space:]]*(```|~~~)/) fenced = 0
+        remainder = substr(rest, marker_length + 1)
+        if (marker == fence_char && marker_length >= fence_length \
+            && remainder ~ /^[[:space:]]*$/) {
+          fenced = 0
+          fence_char = ""
+          fence_length = 0
+        }
         next
       }
-      if (!comment && line ~ /^[[:space:]]*(```|~~~)/) {
+      if (!comment && marker_length >= 3) {
         fenced = 1
+        fence_char = marker
+        fence_length = marker_length
         next
       }
 
@@ -237,7 +272,7 @@ check_pr_body() {
     infra "cannot read PR body: $body_file"
     return
   fi
-  if grep -Eiq '(Important policy notice|does not accept contributions from non-members|authorized member.*delete the notice|Checklist \(members only\)|If you are not a member)' "$body_file"; then
+  if grep -Eiq '^[[:space:]]*>[[:space:]]+\*\*.*Important policy notice\*\*[[:space:]]*$|^## Checklist \(members only\)[[:space:]]*$|^If you are not a member, please close this PR instead of submitting\.[[:space:]]*$' "$body_file"; then
     fail "PR body retains the member notice"
     return
   fi
@@ -319,21 +354,31 @@ check_pr_body() {
 }
 
 check_commits() {
-  local base="$1" revisions hash author_name author_email subject message ancestry_rc=0 count=0
+  local base="$1" base_oid integration_oid revisions hash author_name author_email
+  local subject message trailers ancestry_rc=0 count=0
 
   if ! command -v git >/dev/null 2>&1; then
     infra "cannot inspect commits without git"
     return
   fi
-  if ! git rev-parse --verify "${base}^{commit}" >/dev/null 2>&1; then
+  if ! base_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify "${base}^{commit}" 2>/dev/null)"; then
     infra "invalid base: $base"
     return
   fi
-  if ! git rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
+  if ! integration_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'origin/dev^{commit}' 2>/dev/null)"; then
+    infra "cannot resolve origin/dev"
+    return
+  fi
+  if [[ "$base_oid" != "$integration_oid" ]]; then
+    fail "commit base must resolve to origin/dev: $base"
+    return
+  fi
+  if ! GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
     infra "cannot resolve HEAD"
     return
   fi
-  git merge-base --is-ancestor "$base" HEAD >/dev/null 2>&1 || ancestry_rc=$?
+  GIT_NO_REPLACE_OBJECTS=1 git merge-base --is-ancestor "$base_oid" HEAD >/dev/null 2>&1 \
+    || ancestry_rc=$?
   case "$ancestry_rc" in
     0) ;;
     1)
@@ -345,17 +390,17 @@ check_commits() {
       return
       ;;
   esac
-  if ! revisions="$(git rev-list --reverse --no-merges "${base}..HEAD" 2>/dev/null)"; then
+  if ! revisions="$(GIT_NO_REPLACE_OBJECTS=1 git rev-list --reverse --no-merges "${base_oid}..HEAD" 2>/dev/null)"; then
     infra "cannot enumerate introduced commits from base: $base"
     return
   fi
 
   while IFS= read -r hash; do
     [[ -n "$hash" ]] || continue
-    if ! author_name="$(git show -s --format=%an "$hash" 2>/dev/null)" \
-      || ! author_email="$(git show -s --format=%ae "$hash" 2>/dev/null)" \
-      || ! subject="$(git show -s --format=%s "$hash" 2>/dev/null)" \
-      || ! message="$(git show -s --format=%B "$hash" 2>/dev/null)"; then
+    if ! author_name="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%an "$hash" 2>/dev/null)" \
+      || ! author_email="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%ae "$hash" 2>/dev/null)" \
+      || ! subject="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%s "$hash" 2>/dev/null)" \
+      || ! message="$(GIT_NO_REPLACE_OBJECTS=1 git show -s --format=%B "$hash" 2>/dev/null)"; then
       infra "cannot inspect commit: $hash"
       return
     fi
@@ -367,7 +412,11 @@ check_commits() {
       fail "invalid commit subject in $hash: $subject_reason"
       return
     fi
-    if grep -Eiq '^[[:space:]]*(Co-authored-by|Generated-by|Assisted-by)[[:space:]]*:' <<<"$message"; then
+    if ! trailers="$(git interpret-trailers --parse <<<"$message" 2>/dev/null)"; then
+      infra "cannot parse commit trailers in $hash"
+      return
+    fi
+    if grep -Eiq '^[[:space:]]*(Co-authored-by|Generated-by|Assisted-by)[[:space:]]*:' <<<"$trailers"; then
       fail "commit $hash contains a disallowed attribution trailer"
       return
     fi
