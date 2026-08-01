@@ -17,10 +17,17 @@ passes=0
 failures=0
 pass() { printf 'PASS %s\n' "$1"; passes=$((passes + 1)); }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
+checker_cwd="$repo_root"
 
 run_checker() {
   checker_rc=0
-  checker_out="$("$checker" "$@" 2>&1)" || checker_rc=$?
+  checker_out="$(
+    if ! cd -- "$checker_cwd"; then
+      printf 'INFRA workflow-check contract cannot enter checker fixture\n' >&2
+      exit 125
+    fi
+    "$checker" "$@" 2>&1
+  )" || checker_rc=$?
 }
 
 expect_ok() {
@@ -75,6 +82,13 @@ if [ ! -x "$checker" ]; then
   fail "workflow checker exists and is executable"
   printf 'SUMMARY pass=%s fail=%s\n' "$passes" "$failures"
   exit 1
+fi
+
+checker_cwd="$work/checker-repo"
+if ! git init -q "$checker_cwd" >/dev/null 2>&1 ||
+  ! git -C "$checker_cwd" symbolic-ref HEAD refs/heads/xor/workflow >/dev/null 2>&1; then
+  printf 'INFRA workflow-check contract cannot create attached checker fixture\n' >&2
+  exit 125
 fi
 
 echo "== command contract =="
