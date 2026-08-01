@@ -42,7 +42,7 @@ suite ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
 suite required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
 suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
 suite workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=113 fail=0
-suite coordination tests/dev/coord-cases.sh SUMMARY assertions=47 expected=47 failures=0
+suite coordination tests/dev/coord-cases.sh SUMMARY assertions=50 expected=50 failures=0
 suite docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0
 suite guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
 suite guard-mount tests/guard/cases.sh SUMMARY failures=0

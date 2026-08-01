@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 coord_source="$repo_root/scripts/dev/coord"
-full_expected_assertions=47
+full_expected_assertions=50
 assertions=0
 failures=0
 
@@ -479,6 +479,43 @@ if ((default_rc == 0)) && [[ -e "$default_fixture/.cache/dev/coord" ]] && \
   pass "default state lives under ignored .cache/dev/coord"
 else
   fail "default state lives under ignored .cache/dev/coord"
+fi
+
+root_override_fixture="$work/root-override/repo"
+mkdir -p "$(dirname "$root_override_fixture")"
+make_fixture "$root_override_fixture"
+capture_coord "$root_override_fixture" "$root_override_fixture" init coordinator
+if ((capture_rc == 1)) && \
+  [[ ! -e "$root_override_fixture/current" ]] && \
+  [[ ! -e "$root_override_fixture/archive" ]] && \
+  [[ ! -e "$root_override_fixture/.lock" ]]; then
+  pass "an override cannot place coordination artifacts at the checkout root"
+else
+  fail "an override cannot place coordination artifacts at the checkout root"
+fi
+
+relative_override_fixture="$work/relative-override/repo"
+mkdir -p "$(dirname "$relative_override_fixture")"
+make_fixture "$relative_override_fixture"
+capture_coord "$relative_override_fixture" . init coordinator
+if ((capture_rc == 1)) && \
+  [[ ! -e "$relative_override_fixture/current" ]] && \
+  [[ ! -e "$relative_override_fixture/archive" ]] && \
+  [[ ! -e "$relative_override_fixture/.lock" ]]; then
+  pass "coordination root overrides must be absolute"
+else
+  fail "coordination root overrides must be absolute"
+fi
+
+tracked_override_fixture="$work/tracked-override/repo"
+tracked_override_root="$tracked_override_fixture/coord-state"
+mkdir -p "$(dirname "$tracked_override_fixture")"
+make_fixture "$tracked_override_fixture"
+capture_coord "$tracked_override_fixture" "$tracked_override_root" init coordinator
+if ((capture_rc == 1)) && [[ ! -e "$tracked_override_root" ]]; then
+  pass "an override cannot create coordination artifacts in tracked checkout paths"
+else
+  fail "an override cannot create coordination artifacts in tracked checkout paths"
 fi
 
 race_fixture="$work/race/repo"
