@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 coord_source="$repo_root/scripts/dev/coord"
-full_expected_assertions=54
+full_expected_assertions=58
 assertions=0
 failures=0
 
@@ -514,6 +514,64 @@ git -C "$advance_guard_fixture" add advance.txt
 git -C "$advance_guard_fixture" commit -qm "move fixture head"
 expect_failure "coordinator cannot advance while a task lacks a handoff" \
   "$advance_guard_fixture" "$advance_guard_state" advance coordinator
+
+recover_fixture="$work/recover/repo"
+recover_state="$work/recover/state"
+mkdir -p "$(dirname "$recover_fixture")"
+make_fixture "$recover_fixture"
+run_coord "$recover_fixture" "$recover_state" init coordinator >/dev/null
+mkdir "$recover_state/.lock"
+capture_coord "$recover_fixture" "$recover_state" recover coordinator
+recover_rc=$capture_rc
+recover_status_rc=1
+if ((recover_rc == 0)); then
+  capture_coord "$recover_fixture" "$recover_state" status
+  recover_status_rc=$capture_rc
+else
+  find "$recover_state/.lock" -depth -delete
+fi
+if ((recover_rc == 0 && recover_status_rc == 0)); then
+  pass "coordinator can clear a stale lock and resume the session"
+else
+  fail "coordinator can clear a stale lock and resume the session"
+fi
+
+mkdir "$recover_state/.lock"
+printf '%s\n' "$$" >"$recover_state/.lock/pid"
+capture_coord "$recover_fixture" "$recover_state" recover coordinator
+recover_live_rc=$capture_rc
+find "$recover_state/.lock" -depth -delete
+if ((recover_live_rc == 1)); then
+  pass "lock recovery refuses an owner PID that is still alive"
+else
+  fail "lock recovery refuses an owner PID that is still alive"
+fi
+
+preinit_recover_fixture="$work/preinit-recover/repo"
+preinit_recover_state="$work/preinit-recover/state"
+mkdir -p "$(dirname "$preinit_recover_fixture")" "$preinit_recover_state/.lock"
+make_fixture "$preinit_recover_fixture"
+capture_coord "$preinit_recover_fixture" "$preinit_recover_state" recover coordinator
+preinit_recover_rc=$capture_rc
+if ((preinit_recover_rc != 0)); then
+  find "$preinit_recover_state/.lock" -depth -delete
+fi
+capture_coord "$preinit_recover_fixture" "$preinit_recover_state" init coordinator
+preinit_init_rc=$capture_rc
+if ((preinit_recover_rc == 0 && preinit_init_rc == 0)); then
+  pass "stale init lock can be recovered before a session exists"
+else
+  fail "stale init lock can be recovered before a session exists"
+fi
+
+staging_fixture="$work/staging-recovery/repo"
+staging_state="$work/staging-recovery/state"
+mkdir -p "$(dirname "$staging_fixture")"
+make_fixture "$staging_fixture"
+run_coord "$staging_fixture" "$staging_state" init coordinator >/dev/null
+mkdir "$staging_state/current/tasks/.claim.interrupted"
+expect_success "an interrupted hidden claim staging directory does not wedge close" \
+  "$staging_fixture" "$staging_state" close coordinator
 
 clean_fixture="$work/clean/repo"
 clean_state="$work/clean/state"
