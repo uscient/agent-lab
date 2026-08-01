@@ -183,6 +183,20 @@ Generic pull-request metadata hides the delivered outcome and evidence.
 EOF
 expect_ok "complete PR body is accepted" pr-body "$good_body"
 
+template_body="$work/template-body.md"
+awk '
+  {
+    gsub(/- \[ \]/, "- [x]")
+    print
+    if ($0 == "## Summary") print "\nStandardize development workflow metadata."
+    if ($0 == "## Motivation / Context") print "\nReview metadata needs deterministic local evidence."
+    if ($0 == "## Changes") print "\n- add executable workflow conventions."
+    if ($0 == "## Testing") print "\n- `bash tests/dev/workflow-check-cases.sh` — pass."
+  }
+' "$repo_root/.github/PULL_REQUEST_TEMPLATE.md" > "$template_body"
+expect_ok "tracked PR template can produce a valid checked body" \
+  pr-body "$template_body"
+
 empty_body="$work/empty-body.md"
 cat > "$empty_body" <<'EOF'
 ## Summary
@@ -777,7 +791,7 @@ else
   printf '%s\n' "$checker_out"
 fi
 
-expected_passes=113
+expected_passes=114
 if [ "$passes" -ne "$expected_passes" ]; then
   fail "contract executed the exact expected assertions ($passes/$expected_passes)"
 fi
