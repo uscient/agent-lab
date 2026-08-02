@@ -1634,7 +1634,9 @@ def _remove_entry_at(
         if (
             (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
             or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_mode != metadata.st_mode
             or opened.st_uid != os.getuid()
+            or opened.st_nlink != metadata.st_nlink
         ):
             _infra("Experiment cleanup directory identity changed")
         if _directory_names is not _ORIGINAL_DIRECTORY_NAMES:
