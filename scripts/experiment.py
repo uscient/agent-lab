@@ -546,7 +546,7 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
         members = []
         for member in raw_members:
             selector = member["image"]
-            if not isinstance(selector, dict) or set(selector) != {"digestRef"}:
+            if not isinstance(selector, dict) or set(selector) not in ({"digestRef"}, {"catalogName"}):
                 raise KeyError("unresolved selector")
             members.append({
                 "command": member.get("command", []),
@@ -597,23 +597,51 @@ def bundled_catalog(repo_root: Path) -> tuple[dict[str, object], str]:
     return value, digest_record(BUNDLED_CATALOG_DOMAIN, value)
 
 
+def local_catalog_entry(home: Path, name: str) -> dict[str, object]:
+    try:
+        config = strict_json((home / "config.json").read_bytes(), source="local config")
+        assert isinstance(config, dict)
+        images = config["paths"]["images"]
+        root = home / images / "catalog"
+        pointer = strict_json((root / "current.json").read_bytes(), source="local catalog pointer")
+        assert isinstance(pointer, dict) and set(pointer) == {"snapshotDigest"}
+        snapshot_digest = pointer["snapshotDigest"]
+        assert isinstance(snapshot_digest, str) and is_sha256(snapshot_digest)
+        snapshot = strict_json(
+            (root / "snapshots" / f"{snapshot_digest[7:]}.json").read_bytes(),
+            source="local catalog snapshot",
+        )
+        if digest_record(b"agent-lab.local-image-snapshot.v1\0", snapshot) != snapshot_digest:
+            raise ValueError("snapshot digest")
+        assert isinstance(snapshot, dict)
+        record = snapshot["records"].get(name)
+        if record is None or record["state"] != "active":
+            raise InvalidManifest("references an unknown or removed local image name")
+        assert isinstance(record, dict)
+        return record
+    except InvalidManifest:
+        raise
+    except (AssertionError, KeyError, OSError, TypeError, ValueError) as error:
+        raise InfrastructureError("local image catalog cannot be verified") from error
+
+
 def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, object] | None = None) -> dict[str, object]:
-    if catalog is None:
-        catalog, _ = bundled_catalog(repo_root)
-    entries = catalog.get("entries")
-    if not isinstance(entries, list):
-        raise InfrastructureError("bundled image catalog entries are malformed")
-    by_name: dict[str, dict[str, object]] = {}
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
-            raise InfrastructureError("bundled image catalog entry is malformed")
-        name, subject = entry["name"], entry["subject"]
-        if not valid_catalog_name(name) or not isinstance(subject, str) or "@sha256:" not in subject:
-            raise InfrastructureError("bundled image catalog entry is invalid")
-        assert isinstance(name, str)
-        if not name.startswith("agent-lab.") or name in by_name:
-            raise InfrastructureError("bundled image catalog namespace is invalid")
-        by_name[name] = entry
+    by_name: dict[str, dict[str, object]] | None = None
+    if catalog is not None:
+        entries = catalog.get("entries")
+        if not isinstance(entries, list):
+            raise InfrastructureError("bundled image catalog entries are malformed")
+        by_name = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
+                raise InfrastructureError("bundled image catalog entry is malformed")
+            name, subject = entry["name"], entry["subject"]
+            if not valid_catalog_name(name) or not isinstance(subject, str) or "@sha256:" not in subject:
+                raise InfrastructureError("bundled image catalog entry is invalid")
+            assert isinstance(name, str)
+            if not name.startswith("agent-lab.") or name in by_name:
+                raise InfrastructureError("bundled image catalog namespace is invalid")
+            by_name[name] = entry
     resolved = json.loads(canonical_json(plan))
     members = resolved["spec"]["members"]
     for member in members:
@@ -624,18 +652,30 @@ def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, ob
         if set(selector) != {"catalogName"} or not valid_catalog_name(selector["catalogName"]):
             raise InvalidManifest("contains an invalid image selector")
         name = selector["catalogName"]
-        if not name.startswith("agent-lab."):
-            raise InvalidManifest("local image name is not configured")
-        entry = by_name.get(name)
-        if entry is None:
-            raise InvalidManifest("references an unknown bundled image name")
-        entry_digest = digest_record(BUNDLED_ENTRY_DOMAIN, entry)
-        member["resolvedImage"] = {
-            "entryDigest": entry_digest,
-            "generation": 1,
-            "origin": "agent-lab",
-            "subject": entry["subject"],
-        }
+        if name.startswith("agent-lab."):
+            if by_name is None:
+                loaded_catalog, _ = bundled_catalog(repo_root)
+                return resolve_plan(plan, repo_root, loaded_catalog)
+            entry = by_name.get(name)
+            if entry is None:
+                raise InvalidManifest("references an unknown bundled image name")
+            member["resolvedImage"] = {
+                "entryDigest": digest_record(BUNDLED_ENTRY_DOMAIN, entry),
+                "generation": 1,
+                "origin": "agent-lab",
+                "subject": entry["subject"],
+            }
+        else:
+            raw_home = os.environ.get("AGENT_LAB_HOME")
+            if not raw_home:
+                raise InvalidManifest("local image name requires an initialized Agent Lab home")
+            record = local_catalog_entry(Path(raw_home), name)
+            member["resolvedImage"] = {
+                "entryDigest": record["entryDigest"],
+                "generation": record["generation"],
+                "origin": "local",
+                "subject": record["subject"],
+            }
     return resolved
 
 
