@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 
@@ -28,6 +29,16 @@ EXPECTED = (
     "GIT-TYPE-001",
     "GIT-BLOB-001",
     "GIT-DRIFT-001",
+    "GIT-AUTHORITY-001",
+    "GIT-CREDENTIAL-001",
+    "GIT-REDIRECT-001",
+    "GIT-CONTENT-001",
+    "GIT-TIMEOUT-001",
+    "GIT-OUTPUT-001",
+    "GIT-ACQUIRE-001",
+    "GIT-PGROUP-001",
+    "GIT-CLEANUP-001",
+    "GIT-TAXONOMY-001",
 )
 URL = "https://github.com/uscient/experiment-fixture.git"
 COMMIT = "1cffa1a28f96d2f2cb898b1bad70d281e359a5b5"
@@ -463,6 +474,299 @@ def main() -> int:
                         "GIT-DRIFT-001",
                         drift_outcome[0] == "infra" and "GIT-TREE" in drift_outcome[1],
                         "changed object output is infrastructure uncertainty",
+                    )
+                )
+
+                expected_headers = (
+                    ("Accept", "application/vnd.github+json"),
+                    ("User-Agent", "agent-lab/v0alpha1"),
+                    ("X-GitHub-Api-Version", "2022-11-28"),
+                )
+                results.append(
+                    (
+                        "GIT-AUTHORITY-001",
+                        all(call[0] == "api.github.com" for call in request_calls)
+                        and all(call[2] == expected_headers for call in request_calls)
+                        and request_calls[0][3] == 1_048_576
+                        and request_calls[0][3] > request_calls[1][3] > request_calls[2][3],
+                        "only the fixed credential-free provider authority is requested",
+                    )
+                )
+
+                inherited_names = {
+                    "GIT_ASKPASS": str(Path(raw_home) / "askpass"),
+                    "GIT_CONFIG_GLOBAL": str(Path(raw_home) / "gitconfig"),
+                    "HTTPS_PROXY": "http://credential.invalid:9",
+                    "SSL_CERT_FILE": str(Path(raw_home) / "caller-ca"),
+                }
+                prior_inherited = {name: os.environ.get(name) for name in inherited_names}
+                os.environ.update(inherited_names)
+                try:
+                    credential_outcome = acquire(fixture_responses)
+                finally:
+                    for name, value in prior_inherited.items():
+                        if value is None:
+                            os.environ.pop(name, None)
+                        else:
+                            os.environ[name] = value
+                credential_text = repr(credential_outcome)
+                results.append(
+                    (
+                        "GIT-CREDENTIAL-001",
+                        credential_outcome[0] == "ok"
+                        and "credential.invalid" not in credential_text
+                        and "caller-ca" not in credential_text
+                        and "askpass" not in credential_text,
+                        "caller credentials, proxy, CA, and Git configuration are not retained",
+                    )
+                )
+
+                redirect_responses = dict(fixture_responses)
+                redirect_responses[next(iter(fixture_responses))] = (
+                    302,
+                    (
+                        ("content-length", "0"),
+                        ("content-type", "application/json; charset=utf-8"),
+                        ("location", "https://credential.invalid/secret"),
+                    ),
+                    b"",
+                )
+                redirect_outcome = acquire(redirect_responses)
+                results.append(
+                    (
+                        "GIT-REDIRECT-001",
+                        redirect_outcome[0] == "infra"
+                        and "credential.invalid" not in redirect_outcome[1],
+                        "provider redirects are infrastructure uncertainty and never followed",
+                    )
+                )
+
+                content_marker = Path(raw_home) / "content-executed"
+                marker_source = (
+                    f"// $(touch {content_marker})\n".encode("ascii") + source
+                )
+                marker_blob = git_oid("blob", marker_source)
+                marker_tree_payload = b"100644 experiment.cue\0" + bytes.fromhex(marker_blob)
+                marker_tree = git_oid("tree", marker_tree_payload)
+                marker_responses = {
+                    f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}": response(
+                        {"sha": COMMIT, "tree": {"sha": marker_tree}}
+                    ),
+                    f"/repos/uscient/experiment-fixture/git/trees/{marker_tree}": response(
+                        {
+                            "sha": marker_tree,
+                            "tree": [
+                                {
+                                    "mode": "100644",
+                                    "path": "experiment.cue",
+                                    "sha": marker_blob,
+                                    "size": len(marker_source),
+                                    "type": "blob",
+                                }
+                            ],
+                            "truncated": False,
+                        }
+                    ),
+                    f"/repos/uscient/experiment-fixture/git/blobs/{marker_blob}": response(
+                        {
+                            "content": base64.b64encode(marker_source).decode("ascii"),
+                            "encoding": "base64",
+                            "sha": marker_blob,
+                            "size": len(marker_source),
+                        }
+                    ),
+                }
+                content_outcome = acquire(marker_responses)
+                results.append(
+                    (
+                        "GIT-CONTENT-001",
+                        content_outcome[0] == "ok"
+                        and content_outcome[1].data == marker_source
+                        and not content_marker.exists(),
+                        "repository content is snapshotted without checkout or execution",
+                    )
+                )
+
+                original_timeout = experiment.GIT_ACQUISITION_TIMEOUT_SECONDS
+                experiment.GIT_ACQUISITION_TIMEOUT_SECONDS = 0.001
+
+                def slow_requester(authority, path, headers, maximum, deadline):
+                    import time
+
+                    time.sleep(0.01)
+                    return fixture_responses[path]
+
+                try:
+                    try:
+                        experiment.read_git_snapshot(URL, COMMIT, requester=slow_requester)
+                        timeout_outcome = "ok"
+                    except experiment.InfrastructureError as error:
+                        timeout_outcome = str(error)
+                finally:
+                    experiment.GIT_ACQUISITION_TIMEOUT_SECONDS = original_timeout
+                results.append(
+                    (
+                        "GIT-TIMEOUT-001",
+                        "GIT-TIMEOUT" in timeout_outcome,
+                        "one absolute acquisition deadline bounds all provider requests",
+                    )
+                )
+
+                oversized_responses = dict(fixture_responses)
+                oversized_responses[next(iter(fixture_responses))] = (
+                    200,
+                    (
+                        ("content-length", str(1_048_577)),
+                        ("content-type", "application/json; charset=utf-8"),
+                    ),
+                    b"x" * 1_048_577,
+                )
+                output_outcome = acquire(oversized_responses)
+                results.append(
+                    (
+                        "GIT-OUTPUT-001",
+                        output_outcome[0] == "infra" and "GIT-OUTPUT" in output_outcome[1],
+                        "one provider response cannot exceed the acquisition cap",
+                    )
+                )
+
+                padded_commit = dict(commit_body)
+                padded_commit["ignored"] = "c" * 524_000
+                padded_tree = dict(tree_body)
+                padded_tree["ignored"] = "t" * 524_000
+                aggregate_responses = dict(fixture_responses)
+                aggregate_responses[next(iter(fixture_responses))] = response(padded_commit)
+                aggregate_responses[f"/repos/uscient/experiment-fixture/git/trees/{TREE}"] = response(
+                    padded_tree
+                )
+                aggregate_outcome = acquire(aggregate_responses)
+                results.append(
+                    (
+                        "GIT-ACQUIRE-001",
+                        aggregate_outcome[0] == "infra"
+                        and "GIT-OUTPUT" in aggregate_outcome[1]
+                        and all(len(item[2]) < 1_048_576 for item in aggregate_responses.values()),
+                        "the response-byte bound is aggregate rather than per request",
+                    )
+                )
+
+                original_worker_requester = getattr(experiment, "_github_api_request", None)
+
+                def worker_requester(authority, path, headers, maximum, deadline):
+                    return fixture_responses[path]
+
+                experiment._github_api_request = worker_requester
+                try:
+                    try:
+                        worker_snapshot = experiment.read_git_snapshot(URL, COMMIT)
+                    except (experiment.InvalidManifest, experiment.InfrastructureError):
+                        worker_snapshot = None
+                finally:
+                    if original_worker_requester is None:
+                        delattr(experiment, "_github_api_request")
+                    else:
+                        experiment._github_api_request = original_worker_requester
+                results.append(
+                    (
+                        "GIT-PGROUP-001",
+                        worker_snapshot is not None
+                        and worker_snapshot.data == source
+                        and worker_snapshot.digest == SOURCE_DIGEST,
+                        "the fixed provider runs in the bounded worker path",
+                    )
+                )
+
+                read_descriptor, write_descriptor = os.pipe()
+                os.set_blocking(read_descriptor, False)
+                residual_spawned = False
+                residual_pid = None
+                residual_calls = 0
+
+                def residual_requester(authority, path, headers, maximum, deadline):
+                    nonlocal residual_calls
+                    residual_calls += 1
+                    if residual_calls == 1:
+                        child = os.fork()
+                        if child == 0:
+                            os.close(read_descriptor)
+                            try:
+                                os.write(write_descriptor, f"{os.getpid()}\n".encode("ascii"))
+                                while True:
+                                    signal.pause()
+                            finally:
+                                os._exit(0)
+                    return fixture_responses[path]
+
+                original_worker_requester = getattr(experiment, "_github_api_request", None)
+                experiment._github_api_request = residual_requester
+                try:
+                    try:
+                        experiment.read_git_snapshot(URL, COMMIT)
+                        residual_outcome = "ok"
+                    except experiment.InfrastructureError as error:
+                        residual_outcome = str(error)
+                finally:
+                    os.close(write_descriptor)
+                    if original_worker_requester is None:
+                        delattr(experiment, "_github_api_request")
+                    else:
+                        experiment._github_api_request = original_worker_requester
+                try:
+                    residual_record = os.read(read_descriptor, 64).decode("ascii").strip()
+                except BlockingIOError:
+                    residual_record = ""
+                finally:
+                    os.close(read_descriptor)
+                if residual_record.isdigit():
+                    residual_spawned = True
+                    residual_pid = int(residual_record)
+                    try:
+                        os.kill(residual_pid, 0)
+                    except ProcessLookupError:
+                        residual_alive = False
+                    else:
+                        residual_alive = True
+                        os.kill(residual_pid, signal.SIGKILL)
+                else:
+                    residual_alive = False
+                results.append(
+                    (
+                        "GIT-CLEANUP-001",
+                        residual_spawned
+                        and not residual_alive
+                        and "residual" in residual_outcome.lower(),
+                        "a residual provider descendant is killed and reported as uncertainty",
+                    )
+                )
+
+                taxonomy_outcomes = []
+                for status in (404, 403, 500):
+                    status_responses = dict(fixture_responses)
+                    status_responses[next(iter(fixture_responses))] = (
+                        status,
+                        (
+                            ("content-length", "2"),
+                            ("content-type", "application/json; charset=utf-8"),
+                        ),
+                        b"{}",
+                    )
+                    taxonomy_outcomes.append((status, acquire(status_responses)[0]))
+                malformed_responses = dict(fixture_responses)
+                malformed_responses[next(iter(fixture_responses))] = (
+                    200,
+                    (
+                        ("content-length", "1"),
+                        ("content-type", "application/json; charset=utf-8"),
+                    ),
+                    b"{",
+                )
+                taxonomy_outcomes.append((200, acquire(malformed_responses)[0]))
+                results.append(
+                    (
+                        "GIT-TAXONOMY-001",
+                        taxonomy_outcomes
+                        == [(404, "reject"), (403, "infra"), (500, "infra"), (200, "infra")],
+                        "stable absence is rejection while provider uncertainty is infrastructure",
                     )
                 )
             finally:
