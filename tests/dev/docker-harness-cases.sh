@@ -34,22 +34,38 @@ fi
 
 expected_suites="$work/expected-docker-suites"
 cat > "$expected_suites" <<'EOF'
-image-volume tests/docker/image-volume.sh
-wrapper-context-runtime tests/docker/wrapper-context.sh
-network-boundary tests/docker/network-boundary.sh
-dns-contract tests/docker/dns-contract.sh
-runtime-inspect-differential tests/docker/runtime-inspect-differential.sh
-runtime-hardening tests/docker/runtime-hardening.sh
-secret-nondisclosure tests/docker/secret-nondisclosure.sh
-serena-runtime tests/docker/serena-runtime.sh
+image-volume tests/docker/image-volume.sh SUMMARY failures=0
+wrapper-context-runtime tests/docker/wrapper-context.sh SUMMARY failures=0
+network-boundary tests/docker/network-boundary.sh SUMMARY failures=0
+dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
+runtime-inspect-differential tests/docker/runtime-inspect-differential.sh SUMMARY failures=0
+runtime-hardening tests/docker/runtime-hardening.sh RUNTIME HARDENING SUMMARY failures=0
+secret-nondisclosure tests/docker/secret-nondisclosure.sh SUMMARY failures=0
+serena-runtime tests/docker/serena-runtime.sh SERENA RUNTIME SUMMARY failures=0
 EOF
 actual_suites="$work/actual-docker-suites"
-awk '$1 == "suite" { print $2, $3 }' "$docker_manifest" > "$actual_suites"
+awk '$1 == "suite" { $1 = ""; sub(/^ /, ""); print }' "$docker_manifest" > "$actual_suites"
 if cmp -s "$expected_suites" "$actual_suites"; then
   pass "versioned Docker gate has the exact required suite contract"
 else
   fail "versioned Docker gate has the exact required suite contract"
   diff -u "$expected_suites" "$actual_suites" || true
+fi
+
+serena_runtime="$repo_root/tests/docker/serena-runtime.sh"
+if [ "$(grep -Fxc "printf 'SERENA RUNTIME SUMMARY failures=%s\\n' \"\$failures\"" "$serena_runtime")" -eq 1 ] &&
+   ! grep -Fq "printf 'SUMMARY failures=%s\\n' \"\$failures\"" "$serena_runtime"; then
+  pass "Serena runtime owns one suite-specific completion marker"
+else
+  fail "Serena runtime owns one suite-specific completion marker"
+fi
+
+runtime_hardening="$repo_root/tests/docker/runtime-hardening.sh"
+if [ "$(grep -Fxc "printf 'RUNTIME HARDENING SUMMARY failures=%s\\n' \"\$failures\"" "$runtime_hardening")" -eq 1 ] &&
+   ! grep -Fq "printf 'SUMMARY failures=%s\\n' \"\$failures\"" "$runtime_hardening"; then
+  pass "runtime hardening owns one suite-specific completion marker"
+else
+  fail "runtime hardening owns one suite-specific completion marker"
 fi
 if grep -Fxq 'tool python3' "$fast_manifest" &&
    ! grep -Fxq 'tool timeout' "$fast_manifest" &&
