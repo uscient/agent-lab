@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 import io
@@ -24,6 +24,7 @@ AGENT_LAB_MODULE = REPO_ROOT / "scripts" / "agent-lab.py"
 CATALOG_MODULE = REPO_ROOT / "scripts" / "image_catalog.py"
 SUBJECT = "registry.example/operator/worker@sha256:" + "a" * 64
 OTHER_SUBJECT = "registry.example/operator/other@sha256:" + "b" * 64
+THIRD_SUBJECT = "registry.example/operator/third@sha256:" + "c" * 64
 ENTRY_DOMAIN = b"agent-lab.local-image-entry.v1\0"
 SNAPSHOT_DOMAIN = b"agent-lab.local-image-snapshot.v1\0"
 
@@ -173,7 +174,14 @@ def write_record(root: Path, domain: bytes, value: dict[str, object]) -> Path:
     return path
 
 
-def hard_exit_add(home: Path, name: str, subject: str, point: str) -> int:
+def hard_exit_add(
+    home: Path,
+    name: str,
+    subject: str,
+    point: str,
+    *,
+    limits=None,
+) -> int:
     pid = os.fork()
     if pid == 0:
         def stop_at(observed: str) -> None:
@@ -181,7 +189,8 @@ def hard_exit_add(home: Path, name: str, subject: str, point: str) -> int:
                 os._exit(99)
 
         try:
-            CATALOG.add_image(home, name, subject, fault=stop_at)
+            keyword = {} if limits is None else {"limits": limits}
+            CATALOG.add_image(home, name, subject, fault=stop_at, **keyword)
         except BaseException:
             os._exit(98)
         os._exit(97)
@@ -199,6 +208,37 @@ def hard_exit_add(home: Path, name: str, subject: str, point: str) -> int:
 class BrokenOutput(io.StringIO):
     def write(self, value: str) -> int:
         raise OSError("injected result-output failure")
+
+
+def catalog_add_result(home: Path, name: str, subject: str, *, limits=None):
+    keyword = {} if limits is None else {"limits": limits}
+    try:
+        return 0, CATALOG.add_image(home, name, subject, **keyword), None
+    except CATALOG.CatalogReject as error:
+        return 1, None, error
+    except CATALOG.CatalogInfrastructure as error:
+        return 125, None, error
+    except BaseException as error:  # The assertion records an uncontained production fault as RED.
+        return None, None, error
+
+
+def traced_catalog_add(home: Path, name: str, subject: str):
+    targets: list[str] = []
+    original_fsync = CATALOG.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        try:
+            targets.append(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            targets.append("<unresolved>")
+        original_fsync(descriptor)
+
+    CATALOG.os.fsync = record_fsync
+    try:
+        rc, value, error = catalog_add_result(home, name, subject)
+    finally:
+        CATALOG.os.fsync = original_fsync
+    return rc, value, error, targets
 
 
 def main() -> int:
@@ -472,6 +512,33 @@ def main() -> int:
             f"rc={completed.returncode}",
         )
 
+        split_home = new_home(root, "split-lock-home")
+        original_catalog_lock = CATALOG._catalog_lock
+        split_rejected = False
+
+        @contextmanager
+        def replace_before_lock(authority, *, exclusive):
+            path = authority.lock
+            data = path.read_bytes()
+            path.rename(root / "split-original-image-catalog.lock")
+            path.write_bytes(data)
+            path.chmod(0o600)
+            with original_catalog_lock(authority, exclusive=exclusive) as descriptor:
+                yield descriptor
+
+        CATALOG._catalog_lock = replace_before_lock
+        try:
+            CATALOG.list_images(split_home)
+        except CATALOG.CatalogInfrastructure:
+            split_rejected = True
+        finally:
+            CATALOG._catalog_lock = original_catalog_lock
+        check(
+            "CAT-STATE-018",
+            split_rejected,
+            "receipt-bound lock identity is rechecked after acquisition to prevent split-brain",
+        )
+
         nested_home = new_home(root, "nested-json-home")
         add(nested_home)
         nested_current = nested_home / "images" / "catalog" / "current.json"
@@ -515,6 +582,76 @@ def main() -> int:
             completed.returncode == 125 and orphan.exists() and orphan.stat().st_size == before,
             "over-bound physical catalog state fails closed without broad deletion",
             f"rc={completed.returncode}",
+        )
+
+        physical_limit_home = new_home(root, "physical-name-limit-home")
+        physical_limits = CATALOG.CatalogLimits(names=2)
+        catalog_add_result(
+            physical_limit_home,
+            "vendor.first",
+            SUBJECT,
+            limits=physical_limits,
+        )
+        child_rc = hard_exit_add(
+            physical_limit_home,
+            "vendor.orphan",
+            OTHER_SUBJECT,
+            "catalog immutable entry.after_noreplace",
+            limits=physical_limits,
+        )
+        before = fingerprint(physical_limit_home / "images" / "catalog")
+        third_rc, _, third_error = catalog_add_result(
+            physical_limit_home,
+            "vendor.third",
+            THIRD_SUBJECT,
+            limits=physical_limits,
+        )
+        after = fingerprint(physical_limit_home / "images" / "catalog")
+        observed = cli(physical_limit_home, "image", "list")
+        check(
+            "CAT-BOUND-003",
+            child_rc == 99
+            and third_rc == 1
+            and isinstance(third_error, CATALOG.CatalogReject)
+            and before == after
+            and observed.returncode == 0
+            and [item.get("name") for item in json.loads(observed.stdout)] == ["vendor.first"],
+            "a valid unreachable orphan consumes physical-name capacity before new publication",
+            (
+                f"child_rc={child_rc} third_rc={third_rc} error={third_error!r} "
+                f"changed={before != after} list_rc={observed.returncode}"
+            ),
+        )
+
+        orphan_conflict_home = new_home(root, "orphan-generation-conflict-home")
+        add(orphan_conflict_home, "vendor.first", SUBJECT)
+        child_rc = hard_exit_add(
+            orphan_conflict_home,
+            "vendor.orphan",
+            OTHER_SUBJECT,
+            "catalog immutable entry.after_noreplace",
+        )
+        before = fingerprint(orphan_conflict_home / "images" / "catalog")
+        conflict_rc, _, conflict_error = catalog_add_result(
+            orphan_conflict_home,
+            "vendor.orphan",
+            THIRD_SUBJECT,
+        )
+        after = fingerprint(orphan_conflict_home / "images" / "catalog")
+        observed = cli(orphan_conflict_home, "image", "list")
+        check(
+            "CAT-BOUND-004",
+            child_rc == 99
+            and conflict_rc == 1
+            and isinstance(conflict_error, CATALOG.CatalogReject)
+            and before == after
+            and observed.returncode == 0
+            and [item.get("name") for item in json.loads(observed.stdout)] == ["vendor.first"],
+            "a conflicting generation-one orphan is rejected before immutable publication",
+            (
+                f"child_rc={child_rc} conflict_rc={conflict_rc} error={conflict_error!r} "
+                f"changed={before != after} list_rc={observed.returncode}"
+            ),
         )
 
         fsync_home = new_home(root, "fsync-home")
@@ -631,19 +768,17 @@ def main() -> int:
         completed = cli(forged_home, "image", "add", "vendor.third", OTHER_SUBJECT)
         after = fingerprint(forged_home / "images")
         observed = cli(forged_home, "image", "list")
-        observed_value = json.loads(observed.stdout) if observed.returncode == 0 else []
         check(
             "CAT-CRASH-004",
             completed.returncode == 125
             and completed.stdout == b""
             and before == after
-            and observed.returncode == 0
-            and len(observed_value) == 1
-            and observed_value[0].get("entryDigest") == victim_digest,
+            and observed.returncode == 125
+            and observed.stdout == b"",
             "unproven staged intent cannot delete committed immutable history or its own evidence",
             (
                 f"rc={completed.returncode} changed={before != after} "
-                f"list_rc={observed.returncode} list={observed_value!r}"
+                f"list_rc={observed.returncode}"
             ),
         )
 
@@ -826,19 +961,40 @@ def main() -> int:
         stage_before = fingerprint(preintent_home / "images" / ".staging")
         retry = cli(preintent_home, "image", "add", "vendor.second", OTHER_SUBJECT)
         stage_after = fingerprint(preintent_home / "images" / ".staging")
-        before_value = json.loads(before_retry.stdout) if before_retry.returncode == 0 else []
+        pristine_preintent_home = new_home(root, "pristine-preintent-crash-home")
+        pristine_child_rc = hard_exit_add(
+            pristine_preintent_home,
+            "vendor.worker",
+            SUBJECT,
+            "catalog wrapper.after_create",
+        )
+        pristine_before = fingerprint(pristine_preintent_home / "images" / ".staging")
+        pristine_list = cli(pristine_preintent_home, "image", "list")
+        pristine_retry = cli(
+            pristine_preintent_home,
+            "image",
+            "add",
+            "vendor.worker",
+            SUBJECT,
+        )
+        pristine_after = fingerprint(pristine_preintent_home / "images" / ".staging")
         check(
             "CAT-CRASH-007",
             child_rc == 99
-            and before_retry.returncode == 0
-            and [record.get("name") for record in before_value] == ["vendor.worker"]
+            and before_retry.returncode == 125
             and retry.returncode == 125
             and retry.stdout == b""
-            and stage_before == stage_after,
-            "a pre-intent hard exit preserves the committed view and returns uncertainty without deleting residue",
+            and stage_before == stage_after
+            and pristine_child_rc == 99
+            and pristine_list.returncode == 125
+            and pristine_retry.returncode == 125
+            and pristine_before == pristine_after,
+            "a pre-intent hard exit blocks reads and mutation without deleting residue",
             (
                 f"child_rc={child_rc} list_rc={before_retry.returncode} "
-                f"retry_rc={retry.returncode} changed={stage_before != stage_after}"
+                f"retry_rc={retry.returncode} changed={stage_before != stage_after} "
+                f"pristine_child={pristine_child_rc} pristine_list={pristine_list.returncode} "
+                f"pristine_retry={pristine_retry.returncode}"
             ),
         )
 
@@ -871,6 +1027,124 @@ def main() -> int:
             and not (phase_home / "images" / "catalog").exists(),
             "phase-inconsistent bootstrap staging remains inert and cannot become committed authority",
             f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after}",
+        )
+
+        incomplete_home = new_home(root, "incomplete-later-phase-home")
+        add(incomplete_home)
+        child_rc = hard_exit_add(
+            incomplete_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "catalog staged pointer.after_replace",
+        )
+        incomplete_payload = (
+            incomplete_home
+            / "images"
+            / ".staging"
+            / "image-catalog-operation"
+            / "payload"
+        )
+        (incomplete_payload / "entry.json").unlink()
+        (incomplete_payload / "snapshot.json").unlink()
+        before = fingerprint(incomplete_home / "images")
+        retry = cli(incomplete_home, "image", "add", "vendor.second", OTHER_SUBJECT)
+        after = fingerprint(incomplete_home / "images")
+        check(
+            "CAT-CRASH-009",
+            child_rc == 99
+            and retry.returncode == 125
+            and retry.stdout == b""
+            and before == after,
+            "a later stage cannot claim a pointer phase without candidate record evidence",
+            f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after}",
+        )
+
+        marker_durable_home = new_home(root, "marker-durable-recovery-home")
+        marker_child = hard_exit_add(
+            marker_durable_home,
+            "vendor.worker",
+            SUBJECT,
+            "catalog marker.after_write",
+        )
+        marker_rc, marker_value, marker_error, marker_targets = traced_catalog_add(
+            marker_durable_home,
+            "vendor.worker",
+            SUBJECT,
+        )
+        marker_lock_target = str(marker_durable_home / "state" / "locks" / "image-catalog.lock")
+        marker_images_target = str(marker_durable_home / "images")
+
+        bootstrap_durable_home = new_home(root, "bootstrap-durable-recovery-home")
+        bootstrap_child = hard_exit_add(
+            bootstrap_durable_home,
+            "vendor.worker",
+            SUBJECT,
+            "bootstrap.after_rename",
+        )
+        bootstrap_rc, bootstrap_value, bootstrap_error, bootstrap_targets = traced_catalog_add(
+            bootstrap_durable_home,
+            "vendor.worker",
+            SUBJECT,
+        )
+
+        pointer_durable_home = new_home(root, "pointer-durable-recovery-home")
+        add(pointer_durable_home)
+        pointer_child = hard_exit_add(
+            pointer_durable_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "pointer.after_replace",
+        )
+        pointer_rc, pointer_value, pointer_error, pointer_targets = traced_catalog_add(
+            pointer_durable_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+        )
+
+        cleanup_durable_home = new_home(root, "cleanup-durable-recovery-home")
+        add(cleanup_durable_home)
+        cleanup_rc, cleanup_value, cleanup_error, cleanup_targets = traced_catalog_add(
+            cleanup_durable_home,
+            "vendor.worker",
+            SUBJECT,
+        )
+        marker_ordered = (
+            marker_lock_target in marker_targets
+            and marker_images_target in marker_targets
+            and marker_targets.index(marker_lock_target) < marker_targets.index(marker_images_target)
+        )
+        check(
+            "CAT-CRASH-010",
+            marker_child == 99
+            and marker_rc == 0
+            and isinstance(marker_value, dict)
+            and marker_value.get("changed") is False
+            and marker_error is None
+            and marker_ordered
+            and bootstrap_child == 99
+            and bootstrap_rc == 0
+            and isinstance(bootstrap_value, dict)
+            and bootstrap_value.get("changed") is False
+            and bootstrap_error is None
+            and str(bootstrap_durable_home / "images") in bootstrap_targets
+            and pointer_child == 99
+            and pointer_rc == 0
+            and isinstance(pointer_value, dict)
+            and pointer_value.get("changed") is False
+            and pointer_error is None
+            and str(pointer_durable_home / "images" / "catalog") in pointer_targets
+            and cleanup_rc == 0
+            and isinstance(cleanup_value, dict)
+            and cleanup_value.get("changed") is False
+            and cleanup_error is None
+            and str(cleanup_durable_home / "images" / ".staging") in cleanup_targets,
+            "recovery completes marker, commit-parent, and cleanup-root durability before success",
+            (
+                f"marker=({marker_child},{marker_rc},{marker_targets!r}) "
+                f"bootstrap=({bootstrap_child},{bootstrap_rc},{bootstrap_targets!r}) "
+                f"pointer=({pointer_child},{pointer_rc},{pointer_targets!r}) "
+                f"cleanup=({cleanup_rc},{cleanup_targets!r})"
+            ),
         )
 
         platform_home = new_home(root, "platform-home")
@@ -909,9 +1183,12 @@ def main() -> int:
         "CAT-STATE-014",
         "CAT-STATE-015",
         "CAT-STATE-016",
+        "CAT-STATE-018",
         "CAT-STATE-017",
         "CAT-BOUND-001",
         "CAT-BOUND-002",
+        "CAT-BOUND-003",
+        "CAT-BOUND-004",
         "CAT-CRASH-001",
         "CAT-CRASH-002",
         "CAT-CRASH-003",
@@ -920,12 +1197,14 @@ def main() -> int:
         "CAT-CRASH-006",
         "CAT-CRASH-007",
         "CAT-CRASH-008",
+        "CAT-CRASH-009",
+        "CAT-CRASH-010",
         "CAT-PLAT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=28 expected=28 failures={FAILURES} infra=0")
+    print(f"SUMMARY assertions=33 expected=33 failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
