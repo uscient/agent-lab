@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import re
 import stat
+import subprocess
 import sys
 
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
@@ -164,6 +165,35 @@ def main(argv: list[str]) -> int:
             sys.stdout.buffer.write(loaded[1])
         else:
             print("valid:true")
+        return 0
+    if argv == ["tools", "provision"]:
+        try:
+            loaded = load_config(home)
+        except RuntimeError as error:
+            print(f"INFRA Agent Lab {error}", file=sys.stderr)
+            return 125
+        if loaded is None:
+            print("FAIL Agent Lab home is not initialized", file=sys.stderr)
+            return 1
+        paths = loaded[0]["paths"]
+        assert isinstance(paths, dict)
+        cache = home / str(paths["cache"]) / "tools"
+        root = Path(__file__).resolve().parent.parent
+        environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        for name in ("cue", "cedar"):
+            environment[f"AGENT_LAB_{name.upper()}_TOOL_DIR"] = str(cache / name)
+            completed = subprocess.run(
+                [sys.executable, "-I", str(root / f"scripts/dev/{name}-tool.py"), "provision"],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+            if completed.returncode != 0:
+                sys.stderr.buffer.write(completed.stderr)
+                return 125
+        print("tools:ready")
         return 0
     if argv[:2] == ["experiment", "check"] and len(argv) == 3:
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
