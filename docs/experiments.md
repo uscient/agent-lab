@@ -1,9 +1,10 @@
 # Experiments
 
-An Experiment is authored as data in a directory containing exactly one file, `experiment.cue`.
-The file defines one concrete value named `experiment` in package `experiment`. Agent Lab snapshots
-the exact bytes privately before evaluating them; extra entries, links, special files, suspicious
-modes, changing sources, malformed CUE, and unknown schema fields are refused.
+An Experiment is authored as data in a directory containing exactly one file, `experiment.cue`, or
+in a bounded ZIP archive containing that exact sole member. The file defines one concrete value named
+`experiment` in package `experiment`. Agent Lab snapshots the exact authored bytes privately before
+evaluating them; extra entries, links, special files, suspicious modes, changing sources, malformed
+CUE, and unknown schema fields are refused.
 
 ```cue
 package experiment
@@ -25,6 +26,8 @@ Check the artifact or preview its install authorization from the repository:
 ```bash
 ./scripts/agent-lab experiment check ./my-experiment
 ./scripts/agent-lab experiment authorize install ./my-experiment
+./scripts/agent-lab experiment check --zip ./my-experiment.zip
+./scripts/agent-lab experiment authorize install --zip ./my-experiment.zip
 ```
 
 These two commands are previews. They create no durable Agent Lab state and do not invoke Docker or
@@ -36,6 +39,7 @@ Install a freshly checked and permitted artifact, then inspect its stored identi
 
 ```bash
 agent-lab [--home /absolute/private/home] experiment install ./my-experiment
+agent-lab [--home /absolute/private/home] experiment install --zip ./my-experiment.zip
 agent-lab [--home /absolute/private/home] experiment inspect example
 ```
 
@@ -45,6 +49,15 @@ or name override. A permit is evidence for that exact candidate only; installati
 source, plan, decision, provenance, and receipt without running content, invoking Docker, acquiring
 image bytes, or claiming runtime admission. The decision and receipt bind the same domain-separated
 plan identity rather than an unframed hash of the JSON bytes.
+
+ZIP intake reads one stable archive into at most 1,048,576 bytes and accepts only stored or deflated
+`experiment.cue` data that expands to at most 262,144 bytes. ZIP64, multidisk archives, encryption,
+comments, extra fields, alternate paths, extra members, special file types, inconsistent headers,
+bad CRC or lengths, truncated streams, and trailing bytes are rejected before CUE evaluation. Agent
+Lab never extracts the archive or chooses a destination from caller data. The normalized source
+digest is identical to directory intake for identical authored bytes; installation provenance also
+records the raw archive byte count and SHA-256 digest. Archive identity does not affect the plan,
+authorization binding, installation key, or idempotent cross-transport retry.
 
 An exact retry freshly validates and authorizes again, verifies the complete installed envelope,
 and returns `changed:false` with the same `installationKey` and `receiptDigest`. The same requested
