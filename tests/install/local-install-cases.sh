@@ -39,6 +39,7 @@ if [ -f "$repo_root/scripts/install-local.py" ]; then
   chmod +x "$replica/scripts/install-local" "$replica/scripts/agent-lab"
   install_rc=0
   "$replica/scripts/install-local" --prefix "$prefix" > "$work/install.out" 2> "$work/install.err" || install_rc=$?
+  cp -R "$repo_root/tests/experiment/fixtures/directories/minimal" "$work/artifact"
   mv "$replica" "$work/source-unavailable"
   mkdir "$work/unrelated"
   version_rc=0
@@ -52,5 +53,21 @@ else
   fail PKG-003 "installed CLI runs after its isolated source replica is unavailable"
 fi
 
-printf 'SUMMARY assertions=3 expected=3 failures=%s infra=0\n' "$failures"
+check_rc=125
+if [ "$install_rc" -eq 0 ] && [ "$version_rc" -eq 0 ]; then
+  "$prefix/bin/agent-lab" --home "$home" init > "$work/init.out" 2> "$work/init.err"
+  cp -a "$repo_root/.cache/dev/tools/cue/." "$home/cache/tools/cue/"
+  cp -a "$repo_root/.cache/dev/tools/cedar/." "$home/cache/tools/cedar/"
+  check_rc=0
+  (cd "$work/unrelated" && env -i PATH=/usr/bin:/bin "$prefix/bin/agent-lab" --home "$home" experiment check "$work/artifact") \
+    > "$work/check.out" 2> "$work/check.err" || check_rc=$?
+fi
+if [ "$check_rc" -eq 0 ] && [ ! -s "$work/check.err" ] &&
+   jq -e '.source.kind == "directory" and .plan.kind == "RequestedExperimentPlan"' "$work/check.out" >/dev/null 2>&1; then
+  pass PKG-004 "installed Experiment check is independent of the source checkout"
+else
+  fail PKG-004 "installed Experiment check is independent of the source checkout"
+fi
+
+printf 'SUMMARY assertions=4 expected=4 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
