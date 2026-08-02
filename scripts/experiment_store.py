@@ -2023,6 +2023,7 @@ def install_directory(
                 _revalidate_authority(authority)
                 _fault(fault, "experiment envelope.before_noreplace")
                 experiment.verify_trusted_inputs(plan, decision)
+                _revalidate_authority(authority)
                 _rename_noreplace(wrapper / "payload", authority.store / name)
                 _fsync_directory(
                     wrapper,
