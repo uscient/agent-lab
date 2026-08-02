@@ -392,12 +392,37 @@ mkdir "$malformed_control"
 malformed_rc=0
 AGENT_LAB_CATALOG_AGG_CONTROL="$malformed_control" \
   bash "$malformed_aggregate" > "$work/malformed.out" 2>&1 || malformed_rc=$?
-if [ "$malformed_mutation_rc" -eq 0 ] && [ "$malformed_rc" -eq 125 ] &&
+trailing_aggregate="$replica/tests/experiment/local-image-catalog-trailing-status.sh"
+awk '
+  index($0, "printf") && index($0, "$rc") && index($0, "$status") {
+    print "  printf \"0\\\\nTRAILING-GARBAGE\" > \"$status\""
+    changed++
+    next
+  }
+  { print }
+  END { if (changed != 1) exit 42 }
+' "$replica_aggregate" > "$trailing_aggregate"
+trailing_mutation_rc=$?
+chmod +x "$trailing_aggregate"
+reset_fixtures
+trailing_control="$work/trailing-control"
+mkdir "$trailing_control"
+: > "$trailing_control/executions"
+trailing_rc=0
+AGENT_LAB_CATALOG_AGG_CONTROL="$trailing_control" \
+  bash "$trailing_aggregate" > "$work/trailing.out" 2>&1 || trailing_rc=$?
+if [ "$malformed_mutation_rc" -eq 0 ] && [ "$trailing_mutation_rc" -eq 0 ] &&
+   [ "$malformed_rc" -eq 125 ] && [ "$trailing_rc" -eq 125 ] &&
    grep -Fxq 'SUMMARY assertions=76 expected=76 failures=0 infra=1' \
      "$work/malformed.out" &&
+   grep -Fxq 'SUMMARY assertions=76 expected=76 failures=0 infra=1' \
+     "$work/trailing.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL IMAGE CATALOG PASS' "$work/malformed.out" &&
+   ! grep -Fxq 'EXPERIMENT LOCAL IMAGE CATALOG PASS' "$work/trailing.out" &&
    cmp -s <(LC_ALL=C sort "$expected_executions") \
-     <(LC_ALL=C sort "$malformed_control/executions"); then
+     <(LC_ALL=C sort "$malformed_control/executions") &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") \
+     <(LC_ALL=C sort "$trailing_control/executions"); then
   pass AGG-018 "malformed lane status fails closed before success"
 else
   fail AGG-018 "malformed lane status fails closed before success"
