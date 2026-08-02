@@ -620,13 +620,31 @@ def main() -> int:
                     corrupt_blob
                 )
                 corrupt_outcome = acquire(corrupt_responses)
+                same_length_source = source.replace(b'"serve"', b'"shell"', 1)
+                same_length_blob = dict(blob_body)
+                same_length_blob["content"] = base64.b64encode(
+                    same_length_source
+                ).decode("ascii")
+                same_length_responses = dict(fixture_responses)
+                same_length_responses[
+                    f"/repos/uscient/experiment-fixture/git/blobs/{BLOB}"
+                ] = response(same_length_blob)
+                same_length_outcome = acquire(same_length_responses)
                 results.append(
                     (
                         "GIT-BLOB-001",
                         wrapped_outcome[0] == "ok"
                         and wrapped_outcome[1].data == source
                         and corrupt_outcome[0] == "infra"
-                        and "GIT-BLOB" in corrupt_outcome[1],
+                        and "GIT-BLOB" in corrupt_outcome[1]
+                        and same_length_source != source
+                        and len(same_length_source) == len(source)
+                        and git_oid("blob", same_length_source) != BLOB
+                        and same_length_blob["sha"] == BLOB
+                        and same_length_blob["size"] == len(source)
+                        and same_length_outcome[0] == "infra"
+                        and same_length_outcome[1]
+                        == "git provider GIT-BLOB object identity is inconsistent",
                         "documented base64 wrapping is accepted but object drift is not",
                     )
                 )
@@ -639,7 +657,7 @@ def main() -> int:
                 )
                 drift_outcome = acquire(drift_responses)
 
-                bound_drift_source = source.replace(b'"serve"', b'"shell"', 1)
+                bound_drift_source = same_length_source
                 bound_drift_blob = git_oid("blob", bound_drift_source)
                 bound_drift_blob_path = (
                     f"/repos/uscient/experiment-fixture/git/blobs/{bound_drift_blob}"
