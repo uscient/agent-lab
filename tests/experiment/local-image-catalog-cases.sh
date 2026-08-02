@@ -175,21 +175,16 @@ for index in "${!subcases[@]}"; do
     infrastructure=1
     continue
   fi
-  if [ ! -f "$status" ] || [ "$(wc -l < "$status")" -ne 1 ] ||
-     ! IFS= read -r rc < "$status"; then
+  if [ -f "$status" ] && cmp -s "$status" <(printf '0\n'); then
+    rc=0
+  elif [ -f "$status" ] && cmp -s "$status" <(printf '1\n'); then
+    rc=1
+  elif [ -f "$status" ] && cmp -s "$status" <(printf '125\n'); then
+    rc=125
+  else
     printf 'INFRA catalog subcase status is missing or invalid: %s\n' "$subcase" >&2
     rc=125
     infrastructure=1
-  else
-    case "$rc" in
-      0 | 1 | 125)
-        ;;
-      *)
-        printf 'INFRA catalog subcase status is missing or invalid: %s\n' "$subcase" >&2
-        rc=125
-        infrastructure=1
-        ;;
-    esac
   fi
   awk '/^(PASS|FAIL) [A-Z0-9-]+ /' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
