@@ -3,4 +3,4 @@ set -euo pipefail
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 script_dir="$(cd -- "$(dirname -- "$script_path")" >/dev/null 2>&1 && pwd)"
-exec python3 -I "$script_dir/agent-lab.py" "$@"
+exec python3 -I -B "$script_dir/agent-lab.py" "$@"

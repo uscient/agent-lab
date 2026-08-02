@@ -2,12 +2,7 @@
 set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-subcases=(
-  "$repo_root/tests/install/local-install-cases.sh"
-  "$repo_root/tests/experiment/local-config-cases.sh"
-  "$repo_root/tests/experiment/local-image-catalog-cases.sh"
-)
-expected_count=86
+expected_count=76
 work=""
 
 cleanup_work() {
@@ -27,11 +22,16 @@ if ! work="$(mktemp -d)"; then
 fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 
+subcases=(
+  "$repo_root/tests/image/catalog-cases.sh"
+  "$repo_root/tests/image/catalog-state-cases.py"
+  "$repo_root/tests/experiment/catalog-resolution-cases.sh"
+  "$repo_root/tests/image/catalog-mutation-cases.py"
+)
 expected="$work/expected"
 observed="$work/observed"
+: > "$observed"
 printf '%s\n' \
-  PKG-001 PKG-002 PKG-003 PKG-004 PKG-005 \
-  CFG-001 CFG-002 CFG-003 CFG-004 TOOL-001 \
   CAT-NAME-001 CAT-NAME-002 CAT-OCI-001 CAT-OCI-002 \
   CAT-ADD-001 CAT-ADD-002 CAT-ADD-003 CAT-ADD-004 CAT-NS-001 \
   CAT-CAS-001 CAT-CAS-002 CAT-CAS-003 CAT-CAS-004 \
@@ -49,51 +49,56 @@ printf '%s\n' \
   RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001 \
   M-CAT-OCI-001 M-CAT-SHADOW-001 M-CAT-CAS-001 M-CAT-AUTH-001 M-RES-BIND-001 \
   M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001 > "$expected"
-: > "$observed"
-
+declared_count="$(wc -l < "$expected")"
+if [ "$declared_count" -ne "$expected_count" ]; then
+  printf 'INFRA catalog aggregate expected-count drift\n' >&2
+  exit 125
+fi
 infrastructure=0
+
 for index in "${!subcases[@]}"; do
   subcase="${subcases[$index]}"
   output="$work/subcase-$index.out"
   if [ ! -f "$subcase" ]; then
+    printf 'INFRA required catalog subcase is missing: %s\n' "$subcase" >&2
     infrastructure=1
     continue
   fi
-  if bash "$subcase" > "$output" 2>&1; then
-    rc=0
-  else
-    rc=$?
-  fi
-  awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print}' "$output"
-  awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
-  reported_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
-  reported_failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
-  expected_summary="SUMMARY assertions=$reported_assertions expected=$reported_assertions failures=$reported_failures infra=0"
-  matching_summaries="$(grep -Fxc "$expected_summary" "$output" || true)"
-  all_summaries="$(grep -c '^SUMMARY ' "$output" || true)"
-  if [ "$matching_summaries" -ne 1 ] || [ "$all_summaries" -ne 1 ]; then
-    infrastructure=1
-  fi
-  case "$rc" in
-    0)
-      if [ "$reported_failures" -ne 0 ]; then
-        infrastructure=1
-      fi
-      ;;
-    1)
-      if [ "$reported_failures" -eq 0 ]; then
-        infrastructure=1
-      fi
+  case "$subcase" in
+    *.py)
+      python3 -I -B "$subcase" > "$output" 2>&1
+      rc=$?
       ;;
     *)
-      infrastructure=1
+      bash "$subcase" > "$output" 2>&1
+      rc=$?
       ;;
   esac
+  awk '/^(PASS|FAIL) [A-Z0-9-]+ /' "$output"
+  awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
+  subcase_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
+  subcase_failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
+  summary="SUMMARY assertions=$subcase_assertions expected=$subcase_assertions failures=$subcase_failures infra=0"
+  summary_count="$(grep -Fxc "$summary" "$output" || true)"
+  all_summary_count="$(grep -c '^SUMMARY ' "$output" || true)"
+  if [ "$summary_count" -ne 1 ] || [ "$all_summary_count" -ne 1 ]; then
+    printf 'INFRA catalog subcase summary is absent or inconsistent: %s\n' "$subcase" >&2
+    cat "$output" >&2
+    infrastructure=1
+  elif { [ "$rc" -eq 0 ] && [ "$subcase_failures" -ne 0 ]; } \
+    || { [ "$rc" -eq 1 ] && [ "$subcase_failures" -eq 0 ]; } \
+    || { [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; }; then
+    printf 'INFRA catalog subcase status is inconsistent: rc=%s path=%s\n' "$rc" "$subcase" >&2
+    cat "$output" >&2
+    infrastructure=1
+  fi
 done
 
 assertions="$(wc -l < "$observed")"
 failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$work"/subcase-*.out 2>/dev/null)"
 if ! cmp -s "$expected" "$observed"; then
+  printf 'FAIL catalog aggregate assertion identity drift\n' >&2
+  diff -u "$expected" "$observed" >&2 || true
   failures=$((failures + 1))
 fi
 
@@ -110,4 +115,4 @@ fi
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi
-printf 'EXPERIMENT LOCAL LIFECYCLE PASS\n'
+printf 'EXPERIMENT LOCAL IMAGE CATALOG PASS\n'

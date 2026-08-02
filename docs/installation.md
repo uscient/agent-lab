@@ -27,6 +27,9 @@ The default mutable home is the account-database home plus `.agent-lab`; `--home
 over `AGENT_LAB_HOME`. Ambient `HOME` is ignored. The first `init` may choose distinct safe
 single-component names with `--experiments-dir`, `--images-dir`, `--cache-dir`, and `--state-dir`.
 Those choices are frozen by `home.json`; later drift or conflicting initialization is refused.
+The same receipt binds the device, inode, relative path, and schema of both stable lock files.
+`config check` and exact `init` retry refuse a replaced lock or unexpected lock contents as
+infrastructure uncertainty.
 
 `tools provision` is the only foundation command allowed to acquire the pinned CUE and Cedar
 binaries. Normal commands never download them automatically. Program releases, Experiment data,
