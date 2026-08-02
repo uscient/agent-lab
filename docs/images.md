@@ -50,11 +50,17 @@ reachable transition chain, all physical history, ownership and modes, fixed cou
 bounds. Unsafe, missing initialized, changing, or corrupt authority returns `125`; an unknown or
 removed logical name returns `1`.
 
+The initialized-home receipt binds the catalog lock's device, inode, path, and schema. The lock
+starts with its schema line and appends exactly one `initialized` line only after the first complete
+staged catalog is durable and immediately before its no-replace commit. A matching bounded intent
+distinguishes that pre-commit recovery window; replacement or any other bytes fail closed.
+
 Mutations prepare one bounded intent beneath `images/.staging/`. A first catalog uses Linux
 no-replace directory publication. Later changes durably publish immutable records before atomically
 advancing and syncing the current pointer. The next mutation reconciles a recognized interrupted
-intent against the observed pointer; unknown residue is preserved and returns `125`.
+intent against the observed pointer. After it proves that cleanup is safe, it durably renames the
+operation to one bounded cleanup wrapper before removing any contents, so a crash during cleanup is
+restartable. Unknown or unsafe residue is preserved and returns `125`.
 
 This is tamper-evident state for a cooperative local account, not protection from a hostile process
 running as the same user.
-
