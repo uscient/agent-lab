@@ -2,13 +2,31 @@
 set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-work="$(mktemp -d)"
-trap 'find "$work" -type f -delete 2>/dev/null || true; find "$work" -type l -delete 2>/dev/null || true; find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || true' EXIT
+expected_count=76
+work=""
+
+cleanup_work() {
+  local failed=0
+  if [ -n "$work" ] && [ -e "$work" ]; then
+    find "$work" -type f -delete 2>/dev/null || failed=1
+    find "$work" -type l -delete 2>/dev/null || failed=1
+    find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || failed=1
+    [ ! -e "$work" ] || failed=1
+  fi
+  return "$failed"
+}
+
+if ! work="$(mktemp -d)"; then
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+fi
+trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 
 subcases=(
   "$repo_root/tests/image/catalog-cases.sh"
   "$repo_root/tests/image/catalog-state-cases.py"
   "$repo_root/tests/experiment/catalog-resolution-cases.sh"
+  "$repo_root/tests/image/catalog-mutation-cases.py"
 )
 expected="$work/expected"
 observed="$work/observed"
@@ -21,12 +39,21 @@ printf '%s\n' \
   CAT-STATE-001 CAT-STATE-002 CAT-STATE-003 CAT-STATE-004 \
   CAT-STATE-005 CAT-STATE-006 CAT-STATE-007 CAT-STATE-008 \
   CAT-STATE-009 CAT-STATE-010 CAT-STATE-011 CAT-STATE-012 \
-  CAT-BOUND-001 CAT-BOUND-002 CAT-CRASH-001 CAT-CRASH-002 \
-  CAT-CRASH-003 CAT-PLAT-001 \
+  CAT-STATE-013 CAT-STATE-014 CAT-STATE-015 CAT-STATE-016 CAT-STATE-018 CAT-STATE-017 \
+  CAT-BOUND-001 CAT-BOUND-002 CAT-BOUND-003 CAT-BOUND-004 \
+  CAT-CRASH-001 CAT-CRASH-002 CAT-CRASH-003 CAT-CRASH-004 CAT-CRASH-005 \
+  CAT-CRASH-006 CAT-CRASH-007 CAT-CRASH-008 CAT-CRASH-009 CAT-CRASH-010 \
+  CAT-CRASH-011 CAT-PLAT-001 \
   RES-ENTRY-001 RES-SNAP-001 RES-SNAP-002 RES-ENTRY-002 RES-ENTRY-003 \
   RES-ISOLATE-001 RES-STATE-001 RES-STATE-002 RES-STATE-003 RES-INPUT-001 \
-  RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001 > "$expected"
-expected_count="$(wc -l < "$expected")"
+  RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001 \
+  M-CAT-OCI-001 M-CAT-SHADOW-001 M-CAT-CAS-001 M-CAT-AUTH-001 M-RES-BIND-001 \
+  M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001 > "$expected"
+declared_count="$(wc -l < "$expected")"
+if [ "$declared_count" -ne "$expected_count" ]; then
+  printf 'INFRA catalog aggregate expected-count drift\n' >&2
+  exit 125
+fi
 infrastructure=0
 
 for index in "${!subcases[@]}"; do
@@ -39,7 +66,7 @@ for index in "${!subcases[@]}"; do
   fi
   case "$subcase" in
     *.py)
-      python3 -I "$subcase" > "$output" 2>&1
+      python3 -I -B "$subcase" > "$output" 2>&1
       rc=$?
       ;;
     *)
@@ -47,10 +74,22 @@ for index in "${!subcases[@]}"; do
       rc=$?
       ;;
   esac
-  cat "$output"
+  awk '/^(PASS|FAIL) [A-Z0-9-]+ /' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
-  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
-    printf 'INFRA catalog subcase returned %s: %s\n' "$rc" "$subcase" >&2
+  subcase_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
+  subcase_failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
+  summary="SUMMARY assertions=$subcase_assertions expected=$subcase_assertions failures=$subcase_failures infra=0"
+  summary_count="$(grep -Fxc "$summary" "$output" || true)"
+  all_summary_count="$(grep -c '^SUMMARY ' "$output" || true)"
+  if [ "$summary_count" -ne 1 ] || [ "$all_summary_count" -ne 1 ]; then
+    printf 'INFRA catalog subcase summary is absent or inconsistent: %s\n' "$subcase" >&2
+    cat "$output" >&2
+    infrastructure=1
+  elif { [ "$rc" -eq 0 ] && [ "$subcase_failures" -ne 0 ]; } \
+    || { [ "$rc" -eq 1 ] && [ "$subcase_failures" -eq 0 ]; } \
+    || { [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; }; then
+    printf 'INFRA catalog subcase status is inconsistent: rc=%s path=%s\n' "$rc" "$subcase" >&2
+    cat "$output" >&2
     infrastructure=1
   fi
 done
@@ -58,10 +97,15 @@ done
 assertions="$(wc -l < "$observed")"
 failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$work"/subcase-*.out 2>/dev/null)"
 if ! cmp -s "$expected" "$observed"; then
-  printf 'INFRA catalog aggregate assertion identity drift\n' >&2
+  printf 'FAIL catalog aggregate assertion identity drift\n' >&2
   diff -u "$expected" "$observed" >&2 || true
+  failures=$((failures + 1))
+fi
+
+if ! cleanup_work; then
   infrastructure=1
 fi
+trap - EXIT
 
 printf 'SUMMARY assertions=%s expected=%s failures=%s infra=%s\n' \
   "$assertions" "$expected_count" "$failures" "$infrastructure"
