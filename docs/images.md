@@ -33,6 +33,18 @@ Removal requires the active entry digest from add or inspect. An exact compare-a
 generation-2 tombstone. Retrying with the original active digest is idempotent; every other token
 conflicts. A tombstoned name cannot be reused or restored in v0alpha1.
 
+`image remove` removes only the local name from future selection. It does not call Docker, remove
+runtime image bytes, stop a workload, or delete an installed Experiment envelope. A retained
+installed envelope remains inspectable because it binds the exact selected entry identity; a new or
+exact-retry install using the tombstoned name fails its liveness check. Runtime image removal and
+stored-artifact uninstall are separate future operations, and neither is implemented by this
+command.
+
+During `experiment install`, a selected local entry is rechecked after the fresh permit under the
+stable shared catalog lock. The lock remains held through Experiment publication, so a concurrent
+catalog removal cannot invalidate the selected entry mid-install. This proves naming liveness only;
+it does not perform image acquisition or admission.
+
 ## Stored authority
 
 The configured images component contains immutable entry and snapshot histories plus one current
