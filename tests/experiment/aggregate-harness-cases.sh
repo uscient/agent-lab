@@ -3,7 +3,7 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
-expected_count=9
+expected_count=13
 work=""
 
 cleanup_work() {
@@ -51,10 +51,25 @@ expected_ids=(
   RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001
   M-CAT-OCI-001 M-CAT-SHADOW-001 M-CAT-CAS-001 M-CAT-AUTH-001 M-RES-BIND-001
   M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001
+  INST-HOME-001 INST-UNKNOWN-001 INST-NAME-001 INST-PERMIT-001 INST-RECEIPT-001
+  INST-INSPECT-001 INST-RETRY-001 INST-CONFLICT-001 INST-DENY-001
+  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 INST-RUNTIME-001
+  IST-STATE-001 IST-LOCK-001 IST-STATE-002 IST-BOUND-001 IST-STATE-003
+  IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001 IST-PROV-001
+  IST-PREFLIGHT-001 IST-SNAPSHOT-001 IST-CONFIG-001 IST-READ-001 IST-FAULT-001
+  IIN-CLEAN-001 IIN-CONTRACT-001 IIN-BUNDLE-001 IIN-LOCK-001
+  IIN-SNAPSHOT-001 IIN-PREFLIGHT-001 IIN-PLAN-001
+  M-STORE-AUTH-001 M-STORE-SOURCE-001 M-STORE-ATOM-001 M-STORE-RETRY-001
+  M-STORE-DUR-001 M-STORE-LAYOUT-001 M-STORE-KEY-001 M-STORE-VERIFY-001
+  M-STORE-LIVE-001 M-STORE-UNCERT-001 M-STORE-STAGE-001
 )
 installer_ids=("${expected_ids[@]:0:5}")
 config_ids=("${expected_ids[@]:5:5}")
-catalog_ids=("${expected_ids[@]:10}")
+catalog_ids=("${expected_ids[@]:10:76}")
+install_ids=("${expected_ids[@]:86:13}")
+state_ids=("${expected_ids[@]:99:16}")
+integrity_ids=("${expected_ids[@]:115:7}")
+mutation_ids=("${expected_ids[@]:122:11}")
 
 write_fixture() {
   local path="$1"
@@ -67,6 +82,50 @@ write_fixture() {
     printf 'if [ -n "${AGENT_LAB_AGG_EXEC_LOG:-}" ]; then\n'
     printf "  printf '%%s\\n' '%s' >> \"\$AGENT_LAB_AGG_EXEC_LOG\" || exit 125\n" "$execution_id"
     printf 'fi\n'
+    case "$execution_id" in
+      local-install-cases.sh | local-image-catalog-cases.sh)
+        printf 'if [ -n "${AGENT_LAB_AGG_BARRIER_DIR:-}" ]; then\n'
+        printf "  : > \"\$AGENT_LAB_AGG_BARRIER_DIR/%s.ready\" || exit 125\n" "$execution_id"
+        printf '  attempts=0\n'
+        printf '  while [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/local-install-cases.sh.ready" ] ||\n'
+        printf '        [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/local-image-catalog-cases.sh.ready" ] ||\n'
+        printf '        [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/install-state-cases.py.ready" ]; do\n'
+        printf '    attempts=$((attempts + 1))\n'
+        printf '    [ "$attempts" -lt 200 ] || exit 125\n'
+        printf '    sleep 0.01\n'
+        printf '  done\n'
+        printf 'fi\n'
+        ;;
+    esac
+    printf 'if [ -n "${AGENT_LAB_AGG_HOLD_DIR:-}" ] &&\n'
+    printf "   [ \"\${AGENT_LAB_AGG_HOLD_ID:-}\" = '%s' ]; then\n" "$execution_id"
+    printf '  : > "$AGENT_LAB_AGG_HOLD_DIR/ready" || exit 125\n'
+    printf '  attempts=0\n'
+    printf '  while [ ! -f "$AGENT_LAB_AGG_HOLD_DIR/release" ]; do\n'
+    printf '    attempts=$((attempts + 1))\n'
+    printf '    [ "$attempts" -lt 500 ] || exit 125\n'
+    printf '    sleep 0.01\n'
+    printf '  done\n'
+    printf 'fi\n'
+    if [ "$execution_id" = "local-image-catalog-cases.sh" ]; then
+      printf 'if [ -n "${AGENT_LAB_AGG_SIGNAL_DIR:-}" ]; then\n'
+      printf '  sleep 30 &\n'
+      printf '  descendant_pid=$!\n'
+      printf '  printf "%%s\\n" "$descendant_pid" > "$AGENT_LAB_AGG_SIGNAL_DIR/descendant.pid" || exit 125\n'
+      printf '  : > "$AGENT_LAB_AGG_SIGNAL_DIR/ready" || exit 125\n'
+      printf '  wait "$descendant_pid"\n'
+      printf 'fi\n'
+      printf 'if [ -n "${AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR:-}" ]; then\n'
+      printf '  (\n'
+      printf "    trap '' HUP INT QUIT TERM\n"
+      printf '    printf "%%s\\n" "$BASHPID" > "$AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR/descendant.pid" || exit 125\n'
+      printf '    : > "$AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR/ready" || exit 125\n'
+      printf '    sleep 30\n'
+      printf '  ) &\n'
+      printf '  descendant_pid=$!\n'
+      printf '  wait "$descendant_pid"\n'
+      printf 'fi\n'
+    fi
     for record in "$@"; do
       kind="${record%%:*}"
       id="${record#*:}"
@@ -75,7 +134,65 @@ write_fixture() {
     done
     printf "printf 'SUMMARY assertions=%s expected=%s failures=%s infra=0\\n'\n" \
       "$#" "$#" "$fixture_failures"
+    printf 'if [ -n "${AGENT_LAB_AGG_DONE_DIR:-}" ]; then\n'
+    printf "  : > \"\$AGENT_LAB_AGG_DONE_DIR/%s.done\" || exit 125\n" "$execution_id"
+    printf 'fi\n'
     printf 'exit %s\n' "$rc"
+  } > "$path"
+  chmod +x "$path"
+}
+
+write_python_fixture() {
+  local path="$1"
+  local rc="$2"
+  shift 2
+  local record kind id fixture_failures=0
+  local execution_id="${path##*/}"
+  {
+    printf '#!/usr/bin/env python3\n'
+    printf 'import os\n'
+    printf 'from pathlib import Path\n'
+    printf 'import time\n'
+    printf 'log = os.environ.get("AGENT_LAB_AGG_EXEC_LOG")\n'
+    printf 'if log:\n'
+    printf '    with open(log, "a", encoding="ascii") as stream:\n'
+    printf "        stream.write('%s\\\\n')\n" "$execution_id"
+    printf "hold_dir = os.environ.get('AGENT_LAB_AGG_HOLD_DIR')\n"
+    printf "hold_id = os.environ.get('AGENT_LAB_AGG_HOLD_ID')\n"
+    printf "if hold_dir and hold_id == '%s':\n" "$execution_id"
+    printf "    Path(hold_dir, 'ready').touch()\n"
+    printf '    deadline = time.monotonic() + 5.0\n'
+    printf "    while not Path(hold_dir, 'release').is_file():\n"
+    printf '        if time.monotonic() >= deadline:\n'
+    printf '            raise SystemExit(125)\n'
+    printf '        time.sleep(0.01)\n'
+    if [ "$execution_id" = "install-state-cases.py" ]; then
+      printf 'barrier = os.environ.get("AGENT_LAB_AGG_BARRIER_DIR")\n'
+      printf 'if barrier:\n'
+      printf "    Path(barrier, '%s.ready').touch()\n" "$execution_id"
+      printf '    peers = (\n'
+      printf "        'local-install-cases.sh.ready',\n"
+      printf "        'local-image-catalog-cases.sh.ready',\n"
+      printf "        'install-state-cases.py.ready',\n"
+      printf '    )\n'
+      printf '    deadline = time.monotonic() + 2.0\n'
+      printf '    while not all(Path(barrier, peer).is_file() for peer in peers):\n'
+      printf '        if time.monotonic() >= deadline:\n'
+      printf '            raise SystemExit(125)\n'
+      printf '        time.sleep(0.01)\n'
+    fi
+    for record in "$@"; do
+      kind="${record%%:*}"
+      id="${record#*:}"
+      [ "$kind" = "FAIL" ] && fixture_failures=$((fixture_failures + 1))
+      printf "print('%s %s fixture assertion')\n" "$kind" "$id"
+    done
+    printf "print('SUMMARY assertions=%s expected=%s failures=%s infra=0')\n" \
+      "$#" "$#" "$fixture_failures"
+    printf "done_dir = os.environ.get('AGENT_LAB_AGG_DONE_DIR')\n"
+    printf 'if done_dir:\n'
+    printf "    Path(done_dir, '%s.done').touch()\n" "$execution_id"
+    printf 'raise SystemExit(%s)\n' "$rc"
   } > "$path"
   chmod +x "$path"
 }
@@ -89,12 +206,21 @@ pass_records() {
 
 reset_fixtures() {
   local installer_records=() config_records=() catalog_records=()
+  local install_records=() state_records=() integrity_records=() mutation_records=()
   mapfile -t installer_records < <(pass_records "${installer_ids[@]}")
   mapfile -t config_records < <(pass_records "${config_ids[@]}")
   mapfile -t catalog_records < <(pass_records "${catalog_ids[@]}")
+  mapfile -t install_records < <(pass_records "${install_ids[@]}")
+  mapfile -t state_records < <(pass_records "${state_ids[@]}")
+  mapfile -t integrity_records < <(pass_records "${integrity_ids[@]}")
+  mapfile -t mutation_records < <(pass_records "${mutation_ids[@]}")
   write_fixture "$replica/tests/install/local-install-cases.sh" 0 "${installer_records[@]}"
   write_fixture "$replica/tests/experiment/local-config-cases.sh" 0 "${config_records[@]}"
   write_fixture "$replica/tests/experiment/local-image-catalog-cases.sh" 0 "${catalog_records[@]}"
+  write_fixture "$replica/tests/experiment/install-store-cases.sh" 0 "${install_records[@]}"
+  write_python_fixture "$replica/tests/experiment/install-state-cases.py" 0 "${state_records[@]}"
+  write_python_fixture "$replica/tests/experiment/install-integrity-cases.py" 0 "${integrity_records[@]}"
+  write_python_fixture "$replica/tests/experiment/install-mutation-cases.py" 0 "${mutation_records[@]}"
 }
 
 run_replica() {
@@ -111,6 +237,48 @@ run_selected() {
   return $?
 }
 
+wait_for_path() {
+  local path="$1"
+  local attempts=0
+  while [ ! -e "$path" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 500 ] || return 1
+    sleep 0.01
+  done
+}
+
+wait_for_process_exit() {
+  local pid="$1"
+  local attempts=0
+  while kill -0 "$pid" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || return 1
+    sleep 0.01
+  done
+}
+
+wait_for_child_wait() {
+  local pid="$1"
+  local expected_children="$2"
+  local attempts=0
+  local wchan child_list
+  local children=()
+
+  while [ "$attempts" -lt 100 ]; do
+    wchan="$(cat "/proc/$pid/wchan" 2>/dev/null || true)"
+    child_list="$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)"
+    children=()
+    read -r -a children <<< "$child_list"
+    if [ "$wchan" = "do_wait" ] &&
+       [ "${#children[@]}" -eq "$expected_children" ]; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.01
+  done
+  return 1
+}
+
 reset_fixtures
 expected_executions="$work/expected-executions"
 baseline_executions="$work/baseline-executions"
@@ -118,7 +286,11 @@ mutant_executions="$work/mutant-executions"
 printf '%s\n' \
   local-install-cases.sh \
   local-config-cases.sh \
-  local-image-catalog-cases.sh > "$expected_executions"
+  local-image-catalog-cases.sh \
+  install-store-cases.sh \
+  install-state-cases.py \
+  install-integrity-cases.py \
+  install-mutation-cases.py > "$expected_executions"
 : > "$baseline_executions"
 baseline_rc=0
 run_replica "$work/baseline.out" env \
@@ -144,18 +316,36 @@ printf '%s\n' \
   local-install-cases.sh \
   local-install-cases.sh \
   local-config-cases.sh \
-  local-image-catalog-cases.sh > "$mutant_expected"
+  local-image-catalog-cases.sh \
+  install-store-cases.sh \
+  install-state-cases.py \
+  install-integrity-cases.py \
+  install-mutation-cases.py > "$mutant_expected"
+
+overlap_barrier="$work/overlap-barrier"
+overlap_executions="$work/overlap-executions"
+mkdir "$overlap_barrier"
+: > "$overlap_executions"
+overlap_rc=0
+run_replica "$work/overlap.out" env \
+  AGENT_LAB_AGG_EXEC_LOG="$overlap_executions" \
+  AGENT_LAB_AGG_BARRIER_DIR="$overlap_barrier" || overlap_rc=$?
 
 if [ "$baseline_rc" -eq 0 ] &&
-   cmp -s "$expected_executions" "$baseline_executions" &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$baseline_executions") &&
    [ "$mutation_count" -eq 1 ] &&
    [ "$mutant_rc" -eq 0 ] &&
    cmp -s "$work/baseline.out" "$work/mutant.out" &&
-   cmp -s "$mutant_expected" "$mutant_executions" &&
-   ! cmp -s "$expected_executions" "$mutant_executions"; then
-  pass AGG-001 "independent execution ledger proves exact-once routing and detects a hidden duplicate"
+   cmp -s <(LC_ALL=C sort "$mutant_expected") <(LC_ALL=C sort "$mutant_executions") &&
+   ! cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$mutant_executions") &&
+   [ "$overlap_rc" -eq 0 ] &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$overlap_executions") &&
+   [ -f "$overlap_barrier/local-install-cases.sh.ready" ] &&
+   [ -f "$overlap_barrier/local-image-catalog-cases.sh.ready" ] &&
+   [ -f "$overlap_barrier/install-state-cases.py.ready" ]; then
+  pass AGG-001 "execution ledger and overlap barrier prove exact-once concurrent routing"
 else
-  fail AGG-001 "independent execution ledger proves exact-once routing and detects a hidden duplicate"
+  fail AGG-001 "execution ledger and overlap barrier prove exact-once concurrent routing"
 fi
 
 reset_fixtures
@@ -163,10 +353,10 @@ success_output="$work/success.out"
 success_rc=0
 run_replica "$success_output" env || success_rc=$?
 if [ "$success_rc" -eq 0 ] &&
-   [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 86 ] &&
-   [ "$(grep -Fxc 'SUMMARY assertions=86 expected=86 failures=0 infra=0' "$success_output")" -eq 1 ] &&
+   [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 133 ] &&
+   [ "$(grep -Fxc 'SUMMARY assertions=133 expected=133 failures=0 infra=0' "$success_output")" -eq 1 ] &&
    [ "$(tail -n 1 "$success_output")" = 'EXPERIMENT LOCAL LIFECYCLE PASS' ] &&
-   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=86 expected=86 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
+   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=133 expected=133 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
   pass AGG-002 "success forwards only assertions then one summary and marker"
 else
   fail AGG-002 "success forwards only assertions then one summary and marker"
@@ -215,7 +405,7 @@ write_fixture "$replica/tests/install/local-install-cases.sh" 1 "${failed_record
 assertion_rc=0
 run_replica "$work/assertion.out" env || assertion_rc=$?
 if [ "$assertion_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=86 expected=86 failures=1 infra=0' "$work/assertion.out" &&
+   grep -Fxq 'SUMMARY assertions=133 expected=133 failures=1 infra=0' "$work/assertion.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/assertion.out"; then
   pass AGG-006 "subcase assertion failure maps to one"
 else
@@ -229,15 +419,32 @@ write_fixture "$replica/tests/install/local-install-cases.sh" 125 "${uncertain_r
 subcase_infra_rc=0
 run_replica "$work/subcase-infra.out" env || subcase_infra_rc=$?
 reset_fixtures
+mixed_failed_records=()
+mixed_uncertain_records=()
+mapfile -t mixed_failed_records < <(pass_records "${installer_ids[@]}")
+mixed_failed_records[0]='FAIL:PKG-001'
+mapfile -t mixed_uncertain_records < <(pass_records "${config_ids[@]}")
+write_fixture "$replica/tests/install/local-install-cases.sh" 1 "${mixed_failed_records[@]}"
+write_fixture "$replica/tests/experiment/local-config-cases.sh" 125 "${mixed_uncertain_records[@]}"
+mixed_executions="$work/mixed-executions"
+: > "$mixed_executions"
+mixed_rc=0
+run_replica "$work/mixed.out" env \
+  AGENT_LAB_AGG_EXEC_LOG="$mixed_executions" || mixed_rc=$?
+reset_fixtures
 find "$replica/tests/install/local-install-cases.sh" -delete
 setup_infra_rc=0
 run_replica "$work/setup-infra.out" env || setup_infra_rc=$?
 if [ "$subcase_infra_rc" -eq 125 ] && [ "$setup_infra_rc" -eq 125 ] &&
+   [ "$mixed_rc" -eq 125 ] &&
+   grep -Fxq 'SUMMARY assertions=133 expected=133 failures=1 infra=1' "$work/mixed.out" &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$mixed_executions") &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/subcase-infra.out" &&
+   ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/mixed.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/setup-infra.out"; then
-  pass AGG-007 "setup and subcase uncertainty map to one hundred twenty-five"
+  pass AGG-007 "all lanes finish and uncertainty dominates assertion failure"
 else
-  fail AGG-007 "setup and subcase uncertainty map to one hundred twenty-five"
+  fail AGG-007 "all lanes finish and uncertainty dominates assertion failure"
 fi
 
 reset_fixtures
@@ -248,7 +455,7 @@ chmod +x "$shim/rmdir"
 cleanup_rc=0
 run_replica "$work/cleanup.out" env PATH="$shim:$PATH" || cleanup_rc=$?
 if [ "$cleanup_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=86 expected=86 failures=0 infra=1' "$work/cleanup.out" &&
+   grep -Fxq 'SUMMARY assertions=133 expected=133 failures=0 infra=1' "$work/cleanup.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/cleanup.out"; then
   pass AGG-008 "cleanup uncertainty maps to one hundred twenty-five before the marker"
 else
@@ -272,6 +479,164 @@ if [ "$summaryless_rc" -eq 125 ] &&
   pass AGG-009 "missing subcase summary maps to one hundred twenty-five"
 else
   fail AGG-009 "missing subcase summary maps to one hundred twenty-five"
+fi
+
+lane_assignment_count="$(grep -Ec '^[[:space:]]*(readonly[[:space:]]+)?lane_count=' \
+  "$replica_lifecycle" || true)"
+if [ "$lane_assignment_count" -eq 1 ] &&
+   [ "$(grep -Fxc 'readonly lane_count=3' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc 'for ((lane = 0; lane < lane_count; lane++)); do' \
+     "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '  run_lane "$lane" &' "$replica_lifecycle")" -eq 1 ]; then
+  pass AGG-010 "lifecycle declares one immutable three-lane bound"
+else
+  fail AGG-010 "lifecycle declares one immutable three-lane bound"
+fi
+
+hold_ids=(
+  local-install-cases.sh
+  local-config-cases.sh
+  local-image-catalog-cases.sh
+)
+peer_done_one=(
+  install-state-cases.py.done
+  install-mutation-cases.py.done
+  install-mutation-cases.py.done
+)
+peer_done_two=(
+  install-integrity-cases.py.done
+  install-integrity-cases.py.done
+  install-state-cases.py.done
+)
+target_done=(
+  install-mutation-cases.py.done
+  install-state-cases.py.done
+  install-integrity-cases.py.done
+)
+expected_wait_children=(1 1 1)
+wait_contract=1
+for hold_index in "${!hold_ids[@]}"; do
+  reset_fixtures
+  hold_dir="$work/lane-hold-$hold_index"
+  done_dir="$work/lane-done-$hold_index"
+  wait_executions="$work/wait-executions-$hold_index"
+  mkdir "$hold_dir" "$done_dir"
+  : > "$wait_executions"
+  wait_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$wait_executions" \
+    AGENT_LAB_AGG_HOLD_DIR="$hold_dir" \
+    AGENT_LAB_AGG_HOLD_ID="${hold_ids[$hold_index]}" \
+    AGENT_LAB_AGG_DONE_DIR="$done_dir" \
+    bash "$replica_lifecycle" > "$work/wait-$hold_index.out" 2>&1 &
+  wait_pid=$!
+  wait_case_contract=0
+  if wait_for_path "$hold_dir/ready" &&
+     wait_for_path "$done_dir/${peer_done_one[$hold_index]}" &&
+     wait_for_path "$done_dir/${peer_done_two[$hold_index]}" &&
+     wait_for_child_wait "$wait_pid" "${expected_wait_children[$hold_index]}"; then
+    wait_case_contract=1
+  fi
+  : > "$hold_dir/release"
+  wait "$wait_pid" || wait_rc=$?
+  if [ "$wait_case_contract" -ne 1 ] || [ "$wait_rc" -ne 0 ] ||
+     ! wait_for_path "$done_dir/${target_done[$hold_index]}" ||
+     ! cmp -s <(LC_ALL=C sort "$expected_executions") \
+       <(LC_ALL=C sort "$wait_executions"); then
+    wait_contract=0
+  fi
+done
+if [ "$wait_contract" -eq 1 ]; then
+  pass AGG-011 "parent waits every lane through controlled completion"
+else
+  fail AGG-011 "parent waits every lane through controlled completion"
+fi
+
+reset_fixtures
+signal_dir="$work/signal"
+signal_tmp="$work/signal-tmp"
+mkdir "$signal_dir" "$signal_tmp"
+AGENT_LAB_AGG_SIGNAL_DIR="$signal_dir" \
+  TMPDIR="$signal_tmp" \
+  python3 -I -B -c \
+    'import os, sys; os.setsid(); os.execvpe("bash", ["bash", sys.argv[1]], os.environ)' \
+    "$replica_lifecycle" > "$work/signal.out" 2>&1 &
+signal_pid=$!
+signal_rc=0
+descendant_pid=""
+if wait_for_path "$signal_dir/ready" &&
+   IFS= read -r descendant_pid < "$signal_dir/descendant.pid" &&
+   [[ "$descendant_pid" =~ ^[0-9]+$ ]] &&
+   kill -0 "$descendant_pid" 2>/dev/null; then
+  kill -TERM "$signal_pid" 2>/dev/null || true
+else
+  signal_rc=125
+  kill -TERM "$signal_pid" 2>/dev/null || true
+fi
+observed_signal_rc=0
+wait "$signal_pid" || observed_signal_rc=$?
+descendant_gone=0
+if [ -n "$descendant_pid" ] && wait_for_process_exit "$descendant_pid"; then
+  descendant_gone=1
+fi
+if [ "$descendant_gone" -ne 1 ]; then
+  surviving_group="$(ps -o pgid= -p "$descendant_pid" 2>/dev/null || true)"
+  surviving_group="${surviving_group//[[:space:]]/}"
+  if [ "$surviving_group" = "$signal_pid" ]; then
+    kill -KILL -- "-$signal_pid" 2>/dev/null || true
+    wait_for_process_exit "$descendant_pid" || true
+  fi
+fi
+if [ "$signal_rc" -eq 0 ] && [ "$observed_signal_rc" -eq 143 ] &&
+   [ "$descendant_gone" -eq 1 ]; then
+  pass AGG-012 "owned-session termination reaches cooperative descendants"
+else
+  fail AGG-012 "owned-session termination reaches cooperative descendants"
+fi
+
+reset_fixtures
+stubborn_dir="$work/stubborn-signal"
+stubborn_tmp="$work/stubborn-tmp"
+mkdir "$stubborn_dir" "$stubborn_tmp"
+AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR="$stubborn_dir" \
+  TMPDIR="$stubborn_tmp" \
+  python3 -I -B -c \
+    'import os, sys; os.setsid(); os.execvpe("bash", ["bash", sys.argv[1]], os.environ)' \
+    "$replica_lifecycle" > "$work/stubborn-signal.out" 2>&1 &
+stubborn_leader=$!
+stubborn_rc=0
+stubborn_pid=""
+if wait_for_path "$stubborn_dir/ready" &&
+   IFS= read -r stubborn_pid < "$stubborn_dir/descendant.pid" &&
+   [[ "$stubborn_pid" =~ ^[0-9]+$ ]] &&
+   kill -0 "$stubborn_pid" 2>/dev/null; then
+  kill -TERM "$stubborn_leader" 2>/dev/null || true
+else
+  stubborn_rc=125
+  kill -TERM "$stubborn_leader" 2>/dev/null || true
+fi
+observed_stubborn_rc=0
+wait "$stubborn_leader" || observed_stubborn_rc=$?
+stubborn_alive=0
+stubborn_output_preserved=0
+if [ -n "$stubborn_pid" ] && kill -0 "$stubborn_pid" 2>/dev/null; then
+  stubborn_alive=1
+  stubborn_output="$(readlink "/proc/$stubborn_pid/fd/1" 2>/dev/null || true)"
+  if [ -n "$stubborn_output" ] && [ -e "$stubborn_output" ]; then
+    stubborn_output_preserved=1
+  fi
+fi
+stubborn_group="$(ps -o pgid= -p "$stubborn_pid" 2>/dev/null || true)"
+stubborn_group="${stubborn_group//[[:space:]]/}"
+if [ "$stubborn_group" = "$stubborn_leader" ]; then
+  kill -KILL -- "-$stubborn_leader" 2>/dev/null || true
+  wait_for_process_exit "$stubborn_pid" || true
+fi
+if [ "$stubborn_rc" -eq 0 ] && [ "$observed_stubborn_rc" -eq 143 ] &&
+   [ "$stubborn_alive" -eq 1 ] && [ "$stubborn_output_preserved" -eq 1 ]; then
+  pass AGG-013 "signal exit preserves work owned by an uncooperative descendant"
+else
+  fail AGG-013 "signal exit preserves work owned by an uncooperative descendant"
 fi
 
 cleanup_infrastructure=0

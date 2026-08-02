@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+MAX_HOME_AUTHORITY_BYTES = 65_536
 LOCK_SPECS = {
     "imageCatalog": (
         "image-catalog.lock",
@@ -54,6 +55,101 @@ def write_all(descriptor: int, data: bytes) -> None:
         view = view[written:]
 
 
+def home_authority_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def home_authority_metadata_safe(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size <= MAX_HOME_AUTHORITY_BYTES
+    )
+
+
+def read_home_authority(
+    path: Path,
+    lexical: os.stat_result,
+    purpose: str,
+) -> bytes:
+    """Read one bounded home authority file through a stable no-follow descriptor."""
+
+    if not home_authority_metadata_safe(lexical):
+        raise RuntimeError("home authority files are unsafe")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not home_authority_metadata_safe(opened)
+            or home_authority_identity(opened) != home_authority_identity(lexical)
+        ):
+            raise RuntimeError(f"{purpose} authority changed before it was read")
+        chunks: list[bytes] = []
+        remaining = MAX_HOME_AUTHORITY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        final = os.fstat(descriptor)
+    except RuntimeError:
+        raise
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be read safely") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise RuntimeError(f"{purpose} authority descriptor cannot be closed") from error
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be reverified") from error
+    expected_identity = home_authority_identity(lexical)
+    if (
+        len(data) > MAX_HOME_AUTHORITY_BYTES
+        or len(data) != final.st_size
+        or not home_authority_metadata_safe(final)
+        or not home_authority_metadata_safe(current)
+        or home_authority_identity(opened) != expected_identity
+        or home_authority_identity(final) != expected_identity
+        or home_authority_identity(current) != expected_identity
+    ):
+        raise RuntimeError(f"{purpose} authority changed while it was read")
+    return data
+
+
+def reverify_home_authority(path: Path, expected: os.stat_result, purpose: str) -> None:
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be reverified") from error
+    if (
+        not home_authority_metadata_safe(current)
+        or home_authority_identity(current) != home_authority_identity(expected)
+    ):
+        raise RuntimeError(f"{purpose} authority changed during preflight")
+
+
 def lock_record(path: Path, relative: str, schema: str) -> dict[str, object]:
     metadata = path.lstat()
     if (
@@ -71,8 +167,8 @@ def lock_record(path: Path, relative: str, schema: str) -> dict[str, object]:
     }
 
 
-def verify_lock(home: Path, state_component: str, key: str, record: object) -> None:
-    filename, schema, appended = LOCK_SPECS[key]
+def validate_lock_receipt(state_component: str, key: str, record: object) -> None:
+    filename, schema, _ = LOCK_SPECS[key]
     relative = f"{state_component}/locks/{filename}"
     if (
         not isinstance(record, dict)
@@ -85,6 +181,13 @@ def verify_lock(home: Path, state_component: str, key: str, record: object) -> N
         or record.get("schema") != schema
     ):
         raise RuntimeError("home lock receipt is not closed")
+
+
+def verify_lock(home: Path, state_component: str, key: str, record: object) -> None:
+    filename, schema, appended = LOCK_SPECS[key]
+    relative = f"{state_component}/locks/{filename}"
+    validate_lock_receipt(state_component, key, record)
+    assert isinstance(record, dict)
     path = home / relative
     maximum = len(schema.encode("ascii") + b"\n" + appended)
     try:
@@ -235,25 +338,35 @@ def init_home(home: Path, argv: list[str]) -> int:
     return 0
 
 
-def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
+def load_config_receipt(
+    home: Path,
+) -> tuple[dict[str, object], bytes, dict[str, object]] | None:
     config_path = home / "config.json"
     receipt_path = home / "home.json"
     try:
         config_metadata = config_path.lstat()
+    except FileNotFoundError:
+        config_metadata = None
+    except OSError as error:
+        raise RuntimeError("home configuration cannot be inspected") from error
+    try:
         receipt_metadata = receipt_path.lstat()
     except FileNotFoundError:
-        if not config_path.exists() and not receipt_path.exists():
-            return None
+        receipt_metadata = None
+    except OSError as error:
+        raise RuntimeError("home receipt cannot be inspected") from error
+    if config_metadata is None and receipt_metadata is None:
+        return None
+    if config_metadata is None or receipt_metadata is None:
         raise RuntimeError("home receipt and configuration are incomplete")
-    for metadata in (config_metadata, receipt_metadata):
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise RuntimeError("home authority files are unsafe")
+    raw = read_home_authority(config_path, config_metadata, "configuration")
+    receipt_raw = read_home_authority(receipt_path, receipt_metadata, "home receipt")
+    reverify_home_authority(config_path, config_metadata, "configuration")
+    reverify_home_authority(receipt_path, receipt_metadata, "home receipt")
     try:
-        raw = config_path.read_bytes()
-        receipt_raw = receipt_path.read_bytes()
         value = json.loads(raw.decode("utf-8"))
         receipt = json.loads(receipt_raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (RecursionError, UnicodeError, ValueError):
         raise RuntimeError("configuration is malformed")
     if not isinstance(value, dict) or set(value) != {"apiVersion", "paths"} or value["apiVersion"] != "agent-lab.config/v0alpha1":
         raise RuntimeError("configuration is not closed")
@@ -262,7 +375,11 @@ def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
         raise RuntimeError("configuration paths are not closed")
     if len(set(paths.values())) != 4 or any(not isinstance(item, str) or not SAFE_COMPONENT.fullmatch(item) for item in paths.values()):
         raise RuntimeError("configuration paths are unsafe")
-    canonical_config = canonical(value) + b"\n"
+    try:
+        canonical_config = canonical(value) + b"\n"
+        canonical_receipt = canonical(receipt) + b"\n"
+    except (RecursionError, TypeError, ValueError, UnicodeError) as error:
+        raise RuntimeError("configuration is malformed") from error
     if raw != canonical_config:
         raise RuntimeError("configuration is not canonical")
     if (
@@ -271,12 +388,27 @@ def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
         or receipt["apiVersion"] != "agent-lab.home/v0alpha1"
         or receipt["paths"] != paths
         or receipt["configDigest"] != "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
-        or receipt_raw != canonical(receipt) + b"\n"
+        or receipt_raw != canonical_receipt
     ):
         raise RuntimeError("configuration does not match the initialized home receipt")
     locks = receipt["locks"]
     if not isinstance(locks, dict) or set(locks) != set(LOCK_SPECS):
         raise RuntimeError("home lock receipt is not closed")
+    state_component = paths["state"]
+    assert isinstance(state_component, str)
+    for key in LOCK_SPECS:
+        validate_lock_receipt(state_component, key, locks[key])
+    return value, canonical_config, receipt
+
+
+def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
+    loaded = load_config_receipt(home)
+    if loaded is None:
+        return None
+    value, canonical_config, receipt = loaded
+    paths = value["paths"]
+    locks = receipt["locks"]
+    assert isinstance(paths, dict) and isinstance(locks, dict)
     state_component = paths["state"]
     assert isinstance(state_component, str)
     for key in LOCK_SPECS:
@@ -299,6 +431,17 @@ def image_catalog_module():
     spec = spec_from_file_location("agent_lab_image_catalog", path)
     if spec is None or spec.loader is None:
         raise ImportError("image catalog module cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def experiment_store_module():
+    path = Path(__file__).resolve().with_name("experiment_store.py")
+    spec = spec_from_file_location("agent_lab_experiment_store", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Experiment store module cannot be loaded")
     module = module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -358,6 +501,65 @@ def image_command(home: Path, argv: list[str]) -> int:
         write_json(result)
     except OSError as error:
         print(f"INFRA Agent Lab image catalog result is uncertain: {error}", file=sys.stderr)
+        return 125
+    return 0
+
+
+def experiment_command(home: Path, argv: list[str]) -> int:
+    if argv[:1] == ["install"] and len(argv) == 2:
+        operation = "install"
+    elif argv[:1] == ["inspect"] and len(argv) == 2:
+        operation = "inspect"
+    else:
+        return 2
+
+    try:
+        loaded = load_config_receipt(home)
+    except RuntimeError as error:
+        print(f"INFRA Agent Lab {error}", file=sys.stderr)
+        return 125
+    if loaded is None:
+        print("FAIL Agent Lab home is not initialized", file=sys.stderr)
+        return 1
+
+    if operation == "install" and sys.platform != "linux":
+        print("INFRA Agent Lab Experiment installation requires Linux", file=sys.stderr)
+        return 125
+
+    paths = loaded[0]["paths"]
+    assert isinstance(paths, dict)
+    cache = home / str(paths["cache"]) / "tools"
+    os.environ["AGENT_LAB_HOME"] = str(home)
+    os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(cache / "cue"))
+    os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(cache / "cedar"))
+
+    try:
+        store = experiment_store_module()
+    except Exception as error:
+        print(f"INFRA Agent Lab Experiment store is unavailable: {error}", file=sys.stderr)
+        return 125
+
+    try:
+        if operation == "install":
+            result = store.install_directory(home, Path(argv[1]))
+        else:
+            result = store.inspect_install(home, argv[1])
+        if not isinstance(result, dict):
+            raise TypeError("Experiment store returned a non-object result")
+    except store.StoreReject as error:
+        print(f"FAIL Experiment {error}", file=sys.stderr)
+        return 1
+    except store.StoreInfrastructure as error:
+        print(f"INFRA Agent Lab Experiment store {error}", file=sys.stderr)
+        return 125
+    except Exception as error:
+        print(f"INFRA Agent Lab Experiment store operation is unavailable: {error}", file=sys.stderr)
+        return 125
+
+    try:
+        write_json(result)
+    except Exception as error:
+        print(f"INFRA Agent Lab Experiment store result is uncertain: {error}", file=sys.stderr)
         return 125
     return 0
 
@@ -431,6 +633,8 @@ def main(argv: list[str]) -> int:
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
         os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(home / "cache/tools/cedar"))
         return experiment_module().main(["experiment.py", "authorize-directory", argv[3]])
+    if argv[:1] == ["experiment"] and argv[1:2] in (["install"], ["inspect"]):
+        return experiment_command(home, argv[1:])
     if argv[:1] == ["image"]:
         return image_command(home, argv[1:])
     print("Usage: agent-lab [--home ABSOLUTE_HOME] {version|init|config|experiment|image}", file=sys.stderr)

@@ -21,6 +21,7 @@ from typing import NamedTuple, NoReturn
 
 MAX_MANIFEST_BYTES = 262_144
 SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
+PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
 BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
 BUNDLED_ENTRY_DOMAIN = b"agent-lab.experiment-image-entry.v1\0"
 MAX_CUE_OUTPUT_BYTES = 1_048_576
@@ -108,6 +109,7 @@ class SourceSnapshot(NamedTuple):
 
 class PlanResolution(NamedTuple):
     plan: dict[str, object]
+    bundled_catalog: dict[str, object] | None
     local_catalog: dict[str, object] | None
 
 
@@ -152,11 +154,30 @@ def reject_non_finite_numbers(value: object) -> None:
             reject_non_finite_numbers(item)
 
 
-def read_manifest_once(path: str) -> bytes:
+def _manifest_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_manifest_once(
+    path: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> bytes:
     try:
         path_stat = os.lstat(path)
     except OSError as error:
         raise InfrastructureError("manifest cannot be inspected") from error
+    if expected is not None and _manifest_identity(path_stat) != _manifest_identity(expected):
+        raise InfrastructureError("manifest identity changed before read")
     if stat.S_ISLNK(path_stat.st_mode):
         raise InfrastructureError("manifest symlinks are not accepted")
     if not stat.S_ISREG(path_stat.st_mode):
@@ -175,7 +196,7 @@ def read_manifest_once(path: str) -> bytes:
         opened_stat = os.fstat(descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):
             raise InfrastructureError("manifest changed to a non-regular file")
-        if (opened_stat.st_dev, opened_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        if _manifest_identity(opened_stat) != _manifest_identity(path_stat):
             raise InfrastructureError("manifest identity changed before read")
         chunks: list[bytes] = []
         remaining = MAX_MANIFEST_BYTES + 1
@@ -197,18 +218,8 @@ def read_manifest_once(path: str) -> bytes:
 
     if len(data) > MAX_MANIFEST_BYTES:
         raise InvalidManifest(f"exceeds the {MAX_MANIFEST_BYTES}-byte limit")
-    before = (
-        opened_stat.st_dev,
-        opened_stat.st_ino,
-        opened_stat.st_size,
-        opened_stat.st_mtime_ns,
-    )
-    after = (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    )
+    before = _manifest_identity(opened_stat)
+    after = _manifest_identity(final_stat)
     if before != after or len(data) != final_stat.st_size:
         raise InfrastructureError("manifest changed while it was read")
     return data
@@ -237,7 +248,7 @@ def read_directory_snapshot(path: str) -> SourceSnapshot:
     authored_mode = stat.S_IMODE(authored_stat.st_mode)
     if authored_mode & 0o111 or authored_mode & 0o022:
         raise InvalidManifest("experiment.cue has a suspicious mode")
-    data = read_manifest_once(authored_path)
+    data = read_manifest_once(authored_path, expected=authored_stat)
     try:
         after = os.listdir(path)
         final_directory_stat = os.lstat(path)
@@ -343,6 +354,12 @@ def canonical_json(value: object) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as error:
         raise InfrastructureError("CUE produced a non-canonicalizable plan") from error
+
+
+def plan_digest(plan: object) -> str:
+    """Return the canonical, domain-separated identity of one checked plan."""
+
+    return "sha256:" + hashlib.sha256(PLAN_DOMAIN + canonical_json(plan)).hexdigest()
 
 
 def cue_environment(repo_root: Path) -> dict[str, str]:
@@ -646,11 +663,19 @@ def resolve_plan_with_evidence(
 
     catalog_support = None
     bundled_by_name: dict[str, dict[str, object]] = {}
+    bundled_evidence: dict[str, object] | None = None
     if bundled_names:
         catalog_support = image_catalog_module()
         selected_catalog = catalog
         if selected_catalog is None:
             selected_catalog, _ = bundled_catalog(repo_root)
+        if (
+            not isinstance(selected_catalog, dict)
+            or set(selected_catalog) != {"apiVersion", "entries"}
+            or selected_catalog.get("apiVersion")
+            != "agent-lab.experiment-images/v0alpha1"
+        ):
+            raise InfrastructureError("bundled image catalog has an unexpected shape")
         entries = selected_catalog.get("entries")
         if not isinstance(entries, list):
             raise InfrastructureError("bundled image catalog entries are malformed")
@@ -668,6 +693,9 @@ def resolve_plan_with_evidence(
             if not name.startswith("agent-lab.") or name in bundled_by_name:
                 raise InfrastructureError("bundled image catalog namespace is invalid")
             bundled_by_name[name] = entry
+        bundled_evidence = {
+            "snapshotDigest": digest_record(BUNDLED_CATALOG_DOMAIN, selected_catalog)
+        }
 
     local_records: dict[str, dict[str, object]] = {}
     local_evidence: dict[str, object] | None = None
@@ -748,7 +776,7 @@ def resolve_plan_with_evidence(
                 "origin": "local",
                 "subject": record["subject"],
             }
-    return PlanResolution(resolved, local_evidence)
+    return PlanResolution(resolved, bundled_evidence, local_evidence)
 
 
 def resolve_plan(
@@ -943,10 +971,9 @@ def plan_binding(plan: object, source_digest: str) -> PlanBinding:
     except (AssertionError, KeyError, TypeError, ValueError) as error:
         raise InfrastructureError("CUE plan cannot be bound to authorization") from error
 
-    plan_bytes = canonical_json(plan)
-    plan_digest = f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}"
+    bound_plan_digest = plan_digest(plan)
     return PlanBinding(
-        plan_digest=plan_digest,
+        plan_digest=bound_plan_digest,
         contract_digest=contract_digest,
         contract_version=contract_version,
         requested_name=requested_name,
@@ -1292,12 +1319,71 @@ def authorize_plan(plan: object, source_digest: str) -> tuple[dict[str, object],
     return decision, 0 if verdict == "permit" else 1
 
 
-def write_envelope(plan: object, local_catalog: dict[str, object] | None = None) -> None:
-    plan_bytes = canonical_json(plan)
-    digest = hashlib.sha256(plan_bytes).hexdigest()
-    value: dict[str, object] = {"digest": f"sha256:{digest}", "plan": plan}
+def verify_trusted_inputs(plan: object, decision: object) -> None:
+    """Re-snapshot trusted inputs and bind them to one authorized plan."""
+
+    try:
+        if (
+            not isinstance(decision, dict)
+            or not isinstance(decision.get("binding"), dict)
+            or not isinstance(decision.get("resource"), dict)
+        ):
+            raise ValueError("decision envelope")
+        binding = decision["binding"]
+        resource = decision["resource"]
+        if set(binding) != {
+            "authorizationDigest",
+            "contractDigest",
+            "planDigest",
+            "sourceDigest",
+        }:
+            raise ValueError("decision binding")
+        source_digest = binding["sourceDigest"]
+        if not is_sha256(source_digest):
+            raise ValueError("source identity")
+        expected = plan_binding(plan, source_digest)
+        if (
+            binding["planDigest"] != expected.plan_digest
+            or binding["contractDigest"] != expected.contract_digest
+            or resource.get("id") != expected.plan_digest
+        ):
+            raise ValueError("plan decision identity")
+    except (KeyError, TypeError, ValueError) as error:
+        raise InfrastructureError("authorized plan binding is inconsistent") from error
+
+    repo_root = Path(__file__).resolve().parent.parent
+    contract_digest, contract_files = contract_snapshot(repo_root)
+    authorization_digest, authorization_files = authorization_snapshot(repo_root)
+    verify_contract_snapshot(repo_root, contract_files)
+    verify_authorization_snapshot(repo_root, authorization_files)
+    if (
+        expected.contract_digest != f"sha256:{contract_digest}"
+        or binding["authorizationDigest"] != authorization_digest
+    ):
+        raise InfrastructureError("trusted inputs no longer match the authorization")
+
+
+def catalog_resolution_evidence(
+    bundled_catalog: dict[str, object] | None,
+    local_catalog: dict[str, object] | None,
+) -> dict[str, object] | None:
+    catalog: dict[str, object] = {}
+    if bundled_catalog is not None:
+        catalog["bundled"] = bundled_catalog
     if local_catalog is not None:
-        value["catalog"] = {"local": local_catalog}
+        catalog["local"] = local_catalog
+    return catalog or None
+
+
+def write_envelope(
+    plan: object,
+    bundled_catalog: dict[str, object] | None = None,
+    local_catalog: dict[str, object] | None = None,
+) -> None:
+    value: dict[str, object] = {"digest": plan_digest(plan), "plan": plan}
+    catalog = catalog_resolution_evidence(bundled_catalog, local_catalog)
+    if catalog is not None:
+        value["catalog"] = catalog
     envelope = canonical_json(value) + b"\n"
     try:
         written = sys.stdout.buffer.write(envelope)
@@ -1329,14 +1415,17 @@ def main(argv: list[str]) -> int:
             resolution = cue_plan_with_evidence(manifest)
             plan = resolution.plan
             if directory_checking:
-                plan_bytes = canonical_json(plan)
                 checked: dict[str, object] = {
-                    "digest": f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}",
+                    "digest": plan_digest(plan),
                     "plan": plan,
                     "source": {"digest": snapshot.digest, "kind": "directory"},
                 }
-                if resolution.local_catalog is not None:
-                    checked["catalog"] = {"local": resolution.local_catalog}
+                catalog = catalog_resolution_evidence(
+                    resolution.bundled_catalog,
+                    resolution.local_catalog,
+                )
+                if catalog is not None:
+                    checked["catalog"] = catalog
                 sys.stdout.buffer.write(canonical_json(checked) + b"\n")
                 return 0
             decision, result = authorize_plan(plan, snapshot.digest)
@@ -1365,7 +1454,11 @@ def main(argv: list[str]) -> int:
         resolution = cue_plan_with_evidence(manifest)
         plan = resolution.plan
         if checking:
-            write_envelope(plan, resolution.local_catalog)
+            write_envelope(
+                plan,
+                resolution.bundled_catalog,
+                resolution.local_catalog,
+            )
             return 0
         decision, result = authorize_plan(plan, "sha256:" + "0" * 64)
         write_decision(decision)

@@ -9,6 +9,7 @@ scripts/agent-lab.py
 scripts/dev/cedar-tool.py
 scripts/dev/cue-tool.py
 scripts/experiment.py
+scripts/experiment_store.py
 scripts/image_catalog.py
 scripts/image_reference.py
 tools/cedar.lock

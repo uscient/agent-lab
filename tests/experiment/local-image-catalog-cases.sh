@@ -4,6 +4,9 @@ set -u -o pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 expected_count=76
 work=""
+declare -a lane_pids=()
+declare -a signal_descendants=()
+current_lane_pid=""
 
 cleanup_work() {
   local failed=0
@@ -16,11 +19,73 @@ cleanup_work() {
   return "$failed"
 }
 
+collect_descendants() {
+  local parent_pid="$1"
+  local children=""
+  local children_file
+  local child
+  local known
+  local observed
+  for children_file in /proc/"$parent_pid"/task/[0-9]*/children; do
+    if [ ! -r "$children_file" ]; then
+      continue
+    fi
+    children=""
+    IFS= read -r children < "$children_file" || true
+    for child in $children; do
+      if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+        continue
+      fi
+      known=0
+      for observed in "${signal_descendants[@]}"; do
+        if [ "$observed" = "$child" ]; then
+          known=1
+          break
+        fi
+      done
+      if [ "$known" -eq 0 ]; then
+        if ! kill -STOP -- "$child" 2>/dev/null; then
+          continue
+        fi
+        signal_descendants[${#signal_descendants[@]}]="$child"
+      fi
+      collect_descendants "$child"
+    done
+  done
+}
+
+catalog_signal() {
+  local signal_number="$1"
+  local before
+  local index
+  trap '' HUP INT QUIT TERM
+  trap - EXIT
+  signal_descendants=()
+  for _ in 1 2 3 4 5 6 7 8; do
+    before="${#signal_descendants[@]}"
+    collect_descendants "$$"
+    if [ "${#signal_descendants[@]}" -eq "$before" ]; then
+      break
+    fi
+  done
+  for ((index = ${#signal_descendants[@]} - 1; index >= 0; index--)); do
+    kill -TERM -- "${signal_descendants[index]}" 2>/dev/null || true
+  done
+  for ((index = ${#signal_descendants[@]} - 1; index >= 0; index--)); do
+    kill -CONT -- "${signal_descendants[index]}" 2>/dev/null || true
+  done
+  exit $((128 + signal_number))
+}
+
 if ! work="$(mktemp -d)"; then
   printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
+trap 'catalog_signal 1' HUP
+trap 'catalog_signal 2' INT
+trap 'catalog_signal 3' QUIT
+trap 'catalog_signal 15' TERM
 
 subcases=(
   "$repo_root/tests/image/catalog-cases.sh"
@@ -55,47 +120,111 @@ if [ "$declared_count" -ne "$expected_count" ]; then
   exit 125
 fi
 infrastructure=0
+readonly lane_count=2
 
-for index in "${!subcases[@]}"; do
-  subcase="${subcases[$index]}"
-  output="$work/subcase-$index.out"
+run_subcase() {
+  local index="$1"
+  local subcase="${subcases[$index]}"
+  local output="$work/subcase-$index.out"
+  local status="$work/subcase-$index.status"
+  local rc=0
+
   if [ ! -f "$subcase" ]; then
-    printf 'INFRA required catalog subcase is missing: %s\n' "$subcase" >&2
-    infrastructure=1
-    continue
+    printf 'INFRA required catalog subcase is missing: %s\n' "$subcase" > "$output"
+    printf '125\n' > "$status"
+    return 0
   fi
   case "$subcase" in
     *.py)
-      python3 -I -B "$subcase" > "$output" 2>&1
-      rc=$?
+      python3 -I -B "$subcase" > "$output" 2>&1 || rc=$?
       ;;
     *)
-      bash "$subcase" > "$output" 2>&1
-      rc=$?
+      bash "$subcase" > "$output" 2>&1 || rc=$?
       ;;
   esac
+  printf '%s\n' "$rc" > "$status"
+}
+
+run_lane() {
+  local lane="$1"
+  local index
+  local lane_subcases=()
+  case "$lane" in
+    0)
+      lane_subcases=(1)
+      ;;
+    1)
+      lane_subcases=(0 2 3)
+      ;;
+    *)
+      return 125
+      ;;
+  esac
+  for index in "${lane_subcases[@]}"; do
+    run_subcase "$index" || return 125
+  done
+  return 0
+}
+
+for ((lane = 0; lane < lane_count; lane++)); do
+  run_lane "$lane" &
+  lane_pids[lane]=$!
+done
+for lane in "${!lane_pids[@]}"; do
+  lane_rc=0
+  current_lane_pid="${lane_pids[lane]}"
+  lane_pids[lane]=""
+  wait "$current_lane_pid" || lane_rc=$?
+  current_lane_pid=""
+  if [ "$lane_rc" -ne 0 ]; then
+    infrastructure=1
+  fi
+done
+
+failures=0
+for index in "${!subcases[@]}"; do
+  subcase="${subcases[$index]}"
+  output="$work/subcase-$index.out"
+  status="$work/subcase-$index.status"
+  rc=125
+  if [ ! -f "$output" ]; then
+    printf 'INFRA catalog subcase output is missing: %s\n' "$subcase" >&2
+    infrastructure=1
+    continue
+  fi
+  if [ -f "$status" ] && cmp -s "$status" <(printf '0\n'); then
+    rc=0
+  elif [ -f "$status" ] && cmp -s "$status" <(printf '1\n'); then
+    rc=1
+  elif [ -f "$status" ] && cmp -s "$status" <(printf '125\n'); then
+    rc=125
+  else
+    printf 'INFRA catalog subcase status is missing or invalid: %s\n' "$subcase" >&2
+    rc=125
+    infrastructure=1
+  fi
   awk '/^(PASS|FAIL) [A-Z0-9-]+ /' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
   subcase_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
   subcase_failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
+  failures=$((failures + subcase_failures))
   summary="SUMMARY assertions=$subcase_assertions expected=$subcase_assertions failures=$subcase_failures infra=0"
   summary_count="$(grep -Fxc "$summary" "$output" || true)"
   all_summary_count="$(grep -c '^SUMMARY ' "$output" || true)"
   if [ "$summary_count" -ne 1 ] || [ "$all_summary_count" -ne 1 ]; then
     printf 'INFRA catalog subcase summary is absent or inconsistent: %s\n' "$subcase" >&2
-    cat "$output" >&2
+    awk '!/^(PASS|FAIL) [A-Z0-9-]+ / {print}' "$output" >&2
     infrastructure=1
   elif { [ "$rc" -eq 0 ] && [ "$subcase_failures" -ne 0 ]; } \
     || { [ "$rc" -eq 1 ] && [ "$subcase_failures" -eq 0 ]; } \
     || { [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; }; then
     printf 'INFRA catalog subcase status is inconsistent: rc=%s path=%s\n' "$rc" "$subcase" >&2
-    cat "$output" >&2
+    awk '!/^(PASS|FAIL) [A-Z0-9-]+ / {print}' "$output" >&2
     infrastructure=1
   fi
 done
 
 assertions="$(wc -l < "$observed")"
-failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$work"/subcase-*.out 2>/dev/null)"
 if ! cmp -s "$expected" "$observed"; then
   printf 'FAIL catalog aggregate assertion identity drift\n' >&2
   diff -u "$expected" "$observed" >&2 || true
