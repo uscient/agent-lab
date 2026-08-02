@@ -3,10 +3,9 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 subcases=(
-  "$repo_root/tests/experiment/directory-intake-cases.sh"
   "$repo_root/tests/experiment/zip-intake-cases.sh"
 )
-expected_count=14
+expected_count=1
 work=""
 
 cleanup_work() {
@@ -29,8 +28,7 @@ trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 expected="$work/expected"
 observed="$work/observed"
 printf '%s\n' \
-  FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 \
-  FMT-008 SEL-001 CUE-001 FMT-009 M-FMT-001 SEL-002 ZIP-001 > "$expected"
+  ZIP-001 > "$expected"
 : > "$observed"
 
 infrastructure=0

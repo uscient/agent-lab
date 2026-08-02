@@ -3,10 +3,11 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 subcases=(
+  "$repo_root/tests/experiment/directory-intake-cases.sh"
   "$repo_root/tests/experiment/aggregate-harness-cases.sh"
   "$repo_root/tests/experiment/catalog-aggregate-harness-cases.sh"
 )
-expected_count=20
+expected_count=33
 work=""
 
 cleanup_work() {
@@ -29,6 +30,8 @@ trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 expected="$work/expected"
 observed="$work/observed"
 printf '%s\n' \
+  FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 FMT-008 \
+  SEL-001 CUE-001 FMT-009 M-FMT-001 SEL-002 \
   AGG-001 AGG-002 AGG-003 AGG-004 AGG-005 AGG-006 AGG-007 AGG-008 AGG-009 \
   AGG-010 AGG-011 AGG-012 AGG-013 AGG-014 AGG-015 AGG-016 AGG-017 \
   AGG-018 AGG-019 AGG-020 > "$expected"
