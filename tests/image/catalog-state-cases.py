@@ -842,6 +842,37 @@ def main() -> int:
             ),
         )
 
+        phase_home = new_home(root, "bootstrap-phase-home")
+        child_rc = hard_exit_add(
+            phase_home,
+            "vendor.worker",
+            SUBJECT,
+            "catalog marker.after_fsync",
+        )
+        staged_catalog = (
+            phase_home
+            / "images"
+            / ".staging"
+            / "image-catalog-operation"
+            / "payload"
+            / "catalog"
+        )
+        shutil.copyfile(staged_catalog / "current.json", staged_catalog / "current.next")
+        (staged_catalog / "current.next").chmod(0o600)
+        before = fingerprint(phase_home / "images")
+        retry = cli(phase_home, "image", "add", "vendor.worker", SUBJECT)
+        after = fingerprint(phase_home / "images")
+        check(
+            "CAT-CRASH-008",
+            child_rc == 99
+            and retry.returncode == 125
+            and retry.stdout == b""
+            and before == after
+            and not (phase_home / "images" / "catalog").exists(),
+            "phase-inconsistent bootstrap staging remains inert and cannot become committed authority",
+            f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after}",
+        )
+
         platform_home = new_home(root, "platform-home")
         before = fingerprint(platform_home)
         original_platform = MODULE.sys.platform
@@ -888,12 +919,13 @@ def main() -> int:
         "CAT-CRASH-005",
         "CAT-CRASH-006",
         "CAT-CRASH-007",
+        "CAT-CRASH-008",
         "CAT-PLAT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=27 expected=27 failures={FAILURES} infra=0")
+    print(f"SUMMARY assertions=28 expected=28 failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
