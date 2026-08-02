@@ -506,6 +506,8 @@ def image_command(home: Path, argv: list[str]) -> int:
 
 
 def experiment_command(home: Path, argv: list[str]) -> int:
+    if argv == ["install", "--zip"]:
+        return 2
     if argv[:1] == ["install"] and len(argv) == 2:
         operation = "install"
         source_kind = "directory"
@@ -632,6 +634,11 @@ def main(argv: list[str]) -> int:
                 return 125
         print("tools:ready")
         return 0
+    if argv in (
+        ["experiment", "check", "--zip"],
+        ["experiment", "authorize", "install", "--zip"],
+    ):
+        return 2
     if argv[:3] == ["experiment", "check", "--zip"] and len(argv) == 4:
         os.environ["AGENT_LAB_HOME"] = str(home)
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))

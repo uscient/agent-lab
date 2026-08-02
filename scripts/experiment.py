@@ -291,8 +291,6 @@ def _read_zip_archive_once(path: str) -> bytes:
         except OSError as error:
             raise InfrastructureError("zip archive ZIP-READ descriptor could not be closed") from error
 
-    if len(archive) > MAX_ARCHIVE_BYTES:
-        _zip_reject("ZIP-SIZE", f"exceeds the {MAX_ARCHIVE_BYTES}-byte limit")
     assert opened_stat is not None and final_stat is not None
     try:
         current_stat = os.lstat(path)
@@ -306,6 +304,8 @@ def _read_zip_archive_once(path: str) -> bytes:
         or len(archive) != final_stat.st_size
     ):
         raise InfrastructureError("zip archive ZIP-READ changed while being read")
+    if len(archive) > MAX_ARCHIVE_BYTES:
+        _zip_reject("ZIP-SIZE", f"exceeds the {MAX_ARCHIVE_BYTES}-byte limit")
     return archive
 
 
@@ -353,6 +353,15 @@ def _zip_decode(payload: bytes, expanded_size: int) -> bytes:
         decoded = decoder.flush(remaining)
         output.append(decoded)
         produced += len(decoded)
+        if produced > MAX_SOURCE_BYTES:
+            _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+        if not decoder.eof:
+            _zip_reject("ZIP-TRUNC", "deflate stream ended early")
+        if decoder.unused_data or decoder.unconsumed_tail:
+            _zip_reject("ZIP-TRAIL", "deflate stream has unused input")
+        data = b"".join(output)
+        if len(data) != expanded_size:
+            _zip_reject("ZIP-LENGTH", "decoded length disagrees with its header")
     except InvalidManifest:
         raise
     except zlib.error as error:
@@ -361,15 +370,6 @@ def _zip_decode(payload: bytes, expanded_size: int) -> bytes:
         raise InfrastructureError("zip archive ZIP-TIMEOUT decoder deadline expired") from error
     except Exception as error:
         raise InfrastructureError("zip archive ZIP-DECODE decoder result is uncertain") from error
-    if produced > MAX_SOURCE_BYTES:
-        _zip_reject("ZIP-BOMB", "expands beyond the source limit")
-    if not decoder.eof:
-        _zip_reject("ZIP-TRUNC", "deflate stream ended early")
-    if decoder.unused_data or decoder.unconsumed_tail:
-        _zip_reject("ZIP-TRAIL", "deflate stream has unused input")
-    data = b"".join(output)
-    if len(data) != expanded_size:
-        _zip_reject("ZIP-LENGTH", "decoded length disagrees with its header")
     return data
 
 
@@ -484,10 +484,14 @@ def read_zip_snapshot(path: str) -> SourceSnapshot:
         _zip_reject("ZIP-TRUNC", "central record is incomplete")
     if central_extra_size != 0 or member_comment_size != 0:
         _zip_reject("ZIP-META", "contains member metadata")
-    if flags & ~0x800:
-        _zip_reject("ZIP-FLAG", "uses unsupported general-purpose flags")
     if method not in (0, 8):
         _zip_reject("ZIP-METHOD", "uses unsupported compression")
+    allowed_flags = 0x800 | (0x6 if method == 8 else 0)
+    if flags & ~allowed_flags:
+        _zip_reject("ZIP-FLAG", "uses unsupported general-purpose flags")
+    minimum_version = 20 if method == 8 else 10
+    if version_needed < minimum_version:
+        _zip_reject("ZIP-HEADER", "version is too old for its compression method")
     if expanded_size > MAX_SOURCE_BYTES:
         _zip_reject("ZIP-SIZE", f"source exceeds the {MAX_SOURCE_BYTES}-byte limit")
     central_name = archive[central_offset + 46 : central_offset + 46 + name_size]
@@ -496,7 +500,8 @@ def read_zip_snapshot(path: str) -> SourceSnapshot:
     unix_type = stat.S_IFMT(unix_mode)
     dos_attributes = external_attributes & 0xFFFF
     if (
-        dos_attributes & 0x10
+        create_system not in (0, 3)
+        or dos_attributes & 0x18
         or (create_system == 3 and unix_type not in (0, stat.S_IFREG))
     ):
         _zip_reject("ZIP-TYPE", "member is not a regular file")
