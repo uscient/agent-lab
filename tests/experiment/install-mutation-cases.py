@@ -655,18 +655,18 @@ def probe_publication_durability(runtime: Path, probe_root: Path, marker: Path |
     data = artifact_bytes("durability")
     source = write_source(probe_root, "durability-source", data)
     store = fixture_store(runtime, probe_root, FixtureExperiment(direct_fixture(data, "durability")))
-    events: list[tuple[str, str]] = []
+    events: list[tuple[str, Path, str]] = []
     original_rename = store._rename_noreplace
     original_fsync = store._fsync_directory
     target = home / "experiments" / "mutation-store"
 
     def observed_rename(source_path: Path, target_path: Path) -> None:
         if target_path == target:
-            events.append(("publish", str(target_path)))
+            events.append(("publish", target_path, ""))
         original_rename(source_path, target_path)
 
     def observed_fsync(path: Path, purpose: str, *, modes=(0o700,)) -> None:
-        events.append(("fsync", purpose))
+        events.append(("fsync", path, purpose))
         original_fsync(path, purpose, modes=modes)
 
     store._rename_noreplace = observed_rename
@@ -678,28 +678,33 @@ def probe_publication_durability(runtime: Path, probe_root: Path, marker: Path |
         store._fsync_directory = original_fsync
         store._rename_noreplace = original_rename
     publication = [index for index, event in enumerate(events) if event[0] == "publish"]
-    required_purposes = (
-        "Experiment committed artifact",
-        "Experiment committed records",
-        "Experiment staged envelope root",
-        "Experiment committed wrapper",
-        "Experiment committed staging",
+    wrapper = home / "experiments" / ".staging" / "experiment-install"
+    payload = wrapper / "payload"
+    required_events = (
+        ("fsync", payload / "artifact", "Experiment committed artifact"),
+        ("fsync", payload / "records", "Experiment committed records"),
+        ("fsync", payload, "Experiment staged envelope root"),
+        ("fsync", wrapper, "Experiment committed wrapper"),
+        ("fsync", wrapper.parent, "Experiment committed staging"),
     )
     durable = {
-        purpose: [
+        (str(path), purpose): [
             index
             for index, event in enumerate(events)
-            if event == ("fsync", purpose)
+            if event == (kind, path, purpose)
         ]
-        for purpose in required_purposes
+        for kind, path, purpose in required_events
     }
+    durable_order = [indices[0] for indices in durable.values() if len(indices) == 1]
     secure = (
         rc == 0
         and isinstance(value, dict)
         and error is None
         and len(publication) == 1
         and all(len(indices) == 1 for indices in durable.values())
-        and all(indices[0] < publication[0] for indices in durable.values())
+        and len(durable_order) == len(required_events)
+        and durable_order == sorted(durable_order)
+        and all(index < publication[0] for index in durable_order)
     )
     return ProbeResult(secure, f"rc={rc} error={error!r} publish={publication} durable={durable}")
 
