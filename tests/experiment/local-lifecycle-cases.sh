@@ -9,7 +9,7 @@ subcases=(
   "$repo_root/tests/experiment/install-store-cases.sh"
   "$repo_root/tests/experiment/install-state-cases.py"
 )
-expected_count=107
+expected_count=109
 work=""
 
 cleanup_work() {
@@ -53,9 +53,10 @@ printf '%s\n' \
   M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001 \
   INST-HOME-001 INST-UNKNOWN-001 INST-PERMIT-001 INST-RECEIPT-001 \
   INST-INSPECT-001 INST-RETRY-001 INST-CONFLICT-001 INST-DENY-001 \
-  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 \
+  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 INST-NAME-001 \
   IST-STATE-001 IST-LOCK-001 IST-STATE-002 IST-BOUND-001 IST-STATE-003 \
-  IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001 > "$expected"
+  IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001 \
+  IST-PROV-001 > "$expected"
 : > "$observed"
 
 infrastructure=0
