@@ -1478,8 +1478,13 @@ def main() -> int:
             / "payload"
             / "catalog"
         )
-        shutil.copyfile(staged_catalog / "current.json", staged_catalog / "current.next")
-        (staged_catalog / "current.next").chmod(0o600)
+        staged_current = staged_catalog / "current.json"
+        staged_current_available = True
+        try:
+            shutil.copyfile(staged_current, staged_catalog / "current.next")
+            (staged_catalog / "current.next").chmod(0o600)
+        except FileNotFoundError:
+            staged_current_available = False
         before = fingerprint(phase_home / "images")
         retry = cli(phase_home, "image", "add", "vendor.worker", SUBJECT)
         after = fingerprint(phase_home / "images")
@@ -1498,14 +1503,20 @@ def main() -> int:
             / "image-catalog-operation"
             / "payload"
         )
-        shutil.rmtree(marker_payload)
+        marker_payload_available = True
+        try:
+            shutil.rmtree(marker_payload)
+        except FileNotFoundError:
+            marker_payload_available = False
         marker_before = fingerprint(marker_phase_home / "images")
         marker_read = cli(marker_phase_home, "image", "list")
         marker_retry = cli(marker_phase_home, "image", "add", "vendor.worker", SUBJECT)
         marker_after = fingerprint(marker_phase_home / "images")
         check(
             "CAT-CRASH-008",
-            child_rc == 99
+            staged_current_available
+            and marker_payload_available
+            and child_rc == 99
             and retry.returncode == 125
             and retry.stdout == b""
             and before == after
@@ -1519,7 +1530,9 @@ def main() -> int:
             and not (marker_phase_home / "images" / "catalog").exists(),
             "phase-inconsistent bootstrap staging remains inert and cannot become committed authority",
             (
-                f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after} "
+                f"phase_fixture={staged_current_available} child_rc={child_rc} "
+                f"retry_rc={retry.returncode} changed={before != after} "
+                f"marker_fixture={marker_payload_available} "
                 f"marker_child={marker_child} marker_read={marker_read.returncode} "
                 f"marker_retry={marker_retry.returncode} marker_changed={marker_before != marker_after}"
             ),
@@ -1540,19 +1553,29 @@ def main() -> int:
             / "image-catalog-operation"
             / "payload"
         )
-        (incomplete_payload / "entry.json").unlink()
-        (incomplete_payload / "snapshot.json").unlink()
+        incomplete_entry = incomplete_payload / "entry.json"
+        incomplete_snapshot = incomplete_payload / "snapshot.json"
+        incomplete_payload_available = True
+        try:
+            incomplete_entry.unlink()
+            incomplete_snapshot.unlink()
+        except FileNotFoundError:
+            incomplete_payload_available = False
         before = fingerprint(incomplete_home / "images")
         retry = cli(incomplete_home, "image", "add", "vendor.second", OTHER_SUBJECT)
         after = fingerprint(incomplete_home / "images")
         check(
             "CAT-CRASH-009",
-            child_rc == 99
+            incomplete_payload_available
+            and child_rc == 99
             and retry.returncode == 125
             and retry.stdout == b""
             and before == after,
             "a later stage cannot claim a pointer phase without candidate record evidence",
-            f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after}",
+            (
+                f"fixture={incomplete_payload_available} child_rc={child_rc} "
+                f"retry_rc={retry.returncode} changed={before != after}"
+            ),
         )
 
         marker_durable_home = new_home(root, "marker-durable-recovery-home")
