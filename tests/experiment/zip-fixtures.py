@@ -226,6 +226,15 @@ def main() -> int:
     fixtures["trailing.zip"] = stored + b"trailing ambiguity"
 
     big_source = source + b"\n//" + (b"x" * 270_000) + b"\n"
+    limit_source = source + b"\n//" + (
+        b"x" * (262_144 - len(source) - 4)
+    ) + b"\n"
+    if len(limit_source) != 262_144:
+        raise AssertionError("exact source-limit fixture has the wrong size")
+    (root / "expanded-limit.cue").write_bytes(limit_source)
+    fixtures["expanded-limit.zip"] = one(
+        "experiment.cue", limit_source, zipfile.ZIP_DEFLATED
+    )
     fixtures["expanded-over.zip"] = one("experiment.cue", big_source)
     fixtures["deflate-bomb.zip"] = one(
         "experiment.cue", big_source, zipfile.ZIP_DEFLATED

@@ -10,7 +10,7 @@ mkdir -p "$work/home" "$work/tmp"
 
 if ! python3 -I -B "$repo_root/tests/experiment/zip-fixtures.py" \
   "$fixture/experiment.cue" "$work"; then
-  printf 'SUMMARY assertions=0 expected=19 failures=0 infra=1\n'
+  printf 'SUMMARY assertions=0 expected=25 failures=0 infra=1\n'
   exit 125
 fi
 
@@ -34,7 +34,7 @@ init_home() {
   capture "$label" "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed\n' >&2
-    printf 'SUMMARY assertions=%s expected=19 failures=%s infra=1\n' \
+    printf 'SUMMARY assertions=%s expected=25 failures=%s infra=1\n' \
       "$(wc -l < "$observed")" "$failures"
     exit 125
   fi
@@ -123,6 +123,29 @@ expect_all_reject ZIP-TRUNC-001 ZIP-TRUNC "truncated records and deflate streams
 
 expect_all_reject ZIP-TRAIL-001 ZIP-TRAIL "bytes after the canonical archive end are refused" trailing.zip
 
+capture expanded-limit "$agent_lab" experiment check --zip "$work/expanded-limit.zip"
+limit_digest="$(python3 -I -B - "$work/expanded-limit.cue" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+data = Path(sys.argv[1]).read_bytes()
+name = b"experiment.cue"
+digest = sha256(b"agent-lab.experiment-tree.v1\0")
+digest.update(len(name).to_bytes(4, "big"))
+digest.update(name)
+digest.update(len(data).to_bytes(8, "big"))
+digest.update(data)
+print("sha256:" + digest.hexdigest())
+PY
+)"
+if [ "$CAPTURE_RC" -eq 0 ] && [ ! -s "$work/expanded-limit.err" ] &&
+   [ "$(wc -c < "$work/expanded-limit.cue")" -eq 262144 ] &&
+   [ "$(jq -r '.source.digest' "$work/expanded-limit.out")" = "$limit_digest" ]; then
+  pass ZIP-SIZE-002 "the exact expanded source limit remains valid"
+else
+  fail ZIP-SIZE-002 "the exact expanded source limit remains valid"
+fi
+
 ln -s "$work/stored.zip" "$work/archive-link.zip"
 mkdir "$work/archive-directory"
 capture missing "$agent_lab" experiment check --zip "$work/missing.zip"
@@ -137,6 +160,168 @@ if [ "$missing_rc" -eq 125 ] && [ "$linked_rc" -eq 125 ] &&
   pass ZIP-READ-001 "unavailable or unsafe archive paths are infrastructure failures"
 else
   fail ZIP-READ-001 "unavailable or unsafe archive paths are infrastructure failures"
+fi
+
+if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/expanded-limit.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+import sys
+
+spec = spec_from_file_location("zip_read_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+archive = Path(sys.argv[2])
+original_read = module.os.read
+changed = False
+
+def mutating_read(descriptor, size):
+    global changed
+    data = original_read(descriptor, size)
+    if data and not changed:
+        changed = True
+        with archive.open("ab") as stream:
+            stream.write(b"x")
+    return data
+
+module.os.read = mutating_read
+try:
+    module.read_zip_snapshot(str(archive))
+except module.InfrastructureError as error:
+    assert "ZIP-READ" in str(error)
+else:
+    raise AssertionError("mid-read archive mutation was accepted")
+assert changed
+PY
+then
+  pass ZIP-READ-002 "mid-read archive mutation is infrastructure uncertainty"
+else
+  fail ZIP-READ-002 "mid-read archive mutation is infrastructure uncertainty"
+fi
+
+if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/deflated.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+
+spec = spec_from_file_location("zip_decode_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def uncertain_decoder(*_args, **_kwargs):
+    raise RuntimeError("injected decoder uncertainty")
+
+module.zlib.decompressobj = uncertain_decoder
+try:
+    module.read_zip_snapshot(sys.argv[2])
+except module.InfrastructureError as error:
+    assert "ZIP-DECODE" in str(error)
+else:
+    raise AssertionError("unexpected decoder exception was accepted")
+PY
+then
+  pass ZIP-DECODE-001 "unexpected decoder exceptions are infrastructure uncertainty"
+else
+  fail ZIP-DECODE-001 "unexpected decoder exceptions are infrastructure uncertainty"
+fi
+
+if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/deflated.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+
+spec = spec_from_file_location("zip_timeout_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+ticks = iter((0.0, 10.0))
+module.time.monotonic = lambda: next(ticks, 10.0)
+try:
+    module.read_zip_snapshot(sys.argv[2])
+except module.InfrastructureError as error:
+    assert "ZIP-TIMEOUT" in str(error)
+else:
+    raise AssertionError("decoder deadline was accepted")
+PY
+then
+  pass ZIP-TIMEOUT-001 "decoder deadline uncertainty is bounded and classified"
+else
+  fail ZIP-TIMEOUT-001 "decoder deadline uncertainty is bounded and classified"
+fi
+
+if AGENT_LAB_CUE_TOOL_DIR="${AGENT_LAB_CUE_TOOL_DIR:-$repo_root/.cache/dev/tools/cue}" \
+  python3 -I -B - "$repo_root/scripts/experiment.py" "$work/stored.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+
+spec = spec_from_file_location("zip_output_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+class ShortBuffer:
+    def write(self, data):
+        return max(0, len(data) - 1)
+
+    def flush(self):
+        return None
+
+class ShortOutput:
+    buffer = ShortBuffer()
+
+    def flush(self):
+        return None
+
+module.sys.stdout = ShortOutput()
+try:
+    result = module.main(["experiment.py", "check-zip", sys.argv[2]])
+except SystemExit as error:
+    result = error.code
+raise SystemExit(0 if result == 125 else 1)
+PY
+then
+  pass ZIP-OUTPUT-001 "partial checked output is infrastructure uncertainty"
+else
+  fail ZIP-OUTPUT-001 "partial checked output is infrastructure uncertainty"
+fi
+
+if python3 -I -B - "$repo_root/scripts/experiment.py" \
+  "$work/wrapper.zip" "$work/encrypted.zip" "$work/bad-crc.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import contextlib
+import io
+import sys
+
+spec = spec_from_file_location("zip_noeffect_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+reached = False
+
+def forbidden(_snapshot):
+    global reached
+    reached = True
+    raise AssertionError("downstream planning reached")
+
+module.authored_manifest = forbidden
+for archive in sys.argv[2:]:
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            module.main(["experiment.py", "check-zip", archive])
+        except SystemExit as error:
+            assert error.code == 1
+        else:
+            raise AssertionError("hostile archive returned")
+assert not reached
+PY
+then
+  pass ZIP-NOEF-001 "structural rejection occurs before common planning"
+else
+  fail ZIP-NOEF-001 "structural rejection occurs before common planning"
 fi
 
 capture directory-authorize "$agent_lab" experiment authorize install "$fixture"
@@ -202,10 +387,11 @@ printf '%s\n' \
   ZIP-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
   ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001 \
   ZIP-LENGTH-001 ZIP-SIZE-001 ZIP-BOMB-001 ZIP-TRUNC-001 ZIP-TRAIL-001 \
-  ZIP-READ-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 > "$expected"
+  ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-TIMEOUT-001 \
+  ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA assertion identity drift\n' >&2
   exit 125
 fi
-printf 'SUMMARY assertions=19 expected=19 failures=%s infra=0\n' "$failures"
+printf 'SUMMARY assertions=25 expected=25 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
