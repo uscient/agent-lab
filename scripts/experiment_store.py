@@ -49,8 +49,9 @@ GIT_SHA1 = re.compile(r"^sha1:[0-9a-f]{40}$")
 GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 GIT_URL = re.compile(
     r"^https://github\.com/"
-    r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?/"
-    r"[a-z0-9_.-]{1,100}\.git$"
+    r"([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)/"
+    r"([a-z0-9_.-]{1,100})\.git$",
+    re.ASCII,
 )
 PAYLOAD_DIRECTORIES = {"payload", "payload/artifact", "payload/records"}
 PAYLOAD_FILES = {
@@ -872,6 +873,7 @@ def _closed_git_transport(transport: object) -> dict[str, object] | None:
     tree = transport.get("tree")
     blob = transport.get("blob")
     url = transport.get("url")
+    url_match = GIT_URL.fullmatch(url) if isinstance(url, str) else None
     if (
         not isinstance(acquisition, dict)
         or set(acquisition)
@@ -902,7 +904,9 @@ def _closed_git_transport(transport: object) -> dict[str, object] | None:
         or not isinstance(blob, str)
         or GIT_SHA1.fullmatch(blob) is None
         or not isinstance(url, str)
-        or GIT_URL.fullmatch(url) is None
+        or url_match is None
+        or "--" in url_match.group(1)
+        or url_match.group(2) in (".", "..")
     ):
         return None
     return {
