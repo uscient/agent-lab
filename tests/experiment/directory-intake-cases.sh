@@ -34,6 +34,59 @@ else
   fail FMT-002 "sole-entry directory produces a source-bound checked candidate"
 fi
 
+extra="$work/extra"
+mkdir "$extra"
+cp "$fixture/experiment.cue" "$extra/experiment.cue"
+: > "$extra/unexpected"
+capture "$agent_lab" experiment check "$extra"
+if [ "$CAPTURE_RC" -eq 1 ] && [ ! -s "$work/stdout" ]; then
+  pass FMT-004 "an extra directory entry is stable invalid input"
+else
+  fail FMT-004 "an extra directory entry is stable invalid input"
+fi
+
+linked="$work/linked"
+mkdir "$linked"
+ln "$fixture/experiment.cue" "$linked/experiment.cue"
+capture "$agent_lab" experiment check "$linked"
+if [ "$CAPTURE_RC" -eq 1 ] && [ ! -s "$work/stdout" ]; then
+  pass FMT-005 "a multiply linked authored file is refused"
+else
+  fail FMT-005 "a multiply linked authored file is refused"
+fi
+
+executable="$work/executable"
+mkdir "$executable"
+cp "$fixture/experiment.cue" "$executable/experiment.cue"
+chmod 700 "$executable/experiment.cue"
+capture "$agent_lab" experiment check "$executable"
+if [ "$CAPTURE_RC" -eq 1 ] && [ ! -s "$work/stdout" ]; then
+  pass FMT-006 "an executable authored file is refused"
+else
+  fail FMT-006 "an executable authored file is refused"
+fi
+
+expected_digest="$(python3 - "$fixture/experiment.cue" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+data = Path(sys.argv[1]).read_bytes()
+name = b"experiment.cue"
+digest = sha256(b"agent-lab.experiment-tree.v1\0")
+digest.update(len(name).to_bytes(4, "big"))
+digest.update(name)
+digest.update(len(data).to_bytes(8, "big"))
+digest.update(data)
+print("sha256:" + digest.hexdigest())
+PY
+)"
+capture "$agent_lab" experiment check "$fixture"
+if [ "$CAPTURE_RC" -eq 0 ] && [ "$(jq -r '.source.digest' "$work/stdout")" = "$expected_digest" ]; then
+  pass FMT-007 "source identity uses the independently framed exact bytes"
+else
+  fail FMT-007 "source identity uses the independently framed exact bytes"
+fi
+
 capture "$agent_lab" experiment check "$fixture"
 cp "$work/stdout" "$work/second"
 capture "$agent_lab" experiment check "$fixture"
@@ -44,10 +97,10 @@ else
 fi
 
 expected="$work/expected"
-printf '%s\n' FMT-001 FMT-002 FMT-003 > "$expected"
+printf '%s\n' FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA assertion identity drift\n' >&2
   exit 125
 fi
-printf 'SUMMARY assertions=3 expected=3 failures=%s infra=0\n' "$failures"
+printf 'SUMMARY assertions=7 expected=7 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
