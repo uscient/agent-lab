@@ -53,6 +53,14 @@ def rejected_with(module, archive: Path, code: str) -> bool:
     return False
 
 
+def accepted_by(module, archive: Path) -> bool:
+    try:
+        snapshot = module.read_zip_snapshot(str(archive))
+    except (module.InvalidManifest, module.InfrastructureError):
+        return False
+    return isinstance(snapshot, module.SourceSnapshot)
+
+
 def parser_mutation(
     production: Path,
     original: str,
@@ -72,7 +80,7 @@ def parser_mutation(
     os.environ["AGENT_LAB_ZIP_MUTATION_MARK"] = str(marker)
     try:
         mutant = load_module(private_source, "zip_mutant_" + assertion.lower().replace("-", "_"))
-        killed = not rejected_with(mutant, fixture, code)
+        killed = accepted_by(mutant, fixture)
     finally:
         os.environ.pop("AGENT_LAB_ZIP_MUTATION_MARK", None)
     return marker.is_file() and killed and sha256(production.read_bytes()).hexdigest() == sha256(
