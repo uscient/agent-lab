@@ -681,9 +681,54 @@ def _github_worker_request(
 ) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
     if time.monotonic() >= deadline:
         raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
-    control_read, control_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
-    stdout_read, stdout_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
-    stderr_read, stderr_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+    interrupted: int | None = None
+    handlers: dict[int, object] = {}
+    managed_signals: set[int] = set()
+
+    def interrupt(signum: int, _frame: object) -> None:
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = signum
+
+    def change_mask(how: int, signals: set[int]) -> set[signal.Signals]:
+        try:
+            return set(signal.pthread_sigmask(how, signals))
+        except (AttributeError, OSError, ValueError) as error:
+            raise InfrastructureError("git provider GIT-SIGNAL mask is unavailable") from error
+
+    def record_pending(signals: set[int]) -> None:
+        nonlocal interrupted
+        try:
+            while True:
+                pending = set(signal.sigpending()).intersection(signals)
+                if not pending:
+                    return
+                for signum in sorted(pending, key=int):
+                    received = int(signal.sigwait({signum}))
+                    if interrupted is None:
+                        interrupted = received
+        except (AttributeError, OSError, ValueError) as error:
+            raise InfrastructureError(
+                "git provider GIT-SIGNAL pending state is uncertain"
+            ) from error
+
+    original_mask = change_mask(signal.SIG_BLOCK, set())
+    try:
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+            previous = signal.getsignal(signum)
+            if previous == signal.SIG_IGN or signum in original_mask:
+                continue
+            handlers[signum] = previous
+            signal.signal(signum, interrupt)
+            managed_signals.add(signum)
+    except (OSError, ValueError) as error:
+        for signum, previous in handlers.items():
+            signal.signal(signum, previous)
+        raise InfrastructureError("git provider GIT-SIGNAL handlers are unavailable") from error
+
+    control_read = control_write = -1
+    stdout_read = stdout_write = -1
+    stderr_read = stderr_write = -1
     pid = -1
     reaped = False
     acknowledged = False
@@ -693,7 +738,20 @@ def _github_worker_request(
     process_status: int | None = None
     failure: str | None = None
     try:
-        pid = os.fork()
+        control_read, control_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        stdout_read, stdout_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        stderr_read, stderr_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        spawn_mask = change_mask(signal.SIG_BLOCK, managed_signals)
+        try:
+            if interrupted is None:
+                pid = os.fork()
+        finally:
+            if pid != 0:
+                change_mask(signal.SIG_SETMASK, set(spawn_mask))
+        if pid < 0:
+            raise SystemExit(128 + interrupted) if interrupted is not None else InfrastructureError(
+                "git provider GIT-WORKER did not start"
+            )
         if pid == 0:
             os.close(control_write)
             os.close(stdout_read)
@@ -718,6 +776,9 @@ def _github_worker_request(
         selector.register(stderr_read, selectors.EVENT_READ, "stderr")
         expected_frame: int | None = None
         while True:
+            if interrupted is not None:
+                failure = "git provider GIT-SIGNAL interrupted acquisition"
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = "git provider GIT-TIMEOUT deadline expired"
@@ -786,6 +847,9 @@ def _github_worker_request(
             remaining = max(0.0, deadline - time.monotonic())
             wait_deadline = time.monotonic() + min(GIT_WORKER_GRACE_SECONDS, remaining)
             while time.monotonic() < wait_deadline:
+                if interrupted is not None:
+                    failure = "git provider GIT-SIGNAL interrupted acquisition"
+                    break
                 waited, status = os.waitpid(pid, os.WNOHANG)
                 if waited == pid:
                     reaped = True
@@ -849,6 +913,7 @@ def _github_worker_request(
     except (OSError, ValueError) as error:
         raise InfrastructureError("git provider GIT-WORKER could not establish a result") from error
     finally:
+        cleanup_error: InfrastructureError | None = None
         selector.close()
         for descriptor in (
             control_read,
@@ -865,7 +930,40 @@ def _github_worker_request(
                     pass
         if pid > 0 and (not reaped or _git_worker_group_alive(pid)):
             if not _git_worker_terminate(pid, reaped=reaped):
-                raise InfrastructureError("git provider GIT-WORKER cleanup is uncertain")
+                cleanup_error = InfrastructureError(
+                    "git provider GIT-WORKER cleanup is uncertain"
+                )
+        cleanup_mask: set[signal.Signals] | None = None
+        try:
+            cleanup_mask = change_mask(signal.SIG_BLOCK, managed_signals)
+            record_pending(managed_signals)
+        except InfrastructureError as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        finally:
+            for signum, previous in handlers.items():
+                try:
+                    signal.signal(signum, previous)
+                except (OSError, ValueError):
+                    if cleanup_error is None:
+                        cleanup_error = InfrastructureError(
+                            "git provider GIT-SIGNAL handlers could not be restored"
+                        )
+            if cleanup_mask is not None:
+                try:
+                    record_pending(managed_signals)
+                except InfrastructureError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                try:
+                    change_mask(signal.SIG_SETMASK, set(cleanup_mask))
+                except InfrastructureError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+        if interrupted is not None:
+            raise SystemExit(128 + interrupted)
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _read_git_snapshot_with_requester(
