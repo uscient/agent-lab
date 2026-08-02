@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import ctypes
 import errno
 import fcntl
@@ -31,6 +32,8 @@ INTENT_API = "agent-lab.experiment-install-intent/v0alpha1"
 LOCK_SCHEMA = "agent-lab.experiments-lock/v0alpha1"
 OPERATION_WRAPPER = "experiment-install"
 CLEANUP_WRAPPER = "experiment-install-cleanup"
+OWNERSHIP_MARKER = "owner"
+OWNERSHIP_BYTES = b"agent-lab.experiment-stage-owner/v0alpha1\n"
 MAX_STAGE_ENTRIES = 16
 MAX_STAGE_BYTES = 4_194_304
 MAX_AUTHORITY_BYTES = 65_536
@@ -48,7 +51,7 @@ PAYLOAD_FILES = {
     "payload/records/plan.json",
     "payload/records/provenance.json",
 }
-STAGE_ALLOWED = {"intent.json", *PAYLOAD_DIRECTORIES, *PAYLOAD_FILES}
+STAGE_ALLOWED = {OWNERSHIP_MARKER, "intent.json", *PAYLOAD_DIRECTORIES, *PAYLOAD_FILES}
 RECORD_PATHS = {
     "artifact/experiment.cue",
     "records/decision.json",
@@ -94,6 +97,11 @@ class VerifiedInstall(NamedTuple):
     installation_key: str
     receipt_digest: str
     file_digests: dict[str, str]
+
+
+class ScannedWrapper(NamedTuple):
+    intent: dict[str, object] | None
+    has_payload: bool
 
 
 def canonical(value: object) -> bytes:
@@ -507,14 +515,20 @@ def _store_lock(
     except OSError as error:
         _infra("Experiment store lock cannot be held safely", error)
     finally:
-        unwinding = sys.exc_info()[0] is not None
         if descriptor >= 0:
+            release_error: OSError | None = None
+            close_error: OSError | None = None
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError as error:
+                release_error = error
+            try:
                 os.close(descriptor)
             except OSError as error:
-                if not unwinding:
-                    _infra("Experiment store lock could not be released", error)
+                close_error = error
+            if release_error is not None or close_error is not None:
+                cause = close_error if close_error is not None else release_error
+                _infra("Experiment store lock release or close is uncertain", cause)
 
 
 def _module(path: Path, name: str):
@@ -804,6 +818,9 @@ def _directory_names(path: Path, purpose: str, maximum: int) -> tuple[str, ...]:
         _infra(f"{purpose} contains an invalid name", error)
 
 
+_ORIGINAL_DIRECTORY_NAMES = _directory_names
+
+
 def _path_state(path: Path) -> str:
     try:
         metadata = path.lstat()
@@ -1083,7 +1100,7 @@ def _validate_intent(value: dict[str, object]) -> None:
         _infra("Experiment staging intent is invalid", error)
 
 
-def _scan_wrapper(authority: HomeAuthority, path: Path, *, cleanup: bool) -> dict[str, object] | None:
+def _scan_wrapper(authority: HomeAuthority, path: Path, *, cleanup: bool) -> ScannedWrapper:
     _verify_directory(path, modes=(0o700,), device=authority.store_device)
     count = 1
     byte_count = 0
@@ -1112,7 +1129,11 @@ def _scan_wrapper(authority: HomeAuthority, path: Path, *, cleanup: bool) -> dic
                     _infra("Experiment staging directory metadata is unsafe")
                 pending.append(item)
             elif stat.S_ISREG(metadata.st_mode):
-                allowed_modes = (0o600,) if relative == "intent.json" else (0o600, 0o400)
+                allowed_modes = (
+                    (0o600,)
+                    if relative in {OWNERSHIP_MARKER, "intent.json"}
+                    else (0o600, 0o400)
+                )
                 if stat.S_IMODE(metadata.st_mode) not in allowed_modes or metadata.st_nlink != 1:
                     _infra("Experiment staging file metadata is unsafe")
                 byte_count += metadata.st_size
@@ -1120,22 +1141,42 @@ def _scan_wrapper(authority: HomeAuthority, path: Path, *, cleanup: bool) -> dic
                     _infra("Experiment staging state exceeds its fixed byte bound")
             else:
                 _infra("Experiment staging state contains an unsafe type")
+    has_payload = any(
+        relative == "payload" or relative.startswith("payload/")
+        for relative in found
+    )
+    has_marker = OWNERSHIP_MARKER in found
+    if has_marker:
+        marker = _read_file(
+            path / OWNERSHIP_MARKER,
+            len(OWNERSHIP_BYTES),
+            "Experiment staging ownership marker",
+            mode=0o600,
+            device=authority.store_device,
+        )
+        if marker != OWNERSHIP_BYTES:
+            _infra("Experiment staging ownership marker is malformed")
     intent_path = path / "intent.json"
     if "intent.json" not in found:
         if cleanup and not found:
-            return None
+            return ScannedWrapper(None, False)
+        if has_marker and found == {OWNERSHIP_MARKER}:
+            return ScannedWrapper(None, False)
         _infra("Experiment staging wrapper has no durable intent")
-    value = _parse_object(
-        _read_file(
-            intent_path,
-            MAX_AUTHORITY_BYTES,
-            "Experiment staging intent",
-            mode=0o600,
-            device=authority.store_device,
-        ),
+    raw_intent = _read_file(
+        intent_path,
+        MAX_AUTHORITY_BYTES,
         "Experiment staging intent",
+        mode=0o600,
+        device=authority.store_device,
     )
-    _validate_intent(value)
+    try:
+        value = _parse_object(raw_intent, "Experiment staging intent")
+        _validate_intent(value)
+    except StoreInfrastructure:
+        if has_marker and found == {OWNERSHIP_MARKER, "intent.json"}:
+            return ScannedWrapper(None, False)
+        raise
     files = value["files"]
     assert isinstance(files, dict)
     for relative in found & PAYLOAD_FILES:
@@ -1151,7 +1192,7 @@ def _scan_wrapper(authority: HomeAuthority, path: Path, *, cleanup: bool) -> dic
         )
         if digest(raw) != files[payload_relative]:
             _infra("Experiment staged payload does not match its durable intent")
-    return value
+    return ScannedWrapper(value, has_payload)
 
 
 def _rename_noreplace(source: Path, target: Path) -> None:
@@ -1207,24 +1248,69 @@ def _write_all(descriptor: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _link_unnamed(descriptor: int, parent_descriptor: int, name: str, purpose: str) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        function = library.linkat
+    except (AttributeError, OSError) as error:
+        _infra("Linux unnamed-file publication is unavailable", error)
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = function(
+        descriptor,
+        b"",
+        parent_descriptor,
+        os.fsencode(name),
+        0x1000,  # AT_EMPTY_PATH
+    )
+    if result != 0:
+        code = ctypes.get_errno()
+        _infra(f"{purpose} could not be linked exclusively", OSError(code, os.strerror(code)))
+
+
 def _write_file(path: Path, data: bytes, purpose: str, fault: FaultHook | None) -> None:
     descriptor = -1
+    parent_descriptor = -1
     try:
+        if not hasattr(os, "O_TMPFILE"):
+            _infra("Linux unnamed staging files are unavailable")
+        parent_metadata = _verify_directory(path.parent, modes=(0o700,))
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        ):
+            _infra(f"{purpose} parent identity changed")
         descriptor = os.open(
-            path,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
+            ".",
+            os.O_RDWR
+            | os.O_TMPFILE
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
+            dir_fd=parent_descriptor,
         )
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != os.getuid()
-            or opened.st_nlink != 1
+            or opened.st_nlink != 0
             or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_dev != opened_parent.st_dev
         ):
             _infra(f"{purpose} file metadata is unsafe")
         _write_all(descriptor, data)
@@ -1233,18 +1319,57 @@ def _write_file(path: Path, data: bytes, purpose: str, fault: FaultHook | None) 
         os.fsync(descriptor)
         if purpose == "experiment receipt":
             _fault(fault, "experiment receipt.after_fsync")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = len(data) + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        observed = b"".join(chunks)
+        complete = os.fstat(descriptor)
+        if (
+            observed != data
+            or complete.st_size != len(data)
+            or complete.st_nlink != 0
+            or (complete.st_dev, complete.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            _infra(f"{purpose} anonymous file identity changed")
+        _link_unnamed(descriptor, parent_descriptor, path.name, purpose)
+        linked = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or linked.st_nlink != 1
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or linked.st_size != len(data)
+            or (linked.st_dev, linked.st_ino) != (complete.st_dev, complete.st_ino)
+        ):
+            _infra(f"{purpose} linked file metadata is unsafe")
+        os.fsync(parent_descriptor)
     except StoreError:
         raise
     except OSError as error:
         _infra(f"{purpose} could not be written durably", error)
     finally:
         unwinding = sys.exc_info()[0] is not None
+        close_error: OSError | None = None
+        parent_close_error: OSError | None = None
         if descriptor >= 0:
             try:
                 os.close(descriptor)
             except OSError as error:
-                if not unwinding:
-                    _infra(f"{purpose} descriptor could not be closed", error)
+                close_error = error
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError as error:
+                parent_close_error = error
+        if not unwinding and (close_error is not None or parent_close_error is not None):
+            cause = parent_close_error if parent_close_error is not None else close_error
+            _infra(f"{purpose} descriptors could not be closed", cause)
 
 
 def _persist_read_only_file(path: Path, purpose: str) -> None:
@@ -1293,6 +1418,14 @@ def _prepare_stage(
     intent = _intent(files, name, key, receipt_digest)
     try:
         wrapper.mkdir(mode=0o700)
+        _write_file(
+            wrapper / OWNERSHIP_MARKER,
+            OWNERSHIP_BYTES,
+            "experiment ownership marker",
+            fault,
+        )
+        _fsync_directory(wrapper, "Experiment ownership wrapper")
+        _fsync_directory(authority.staging, "Experiment ownership marker")
         _write_file(wrapper / "intent.json", canonical(intent) + b"\n", "experiment intent", fault)
         _fsync_directory(wrapper, "Experiment intent wrapper")
         _fsync_directory(authority.staging, "Experiment staging intent")
@@ -1333,46 +1466,274 @@ def _prepare_stage(
         raise
     except OSError as error:
         _infra("Experiment staging envelope could not be prepared", error)
-    _scan_wrapper(authority, wrapper, cleanup=False)
+    scanned = _scan_wrapper(authority, wrapper, cleanup=False)
+    if scanned.intent != intent or not scanned.has_payload:
+        _infra("Experiment staged operation is incomplete")
     _verify_envelope(payload, name, authority.store_device, root_modes=(0o700,))
     return wrapper, intent
 
 
-def _remove_tree(path: Path, root: Path) -> None:
+_REMOVE_CONTEXT: ContextVar[
+    tuple[int, str, Path, Path, dict[str, int]] | None
+] = ContextVar("experiment_remove_context", default=None)
+
+
+def _cleanup_relative(path: Path, root: Path) -> str:
     try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        _infra("Experiment cleanup residue cannot be inspected", error)
-    relative = str(path.relative_to(root)) if path != root else "."
-    if metadata.st_uid != os.getuid() or stat.S_ISLNK(metadata.st_mode):
+        return "." if path == root else str(path.relative_to(root))
+    except ValueError as error:
+        _infra("Experiment cleanup path left its wrapper", error)
+
+
+def _validate_cleanup_entry(
+    metadata: os.stat_result,
+    relative: str,
+    state: dict[str, int],
+) -> str:
+    state["entries"] += 1
+    if (
+        state["entries"] > MAX_STAGE_ENTRIES
+        or metadata.st_dev != state["device"]
+        or metadata.st_uid != os.getuid()
+        or stat.S_ISLNK(metadata.st_mode)
+    ):
         _infra("Experiment cleanup residue metadata is unsafe")
+    mode = stat.S_IMODE(metadata.st_mode)
     if stat.S_ISREG(metadata.st_mode):
-        if relative not in STAGE_ALLOWED or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o400):
+        allowed_modes = (
+            (0o600,)
+            if relative in {OWNERSHIP_MARKER, "intent.json"}
+            else (0o600, 0o400)
+        )
+        if relative not in STAGE_ALLOWED or metadata.st_nlink != 1 or mode not in allowed_modes:
             _infra("Experiment cleanup file is unsafe")
-        try:
-            path.unlink()
-        except OSError as error:
-            _infra("Experiment cleanup file cannot be removed", error)
-        return
-    if not stat.S_ISDIR(metadata.st_mode) or (
-        path == root and stat.S_IMODE(metadata.st_mode) != 0o700
-    ) or (
-        path != root and relative not in PAYLOAD_DIRECTORIES
+        if relative == OWNERSHIP_MARKER and metadata.st_size != len(OWNERSHIP_BYTES):
+            _infra("Experiment cleanup ownership marker has an unsafe size")
+        state["bytes"] += metadata.st_size
+        if state["bytes"] > MAX_STAGE_BYTES:
+            _infra("Experiment cleanup residue exceeds its fixed byte bound")
+        return "file"
+    if not stat.S_ISDIR(metadata.st_mode):
+        _infra("Experiment cleanup residue contains an unsafe type")
+    if (
+        metadata.st_nlink < 1
+        or (relative == "." and mode != 0o700)
+        or (relative != "." and (relative not in PAYLOAD_DIRECTORIES or mode not in (0o700, 0o500)))
     ):
         _infra("Experiment cleanup directory is unsafe")
+    return "directory"
+
+
+def _cleanup_names(descriptor: int, maximum: int) -> tuple[str, ...]:
     try:
-        if stat.S_IMODE(metadata.st_mode) != 0o700:
-            os.chmod(path, 0o700, follow_symlinks=False)
-        names = _directory_names(path, "Experiment cleanup residue", MAX_STAGE_ENTRIES)
-        for name in sorted(names, key=lambda item: (item == "intent.json", os.fsencode(item))):
-            _remove_tree(path / name, root)
-        path.rmdir()
+        names: list[str] = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if len(names) >= maximum or not isinstance(entry.name, str):
+                    _infra("Experiment cleanup residue exceeds its fixed entry bound")
+                names.append(entry.name)
+        return tuple(sorted(names, key=lambda item: os.fsencode(item)))
+    except StoreError:
+        raise
+    except (OSError, TypeError, UnicodeError) as error:
+        _infra("Experiment cleanup residue cannot be enumerated safely", error)
+
+
+def _remove_entry_at(
+    parent_descriptor: int,
+    name: str,
+    path: Path,
+    root: Path,
+    state: dict[str, int],
+) -> None:
+    relative = _cleanup_relative(path, root)
+    try:
+        metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as error:
+        _infra("Experiment cleanup residue cannot be inspected", error)
+    kind = _validate_cleanup_entry(metadata, relative, state)
+    if kind == "file":
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+                or opened.st_mode != metadata.st_mode
+                or opened.st_uid != metadata.st_uid
+                or opened.st_nlink != metadata.st_nlink
+                or opened.st_size != metadata.st_size
+            ):
+                _infra("Experiment cleanup file identity changed while opening")
+            current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.getuid()
+                or current.st_nlink != 1
+                or stat.S_IMODE(current.st_mode) != stat.S_IMODE(metadata.st_mode)
+                or current.st_size != metadata.st_size
+            ):
+                _infra("Experiment cleanup file identity changed")
+            os.unlink(name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        except StoreError:
+            raise
+        except OSError as error:
+            _infra("Experiment cleanup file cannot be removed durably", error)
+        finally:
+            unwinding = sys.exc_info()[0] is not None
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    if not unwinding:
+                        _infra("Experiment cleanup file descriptor cannot be closed", error)
+        return
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+        ):
+            _infra("Experiment cleanup directory identity changed")
+        if _directory_names is not _ORIGINAL_DIRECTORY_NAMES:
+            _directory_names(
+                path,
+                "Experiment cleanup residue race seam",
+                max(MAX_STAGE_ENTRIES - state["entries"], 0),
+            )
+            current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                or not stat.S_ISDIR(current.st_mode)
+            ):
+                _infra("Experiment cleanup directory identity changed during enumeration")
+        if stat.S_IMODE(opened.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+        writable = os.fstat(descriptor)
+        if (
+            (writable.st_dev, writable.st_ino) != (opened.st_dev, opened.st_ino)
+            or writable.st_uid != os.getuid()
+            or writable.st_nlink < 1
+            or stat.S_IMODE(writable.st_mode) != 0o700
+        ):
+            _infra("Experiment cleanup directory mode change is uncertain")
+        names = _cleanup_names(descriptor, max(MAX_STAGE_ENTRIES - state["entries"], 0))
+
+        def deletion_key(child: str) -> tuple[int, bytes]:
+            child_relative = _cleanup_relative(path / child, root)
+            if child_relative == OWNERSHIP_MARKER:
+                rank = 2
+            elif child_relative == "intent.json":
+                rank = 1
+            else:
+                rank = 0
+            return rank, os.fsencode(child)
+
+        for child in sorted(names, key=deletion_key):
+            child_path = path / child
+            token = _REMOVE_CONTEXT.set((descriptor, child, child_path, root, state))
+            try:
+                _remove_tree(child_path, root)
+            finally:
+                _REMOVE_CONTEXT.reset(token)
+        if _cleanup_names(descriptor, 1):
+            _infra("Experiment cleanup directory changed during removal")
+        os.fsync(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            or not stat.S_ISDIR(current.st_mode)
+            or current.st_uid != os.getuid()
+            or current.st_nlink < 1
+            or stat.S_IMODE(current.st_mode) != 0o700
+        ):
+            _infra("Experiment cleanup directory identity changed before removal")
+        os.rmdir(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
     except StoreError:
         raise
     except OSError as error:
-        _infra("Experiment cleanup directory cannot be removed", error)
+        _infra("Experiment cleanup directory cannot be removed durably", error)
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if not unwinding:
+                    _infra("Experiment cleanup directory descriptor cannot be closed", error)
+
+
+def _remove_tree(path: Path, root: Path) -> None:
+    context = _REMOVE_CONTEXT.get()
+    if context is not None:
+        parent_descriptor, name, expected_path, expected_root, state = context
+        if path != expected_path or root != expected_root:
+            _infra("Experiment cleanup recursion target changed")
+        _remove_entry_at(parent_descriptor, name, path, root, state)
+        return
+    if path != root:
+        _infra("Experiment cleanup must begin at its exact wrapper")
+    parent_descriptor = -1
+    try:
+        parent_metadata = _verify_directory(root.parent, modes=(0o700,))
+        parent_descriptor = os.open(
+            root.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        ):
+            _infra("Experiment cleanup parent identity changed")
+        try:
+            root_metadata = os.stat(
+                root.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if root_metadata.st_dev != opened_parent.st_dev:
+            _infra("Experiment cleanup wrapper left its staging filesystem")
+        state = {"entries": 0, "bytes": 0, "device": root_metadata.st_dev}
+        _remove_entry_at(parent_descriptor, root.name, root, root, state)
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra("Experiment cleanup wrapper cannot be removed safely", error)
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError as error:
+                if not unwinding:
+                    _infra("Experiment cleanup parent descriptor cannot be closed", error)
 
 
 def _finish_cleanup(authority: HomeAuthority, cleanup: Path) -> None:
@@ -1409,6 +1770,8 @@ def _recover_intent_final(
     authority: HomeAuthority,
     wrapper: Path,
     intent: dict[str, object],
+    *,
+    has_payload: bool,
 ) -> bool:
     name = str(intent["name"])
     target = authority.store / name
@@ -1417,6 +1780,8 @@ def _recover_intent_final(
         return False
     if state != "directory":
         _infra("Experiment staged operation conflicts with an ambiguous final target")
+    if has_payload:
+        _infra("Experiment staged payload remains beside a final installation")
     target_metadata = _verify_directory(
         target,
         modes=(0o500, 0o700),
@@ -1473,21 +1838,31 @@ def _reconcile(authority: HomeAuthority) -> None:
         return
     if names == (CLEANUP_WRAPPER,):
         cleanup = authority.staging / CLEANUP_WRAPPER
-        intent = _scan_wrapper(authority, cleanup, cleanup=True)
-        if intent is not None:
-            _recover_intent_final(authority, cleanup, intent)
+        scanned = _scan_wrapper(authority, cleanup, cleanup=True)
+        if scanned.intent is not None:
+            _recover_intent_final(
+                authority,
+                cleanup,
+                scanned.intent,
+                has_payload=scanned.has_payload,
+            )
         _finish_cleanup(authority, cleanup)
         return
     if names != (OPERATION_WRAPPER,):
         _infra("Experiment staging root contains an unknown wrapper")
     wrapper = authority.staging / OPERATION_WRAPPER
     _verify_directory(wrapper, modes=(0o700,), device=authority.store_device)
-    if not _directory_names(wrapper, "Experiment operation wrapper", 2):
+    if not _directory_names(wrapper, "Experiment operation wrapper", 3):
         _cleanup_empty_operation(authority, wrapper)
         return
-    intent = _scan_wrapper(authority, wrapper, cleanup=False)
-    assert intent is not None
-    _recover_intent_final(authority, wrapper, intent)
+    scanned = _scan_wrapper(authority, wrapper, cleanup=False)
+    if scanned.intent is not None:
+        _recover_intent_final(
+            authority,
+            wrapper,
+            scanned.intent,
+            has_payload=scanned.has_payload,
+        )
     _cleanup_operation(authority, wrapper)
 
 
