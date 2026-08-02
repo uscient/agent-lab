@@ -3,7 +3,7 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
-expected_count=9
+expected_count=12
 work=""
 
 cleanup_work() {
@@ -97,6 +97,24 @@ write_fixture() {
         printf 'fi\n'
         ;;
     esac
+    if [ "$execution_id" = "local-image-catalog-cases.sh" ]; then
+      printf 'if [ -n "${AGENT_LAB_AGG_HOLD_DIR:-}" ]; then\n'
+      printf '  : > "$AGENT_LAB_AGG_HOLD_DIR/ready" || exit 125\n'
+      printf '  attempts=0\n'
+      printf '  while [ ! -f "$AGENT_LAB_AGG_HOLD_DIR/release" ]; do\n'
+      printf '    attempts=$((attempts + 1))\n'
+      printf '    [ "$attempts" -lt 500 ] || exit 125\n'
+      printf '    sleep 0.01\n'
+      printf '  done\n'
+      printf 'fi\n'
+      printf 'if [ -n "${AGENT_LAB_AGG_SIGNAL_DIR:-}" ]; then\n'
+      printf '  sleep 30 &\n'
+      printf '  descendant_pid=$!\n'
+      printf '  printf "%%s\\n" "$descendant_pid" > "$AGENT_LAB_AGG_SIGNAL_DIR/descendant.pid" || exit 125\n'
+      printf '  : > "$AGENT_LAB_AGG_SIGNAL_DIR/ready" || exit 125\n'
+      printf '  wait "$descendant_pid"\n'
+      printf 'fi\n'
+    fi
     for record in "$@"; do
       kind="${record%%:*}"
       id="${record#*:}"
@@ -105,6 +123,9 @@ write_fixture() {
     done
     printf "printf 'SUMMARY assertions=%s expected=%s failures=%s infra=0\\n'\n" \
       "$#" "$#" "$fixture_failures"
+    printf 'if [ -n "${AGENT_LAB_AGG_DONE_DIR:-}" ]; then\n'
+    printf "  : > \"\$AGENT_LAB_AGG_DONE_DIR/%s.done\" || exit 125\n" "$execution_id"
+    printf 'fi\n'
     printf 'exit %s\n' "$rc"
   } > "$path"
   chmod +x "$path"
@@ -148,6 +169,9 @@ write_python_fixture() {
     done
     printf "print('SUMMARY assertions=%s expected=%s failures=%s infra=0')\n" \
       "$#" "$#" "$fixture_failures"
+    printf "done_dir = os.environ.get('AGENT_LAB_AGG_DONE_DIR')\n"
+    printf 'if done_dir:\n'
+    printf "    Path(done_dir, '%s.done').touch()\n" "$execution_id"
     printf 'raise SystemExit(%s)\n' "$rc"
   } > "$path"
   chmod +x "$path"
@@ -191,6 +215,26 @@ run_selected() {
   shift 2
   "$@" bash "$selected_lifecycle" > "$output" 2>&1
   return $?
+}
+
+wait_for_path() {
+  local path="$1"
+  local attempts=0
+  while [ ! -e "$path" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 500 ] || return 1
+    sleep 0.01
+  done
+}
+
+wait_for_process_exit() {
+  local pid="$1"
+  local attempts=0
+  while kill -0 "$pid" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 500 ] || return 1
+    sleep 0.01
+  done
 }
 
 reset_fixtures
@@ -393,6 +437,76 @@ if [ "$summaryless_rc" -eq 125 ] &&
   pass AGG-009 "missing subcase summary maps to one hundred twenty-five"
 else
   fail AGG-009 "missing subcase summary maps to one hundred twenty-five"
+fi
+
+if [ "$(grep -Fxc 'lane_count=3' "$replica_lifecycle")" -eq 1 ]; then
+  pass AGG-010 "lifecycle execution is hard-bounded to three lanes"
+else
+  fail AGG-010 "lifecycle execution is hard-bounded to three lanes"
+fi
+
+reset_fixtures
+hold_dir="$work/lane-hold"
+done_dir="$work/lane-done"
+wait_executions="$work/wait-executions"
+mkdir "$hold_dir" "$done_dir"
+: > "$wait_executions"
+wait_rc=0
+run_replica "$work/wait.out" env \
+  AGENT_LAB_AGG_EXEC_LOG="$wait_executions" \
+  AGENT_LAB_AGG_HOLD_DIR="$hold_dir" \
+  AGENT_LAB_AGG_DONE_DIR="$done_dir" &
+wait_pid=$!
+wait_contract=0
+if wait_for_path "$hold_dir/ready" &&
+   wait_for_path "$done_dir/install-mutation-cases.py.done" &&
+   wait_for_path "$done_dir/install-state-cases.py.done"; then
+  sleep 0.5
+  if kill -0 "$wait_pid" 2>/dev/null; then
+    wait_contract=1
+  fi
+fi
+: > "$hold_dir/release"
+wait "$wait_pid" || wait_rc=$?
+if [ "$wait_contract" -eq 1 ] && [ "$wait_rc" -eq 0 ] &&
+   wait_for_path "$done_dir/install-integrity-cases.py.done" &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$wait_executions"); then
+  pass AGG-011 "parent waits every lane through controlled completion"
+else
+  fail AGG-011 "parent waits every lane through controlled completion"
+fi
+
+reset_fixtures
+signal_dir="$work/signal"
+mkdir "$signal_dir"
+AGENT_LAB_AGG_SIGNAL_DIR="$signal_dir" \
+  python3 -I -B -c \
+    'import os, sys; os.setsid(); os.execvpe("bash", ["bash", sys.argv[1]], os.environ)' \
+    "$replica_lifecycle" > "$work/signal.out" 2>&1 &
+signal_pid=$!
+signal_rc=0
+descendant_pid=""
+if wait_for_path "$signal_dir/ready" &&
+   IFS= read -r descendant_pid < "$signal_dir/descendant.pid" &&
+   [[ "$descendant_pid" =~ ^[0-9]+$ ]] &&
+   kill -0 "$descendant_pid" 2>/dev/null; then
+  kill -TERM "$signal_pid" 2>/dev/null || true
+else
+  signal_rc=125
+  kill -TERM "$signal_pid" 2>/dev/null || true
+fi
+observed_signal_rc=0
+wait "$signal_pid" || observed_signal_rc=$?
+descendant_gone=0
+if [ -n "$descendant_pid" ] && wait_for_process_exit "$descendant_pid"; then
+  descendant_gone=1
+fi
+kill -KILL -- "-$signal_pid" 2>/dev/null || true
+if [ "$signal_rc" -eq 0 ] && [ "$observed_signal_rc" -eq 143 ] &&
+   [ "$descendant_gone" -eq 1 ]; then
+  pass AGG-012 "termination reaps active descendants before lifecycle exit"
+else
+  fail AGG-012 "termination reaps active descendants before lifecycle exit"
 fi
 
 cleanup_infrastructure=0
