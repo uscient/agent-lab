@@ -34,17 +34,17 @@ fi
 
 expected_suites="$work/expected-docker-suites"
 cat > "$expected_suites" <<'EOF'
-image-volume tests/docker/image-volume.sh
-wrapper-context-runtime tests/docker/wrapper-context.sh
-network-boundary tests/docker/network-boundary.sh
-dns-contract tests/docker/dns-contract.sh
-runtime-inspect-differential tests/docker/runtime-inspect-differential.sh
-runtime-hardening tests/docker/runtime-hardening.sh
-secret-nondisclosure tests/docker/secret-nondisclosure.sh
-serena-runtime tests/docker/serena-runtime.sh
+image-volume tests/docker/image-volume.sh SUMMARY failures=0
+wrapper-context-runtime tests/docker/wrapper-context.sh SUMMARY failures=0
+network-boundary tests/docker/network-boundary.sh SUMMARY failures=0
+dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
+runtime-inspect-differential tests/docker/runtime-inspect-differential.sh SUMMARY failures=0
+runtime-hardening tests/docker/runtime-hardening.sh SUMMARY failures=0
+secret-nondisclosure tests/docker/secret-nondisclosure.sh SUMMARY failures=0
+serena-runtime tests/docker/serena-runtime.sh SUMMARY failures=0
 EOF
 actual_suites="$work/actual-docker-suites"
-awk '$1 == "suite" { print $2, $3 }' "$docker_manifest" > "$actual_suites"
+awk '$1 == "suite" { $1 = ""; sub(/^ /, ""); print }' "$docker_manifest" > "$actual_suites"
 if cmp -s "$expected_suites" "$actual_suites"; then
   pass "versioned Docker gate has the exact required suite contract"
 else

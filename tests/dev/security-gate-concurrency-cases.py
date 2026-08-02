@@ -882,12 +882,28 @@ def test_ci_foundation_limits_and_deadlines(work: Path) -> None:
         "short-deadlines",
         (
             (
-                '"fast": (120.0, 600.0, 3.0)',
-                '"fast": (0.15, 0.45, 0.05)',
+                "FAST_SUITE_EXECUTION_SECONDS = 120.0",
+                "FAST_SUITE_EXECUTION_SECONDS = 0.15",
             ),
             (
-                '"docker": (900.0, 1800.0, 15.0)',
-                '"docker": (0.15, 0.30, 0.05)',
+                "FAST_GATE_PHASE_SECONDS = 600.0",
+                "FAST_GATE_PHASE_SECONDS = 0.45",
+            ),
+            (
+                "FAST_TERMINATION_SECONDS = 3.0",
+                "FAST_TERMINATION_SECONDS = 0.05",
+            ),
+            (
+                "DOCKER_SUITE_EXECUTION_SECONDS = 900.0",
+                "DOCKER_SUITE_EXECUTION_SECONDS = 0.15",
+            ),
+            (
+                "DOCKER_GATE_PHASE_SECONDS = 1800.0",
+                "DOCKER_GATE_PHASE_SECONDS = 0.30",
+            ),
+            (
+                "DOCKER_TERMINATION_SECONDS = 15.0",
+                "DOCKER_TERMINATION_SECONDS = 0.05",
             ),
             ("PREFLIGHT_EXECUTION_SECONDS = 30.0", "PREFLIGHT_EXECUTION_SECONDS = 0.15"),
             ("PREFLIGHT_TERMINATION_SECONDS = 1.0", "PREFLIGHT_TERMINATION_SECONDS = 0.05"),
@@ -925,6 +941,11 @@ def test_ci_foundation_limits_and_deadlines(work: Path) -> None:
     check(headings(result.stdout) == ["hang", "pass", "queued"], "CI-008 timeout evidence remains manifest ordered")
 
     phase_log = fixture / "phase.log"
+    fake_docker = write_script(
+        fixture,
+        "docker",
+        "case \"${1-} ${2-}\" in\n  'info '|'compose version') exit 0 ;;\n  *) exit 99 ;;\nesac\n",
+    )
     phase_hang = write_script(fixture, "phase-hang.sh", "sleep 30\n")
     phase_queued = write_script(
         fixture,
@@ -945,6 +966,29 @@ def test_ci_foundation_limits_and_deadlines(work: Path) -> None:
     )
     check(phase_result.rc == 125 and phase_result.seconds < 2.0, "CI-006 and CI-011 Docker deadline is bounded infrastructure")
     check(not phase_log.exists(), "CI-011 Docker timeout launches no queued suite")
+
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\nset -u\n"
+        "case \"${1-} ${2-}\" in\n"
+        "  'info ') sleep 30 ;;\n"
+        "  'compose version') exit 0 ;;\n"
+        "  *) exit 99 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    preflight_result = run_gate(
+        phase_manifest,
+        1,
+        mode="docker",
+        helper=timed_helper,
+        extra_env={"PHASE_LOG": str(phase_log), "PATH": str(fixture) + os.pathsep + os.environ["PATH"]},
+    )
+    check(
+        preflight_result.rc == 125 and preflight_result.seconds < 2.0,
+        "CI-009 Docker preflight timeout is bounded infrastructure",
+    )
+    check(not phase_log.exists(), "CI-009 preflight timeout launches no suite")
 
 
 def process_exists(pid: int) -> bool:
@@ -1616,6 +1660,62 @@ def test_residual_marker_forgery(work: Path) -> None:
 
 
 def test_sensitivity_mutants(work: Path) -> None:
+    deadline_mutant = transformed_helper(
+        work,
+        "deadline-removal",
+        (
+            ("if time.monotonic() >= gate_deadline:", "if False:  # deadline-removal mutant"),
+            ("expired = [item for item in running if time.monotonic() >= item.deadline]", "expired = []  # deadline-removal mutant"),
+            ("FAST_SUITE_EXECUTION_SECONDS = 120.0", "FAST_SUITE_EXECUTION_SECONDS = 0.10"),
+            ("FAST_GATE_PHASE_SECONDS = 600.0", "FAST_GATE_PHASE_SECONDS = 0.20"),
+        ),
+    )
+    if deadline_mutant is not None:
+        fixture_work = work / "mutant-deadline"
+        group_file = fixture_work / "suite.group"
+        hanging = write_script(
+            fixture_work,
+            "hang.sh",
+            "printf '%s\\n' \"$$\" > \"$GROUP_FILE\"\nsleep 30\n",
+        )
+        manifest = write_manifest(fixture_work, "hang.manifest", [("hang", hanging, "DONE hang")])
+        env = dict(os.environ)
+        env["GROUP_FILE"] = str(group_file)
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(deadline_mutant), "fast", "--manifest", str(manifest)],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            process.communicate(timeout=0.6)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        if group_file.is_file():
+            try:
+                os.killpg(int(group_file.read_text(encoding="ascii")), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        check(timed_out, "deadline-removal sensitivity mutation turns RED")
+
+    marker_mutant = make_mutant(
+        work,
+        "premature-marker",
+        "marker_valid = (\n                    marker_count == 1\n                    and bool(nonempty_lines)\n                    and nonempty_lines[-1] == suite.marker\n                )",
+        "marker_valid = suite.marker in decoded  # premature-marker mutant",
+    )
+    if marker_mutant is not None:
+        fixture_work = work / "mutant-marker"
+        prefixed = write_script(fixture_work, "prefixed.sh", "printf 'prefix DONE exact\\n'\n")
+        manifest = write_manifest(fixture_work, "prefixed.manifest", [("prefixed", prefixed, "DONE exact")])
+        result = run_gate(manifest, 1, helper=marker_mutant)
+        check(result.rc == 0, "premature-marker sensitivity mutation turns RED")
+
     order_mutant = make_mutant(
         work,
         "order",

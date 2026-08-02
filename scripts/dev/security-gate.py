@@ -23,9 +23,26 @@ ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = str(Path(__file__).with_suffix(""))
 FAST_WORKERS = 4
 DOCKER_WORKERS = 1
-PREFLIGHT_TERMINATION_SECONDS = 1.0
+FAST_SUITE_EXECUTION_SECONDS = 120.0
+FAST_GATE_PHASE_SECONDS = 600.0
 FAST_TERMINATION_SECONDS = 3.0
+DOCKER_SUITE_EXECUTION_SECONDS = 900.0
+DOCKER_GATE_PHASE_SECONDS = 1800.0
 DOCKER_TERMINATION_SECONDS = 15.0
+MODE_LIMITS = {
+    "fast": (
+        FAST_SUITE_EXECUTION_SECONDS,
+        FAST_GATE_PHASE_SECONDS,
+        FAST_TERMINATION_SECONDS,
+    ),
+    "docker": (
+        DOCKER_SUITE_EXECUTION_SECONDS,
+        DOCKER_GATE_PHASE_SECONDS,
+        DOCKER_TERMINATION_SECONDS,
+    ),
+}
+PREFLIGHT_EXECUTION_SECONDS = 30.0
+PREFLIGHT_TERMINATION_SECONDS = 1.0
 MAX_SUITE_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_OUTPUT_BYTES = 32 * 1024 * 1024
 HANDLED_SIGNALS = frozenset(
@@ -47,6 +64,7 @@ class RunningSuite:
     process: subprocess.Popen[bytes]
     stream: socket.socket
     output: bytearray
+    deadline: float
     eof: bool = False
 
 
@@ -199,7 +217,7 @@ def terminate_preflight_group(
         pass
 
 
-def run_preflight_command(command: list[str]) -> int | None:
+def run_preflight_command(command: list[str], gate_deadline: float) -> int | None:
     process: subprocess.Popen[bytes] | None = None
     cancellation_observed = False
 
@@ -236,6 +254,13 @@ def run_preflight_command(command: list[str]) -> int | None:
                 return None
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        deadline = min(time.monotonic() + PREFLIGHT_EXECUTION_SECONDS, gate_deadline)
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if process.poll() is None:
+            remaining = max(0.0, gate_deadline - time.monotonic())
+            terminate_preflight_group(process, min(PREFLIGHT_TERMINATION_SECONDS, remaining))
+            return None
         returncode = process.wait()
         if process_group_alive(process):
             terminate_preflight_group(process, PREFLIGHT_TERMINATION_SECONDS)
@@ -252,6 +277,7 @@ def preflight(
     tool_any: list[tuple[str, str]],
     suites: list[Suite],
     mode: str,
+    gate_deadline: float,
 ) -> None:
     failed = False
     for tool in tools:
@@ -270,11 +296,11 @@ def preflight(
         raise SystemExit(125)
 
     if mode == "docker":
-        docker_info = run_preflight_command(["docker", "info"])
+        docker_info = run_preflight_command(["docker", "info"], gate_deadline)
         if docker_info is None or docker_info != 0:
             infra("Docker daemon is unavailable")
             raise SystemExit(125)
-        compose_version = run_preflight_command(["docker", "compose", "version"])
+        compose_version = run_preflight_command(["docker", "compose", "version"], gate_deadline)
         if compose_version is None or compose_version != 0:
             infra("Docker Compose v2 is unavailable")
             raise SystemExit(125)
@@ -520,6 +546,9 @@ def drain_ready_outputs(
 def run_suites(
     suites: list[Suite],
     jobs: int,
+    mode: str,
+    suite_seconds: float,
+    gate_deadline: float,
     grace_seconds: float,
 ) -> tuple[list[int], list[bytes]]:
     statuses: list[int | None] = [None] * len(suites)
@@ -565,6 +594,10 @@ def run_suites(
 
     try:
         while next_index < len(suites) or running:
+            if time.monotonic() >= gate_deadline:
+                terminate_groups(running, 0.0)
+                infra("security-gate subprocess phase exceeded its deadline")
+                raise SystemExit(125)
             while next_index < len(suites) and len(running) < jobs:
                 suite = suites[next_index]
                 try:
@@ -603,6 +636,7 @@ def run_suites(
                             process,
                             parent_stream,
                             bytearray(),
+                            time.monotonic() + suite_seconds,
                         )
                         try:
                             selector.register(
@@ -688,6 +722,28 @@ def run_suites(
                     total_output_bytes += len(captured)
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            expired = [item for item in running if time.monotonic() >= item.deadline]
+            for item in expired:
+                suite = suites[item.index]
+                remaining = max(0.0, gate_deadline - time.monotonic())
+                terminate_groups(
+                    [item],
+                    min(grace_seconds, remaining),
+                    lambda: drain_ready_outputs(
+                        selector, suites, running, total_output_bytes, 0.0, False
+                    ),
+                )
+                receive_available_output(
+                    selector, suites, running, item, total_output_bytes
+                )
+                close_capture(selector, item)
+                outputs[item.index] = bytes(item.output)
+                statuses[item.index] = 125
+                total_output_bytes += len(item.output)
+                running.remove(item)
+                infra(f"suite {suite.suite_id} exceeded its execution deadline")
+                if mode == "docker":
+                    next_index = len(suites)
     except BaseException:
         terminate_groups(running, 0.0)
         raise
@@ -727,14 +783,23 @@ def classify(suites: list[Suite], statuses: list[int], outputs: list[bytes]) -> 
                     flush=True,
                 )
                 failed += 1
-            elif suite.marker.encode() not in output:
+            else:
+                nonempty_lines = [line for line in decoded.splitlines() if line.strip()]
+                marker_count = sum(line == suite.marker for line in nonempty_lines)
+                marker_valid = (
+                    marker_count == 1
+                    and bool(nonempty_lines)
+                    and nonempty_lines[-1] == suite.marker
+                )
+            if status == 0 and not forbidden.search(decoded) and not marker_valid:
+                marker_problem = "missing" if suite.marker not in decoded else "invalid"
                 print(
-                    f"FAIL suite {suite.suite_id} missing completion marker: {suite.marker}",
+                    f"FAIL suite {suite.suite_id} {marker_problem} completion marker: {suite.marker}",
                     file=sys.stderr,
                     flush=True,
                 )
                 failed += 1
-            else:
+            elif status == 0 and not forbidden.search(decoded):
                 passed += 1
         elif status == 77:
             print(f"SKIP suite {suite.suite_id} returned 77", file=sys.stderr, flush=True)
@@ -976,14 +1041,15 @@ def main(argv: list[str]) -> int:
         infra(f"required manifest is missing: {manifest}")
         return 125
     tools, tool_any, suites = parse_manifest(manifest)
-    preflight(tools, tool_any, suites, mode)
+    suite_seconds, phase_seconds, grace_seconds = MODE_LIMITS[mode]
+    gate_deadline = time.monotonic() + phase_seconds
+    preflight(tools, tool_any, suites, mode, gate_deadline)
     jobs = worker_count(mode)
-    grace_seconds = (
-        DOCKER_TERMINATION_SECONDS if mode == "docker" else FAST_TERMINATION_SECONDS
-    )
     evidence = evidence_directory()
     try:
-        statuses, outputs = run_suites(suites, jobs, grace_seconds)
+        statuses, outputs = run_suites(
+            suites, jobs, mode, suite_seconds, gate_deadline, grace_seconds
+        )
         if evidence is not None:
             persist_evidence(evidence, suites, statuses, outputs)
     except BaseException:
