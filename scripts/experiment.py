@@ -326,8 +326,8 @@ def _zip_eocd(archive: bytes) -> tuple[int, tuple[object, ...]]:
 
 
 def _zip_decode(payload: bytes, expanded_size: int) -> bytes:
-    deadline = time.monotonic() + ZIP_DECODE_TIMEOUT_SECONDS
     try:
+        deadline = time.monotonic() + ZIP_DECODE_TIMEOUT_SECONDS
         decoder = zlib.decompressobj(-15)
         output: list[bytes] = []
         produced = 0
@@ -471,7 +471,6 @@ def read_zip_snapshot(path: str) -> SourceSnapshot:
         _zip_reject("ZIP-HEADER", "central signature is invalid")
     if (
         version_needed >= 45
-        or (version_made & 0xFF) >= 45
         or compressed_size == 0xFFFFFFFF
         or expanded_size == 0xFFFFFFFF
         or local_offset == 0xFFFFFFFF
