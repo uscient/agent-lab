@@ -6,7 +6,7 @@ subcases=(
   "$repo_root/tests/experiment/zip-intake-cases.sh"
   "$repo_root/tests/experiment/zip-mutation-cases.py"
 )
-expected_count=44
+expected_count=45
 work=""
 
 cleanup_work() {
@@ -36,7 +36,7 @@ printf '%s\n' \
   ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 \
   ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 \
   M-ZIP-COUNT-001 M-ZIP-NAME-001 M-ZIP-TYPE-001 M-ZIP-FLAG-001 \
-  M-ZIP-METHOD-001 M-ZIP-SIZE-001 M-ZIP-CRC-001 M-ZIP-HEADER-001 \
+  M-ZIP-METHOD-001 M-ZIP-SIZE-001 M-ZIP-BOMB-001 M-ZIP-CRC-001 M-ZIP-HEADER-001 \
   M-ZIP-EXTRACT-001 M-ZIP-IDENTITY-001 M-ZIP-AUTH-001 > "$expected"
 : > "$observed"
 

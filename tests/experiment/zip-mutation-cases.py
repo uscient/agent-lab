@@ -21,6 +21,7 @@ EXPECTED = (
     "M-ZIP-FLAG-001",
     "M-ZIP-METHOD-001",
     "M-ZIP-SIZE-001",
+    "M-ZIP-BOMB-001",
     "M-ZIP-CRC-001",
     "M-ZIP-HEADER-001",
     "M-ZIP-EXTRACT-001",
@@ -290,6 +291,19 @@ def main() -> int:
                     "    if os.environ.get(\"AGENT_LAB_ZIP_MUTATION_MARK\") is not None:\n"
                     "        Path(os.environ[\"AGENT_LAB_ZIP_MUTATION_MARK\"]).touch()\n"
                     "    if False:\n"
+                ),
+            ),
+            (
+                "M-ZIP-BOMB-001",
+                "deflate-bomb.zip",
+                "ZIP-SIZE",
+                "MAX_SOURCE_BYTES = MAX_MANIFEST_BYTES\n",
+                (
+                    "MAX_SOURCE_BYTES = (\n"
+                    "    (Path(os.environ[\"AGENT_LAB_ZIP_MUTATION_MARK\"]).touch() or 300_000)\n"
+                    "    if os.environ.get(\"AGENT_LAB_ZIP_MUTATION_MARK\") is not None\n"
+                    "    else MAX_MANIFEST_BYTES\n"
+                    ")\n"
                 ),
             ),
             (
