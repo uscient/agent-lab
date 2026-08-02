@@ -2613,16 +2613,27 @@ def main(argv: list[str]) -> int:
     directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
     zip_checking = len(argv) == 3 and argv[1] == "check-zip"
     zip_authorizing = len(argv) == 3 and argv[1] == "authorize-zip"
-    if directory_checking or directory_authorizing or zip_checking or zip_authorizing:
+    git_checking = len(argv) == 4 and argv[1] == "check-git"
+    git_authorizing = len(argv) == 4 and argv[1] == "authorize-git"
+    if (
+        directory_checking
+        or directory_authorizing
+        or zip_checking
+        or zip_authorizing
+        or git_checking
+        or git_authorizing
+    ):
         try:
-            if zip_checking or zip_authorizing:
+            if git_checking or git_authorizing:
+                snapshot = read_git_snapshot(argv[2], argv[3])
+            elif zip_checking or zip_authorizing:
                 snapshot = read_zip_snapshot(argv[2])
             else:
                 snapshot = read_directory_snapshot(argv[2])
             manifest = authored_manifest(snapshot)
             resolution = cue_plan_with_evidence(manifest)
             plan = resolution.plan
-            if directory_checking or zip_checking:
+            if directory_checking or zip_checking or git_checking:
                 checked: dict[str, object] = {
                     "digest": plan_digest(plan),
                     "plan": plan,

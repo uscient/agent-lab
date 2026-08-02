@@ -45,6 +45,13 @@ SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 EXPERIMENT_NAME = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 IMAGE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+GIT_SHA1 = re.compile(r"^sha1:[0-9a-f]{40}$")
+GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+GIT_URL = re.compile(
+    r"^https://github\.com/"
+    r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?/"
+    r"[a-z0-9_.-]{1,100}\.git$"
+)
 PAYLOAD_DIRECTORIES = {"payload", "payload/artifact", "payload/records"}
 PAYLOAD_FILES = {
     "payload/artifact/experiment.cue",
@@ -847,10 +854,74 @@ def _candidate(
     return files, receipt, installation_key, digest(RECEIPT_DOMAIN + canonical(receipt))
 
 
+def _closed_git_transport(transport: object) -> dict[str, object] | None:
+    if not isinstance(transport, dict) or transport.get("kind") != "git":
+        return None
+    if set(transport) != {
+        "acquisition",
+        "blob",
+        "commit",
+        "kind",
+        "requestedCommit",
+        "tree",
+        "url",
+    }:
+        return None
+    acquisition = transport.get("acquisition")
+    requested = transport.get("requestedCommit")
+    if (
+        not isinstance(acquisition, dict)
+        or set(acquisition)
+        != {
+            "acquiredBytes",
+            "limitBytes",
+            "method",
+            "requestCount",
+            "temporaryBytes",
+            "temporaryFiles",
+        }
+        or not isinstance(acquisition.get("acquiredBytes"), int)
+        or isinstance(acquisition.get("acquiredBytes"), bool)
+        or not 1 <= int(acquisition["acquiredBytes"]) <= MAX_ARCHIVE_BYTES
+        or acquisition.get("limitBytes") != MAX_ARCHIVE_BYTES
+        or acquisition.get("method") != "github-git-data-v3"
+        or acquisition.get("requestCount") != 3
+        or acquisition.get("temporaryBytes") != 0
+        or acquisition.get("temporaryFiles") != 0
+        or not isinstance(requested, str)
+        or GIT_COMMIT.fullmatch(requested) is None
+        or transport.get("commit") != f"sha1:{requested}"
+        or GIT_SHA1.fullmatch(str(transport.get("tree"))) is None
+        or GIT_SHA1.fullmatch(str(transport.get("blob"))) is None
+        or not isinstance(transport.get("url"), str)
+        or GIT_URL.fullmatch(str(transport["url"])) is None
+    ):
+        return None
+    return {
+        "acquisition": {
+            "acquiredBytes": acquisition["acquiredBytes"],
+            "limitBytes": MAX_ARCHIVE_BYTES,
+            "method": "github-git-data-v3",
+            "requestCount": 3,
+            "temporaryBytes": 0,
+            "temporaryFiles": 0,
+        },
+        "blob": transport["blob"],
+        "commit": transport["commit"],
+        "kind": "git",
+        "requestedCommit": requested,
+        "tree": transport["tree"],
+        "url": transport["url"],
+    }
+
+
 def _source_transport(snapshot: object) -> dict[str, object]:
     transport = getattr(snapshot, "transport", None)
     if transport is None or transport == {"kind": "directory"}:
         return {"kind": "local-directory"}
+    git_transport = _closed_git_transport(transport)
+    if git_transport is not None:
+        return git_transport
     if (
         not isinstance(transport, dict)
         or set(transport) != {"archiveBytes", "archiveDigest", "kind"}
@@ -870,6 +941,8 @@ def _source_transport(snapshot: object) -> dict[str, object]:
 
 def _validate_transport_provenance(transport: object) -> None:
     if transport == {"kind": "local-directory"}:
+        return
+    if _closed_git_transport(transport) is not None:
         return
     if (
         not isinstance(transport, dict)
@@ -1979,8 +2052,8 @@ def _held_catalog_context(
 
 def _install_source(
     home: Path,
-    source: Path,
     reader_name: str,
+    reader_arguments: tuple[str, ...],
     *,
     fault: FaultHook | None = None,
 ) -> dict[str, object]:
@@ -1993,7 +2066,7 @@ def _install_source(
     try:
         try:
             reader = getattr(experiment, reader_name)
-            snapshot = reader(str(source))
+            snapshot = reader(*reader_arguments)
             manifest = experiment.authored_manifest(snapshot)
             resolution = experiment.cue_plan_with_evidence(manifest)
             plan = resolution.plan
@@ -2110,7 +2183,12 @@ def install_directory(
 
     if sys.platform != "linux":
         _infra("effectful Experiment installation requires Linux")
-    return _install_source(home, source, "read_directory_snapshot", fault=fault)
+    return _install_source(
+        home,
+        "read_directory_snapshot",
+        (str(source),),
+        fault=fault,
+    )
 
 
 def install_zip(
@@ -2123,7 +2201,31 @@ def install_zip(
 
     if sys.platform != "linux":
         _infra("effectful Experiment installation requires Linux")
-    return _install_source(home, source, "read_zip_snapshot", fault=fault)
+    return _install_source(
+        home,
+        "read_zip_snapshot",
+        (str(source),),
+        fault=fault,
+    )
+
+
+def install_git(
+    home: Path,
+    url: str,
+    commit: str,
+    *,
+    fault: FaultHook | None = None,
+) -> dict[str, object]:
+    """Freshly validate/authorize one pinned Git snapshot and publish once."""
+
+    if sys.platform != "linux":
+        _infra("effectful Experiment installation requires Linux")
+    return _install_source(
+        home,
+        "read_git_snapshot",
+        (url, commit),
+        fault=fault,
+    )
 
 
 def inspect_install(home: Path, name: str) -> dict[str, object]:
