@@ -833,9 +833,9 @@ def main() -> int:
         if STORE is not None and layout_install.returncode == 0:
             original_directory_names = STORE._directory_names
 
-            def change_after_enumeration(path: Path):
+            def change_after_enumeration(path: Path, purpose: str, maximum: int):
                 nonlocal layout_changed
-                names = original_directory_names(path)
+                names = original_directory_names(path, purpose, maximum)
                 if path == layout_target and not layout_changed:
                     layout_changed = True
                     layout_target.chmod(0o700)
