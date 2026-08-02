@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import errno
 import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 import io
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable
+from typing import Callable, NamedTuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +36,130 @@ FAULT_POINTS = (
     "experiment envelope.after_noreplace",
     "experiment store root.after_fsync",
 )
+
+
+class FixtureSnapshot(NamedTuple):
+    data: bytes
+    digest: str
+
+
+class FixtureResolution(NamedTuple):
+    plan: dict[str, object]
+    local_catalog: dict[str, object] | None
+
+
+class FixtureInvalidManifest(Exception):
+    """The isolated store fixture rejected its authored manifest."""
+
+
+class FixtureInfrastructure(Exception):
+    """The isolated store fixture could not establish a trusted result."""
+
+
+class FaultFixtureExperiment:
+    """Small deterministic planner used only for exhaustive store fault injection."""
+
+    InvalidManifest = FixtureInvalidManifest
+    InfrastructureError = FixtureInfrastructure
+
+    def __init__(self, source_data: bytes, name: str) -> None:
+        source_digest = store_source_digest(source_data)
+        contract_digest = "sha256:" + "d" * 64
+        plan: dict[str, object] = {
+            "apiVersion": "agent-lab.request/v0alpha1",
+            "contract": {
+                "digest": contract_digest,
+                "name": "agent-lab.experiment",
+                "version": "v0alpha1",
+            },
+            "kind": "RequestedExperimentPlan",
+            "metadata": {"requestedName": name},
+            "spec": {
+                "members": [
+                    {
+                        "command": ["fault-probe"],
+                        "name": "worker",
+                        "requestedSelector": {"digestRef": SUBJECT},
+                        "resolvedImage": {"origin": "direct", "subject": SUBJECT},
+                        "resourceClass": "small",
+                    }
+                ]
+            },
+        }
+        plan_digest = "sha256:" + hashlib.sha256(canonical_json(plan)).hexdigest()
+        self.source_data = source_data
+        self.snapshot = FixtureSnapshot(source_data, source_digest)
+        self.resolution = FixtureResolution(plan, None)
+        self.decision: dict[str, object] = {
+            "action": "experiment.install",
+            "apiVersion": "agent-lab.authorization/v0alpha1",
+            "binding": {
+                "authorizationDigest": "sha256:" + "c" * 64,
+                "contractDigest": contract_digest,
+                "planDigest": plan_digest,
+                "sourceDigest": source_digest,
+            },
+            "kind": "ExperimentAuthorizationDecision",
+            "principal": {
+                "assurance": "none",
+                "authenticated": False,
+                "id": "local-cli",
+                "source": "fixed-local-cli",
+                "type": "AgentLab::Principal",
+            },
+            "resource": {
+                "id": plan_digest,
+                "requestedName": name,
+                "type": "AgentLab::RequestedExperimentPlan",
+            },
+            "verdict": "permit",
+        }
+
+    def read_directory_snapshot(self, source: str) -> FixtureSnapshot:
+        try:
+            observed = (Path(source) / "experiment.cue").read_bytes()
+        except OSError as error:
+            raise FixtureInfrastructure("fault fixture source cannot be read") from error
+        if observed != self.source_data:
+            raise FixtureInvalidManifest("fault fixture source changed")
+        return self.snapshot
+
+    def authored_manifest(self, snapshot: FixtureSnapshot) -> bytes:
+        return snapshot.data
+
+    def cue_plan_with_evidence(self, manifest: object) -> FixtureResolution:
+        if manifest != self.source_data:
+            raise FixtureInvalidManifest("fault fixture manifest changed")
+        return self.resolution
+
+    def authorize_plan(
+        self,
+        plan: dict[str, object],
+        source_digest: str,
+    ) -> tuple[dict[str, object], int]:
+        if plan != self.resolution.plan or source_digest != self.snapshot.digest:
+            raise FixtureInfrastructure("fault fixture authorization binding changed")
+        return self.decision, 0
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def store_source_digest(data: bytes) -> str:
+    value = hashlib.sha256(b"agent-lab.experiment-tree.v1\0")
+    name = b"experiment.cue"
+    value.update(len(name).to_bytes(4, "big"))
+    value.update(name)
+    value.update(len(data).to_bytes(8, "big"))
+    value.update(data)
+    return "sha256:" + value.hexdigest()
 
 
 def load_module(path: Path, name: str):
@@ -126,6 +251,26 @@ def start_cli(home: Path, source: Path) -> subprocess.Popen[bytes]:
 def start_inspect(home: Path, name: str) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [str(AGENT_LAB), "--home", str(home), "experiment", "inspect", name],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=command_environment(),
+        start_new_session=True,
+    )
+
+
+def start_remove(home: Path, name: str, entry_digest: str) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [
+            str(AGENT_LAB),
+            "--home",
+            str(home),
+            "image",
+            "remove",
+            name,
+            "--expect",
+            entry_digest,
+        ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -397,6 +542,56 @@ def hard_exit_before_intent(home: Path, source: Path) -> int:
             return original_write_file(path, data, purpose, fault)
 
         STORE._write_file = stop_before_intent
+        result, _, _ = store_install(home, source)
+        os._exit(97 if result == 0 else 96)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    global INFRA
+    INFRA += 1
+    return 124
+
+
+def hard_exit_during_cleanup(home: Path, source: Path, phase: str) -> int:
+    """Exit after durable cleanup handoff or after the first cleanup-file removal."""
+
+    if STORE is None:
+        return 95
+    pid = os.fork()
+    if pid == 0:
+        if phase == "handoff":
+            original_rename = STORE._rename_noreplace
+
+            def stop_after_handoff(source_path: Path, target_path: Path) -> None:
+                original_rename(source_path, target_path)
+                if target_path.name == STORE.CLEANUP_WRAPPER:
+                    os._exit(99)
+
+            STORE._rename_noreplace = stop_after_handoff
+        elif phase == "remove":
+            original_remove = STORE._remove_tree
+            stopped = False
+
+            def stop_after_first_file(path: Path, root: Path) -> None:
+                nonlocal stopped
+                was_file = False
+                try:
+                    was_file = stat.S_ISREG(path.lstat().st_mode)
+                except OSError:
+                    pass
+                original_remove(path, root)
+                if was_file and not stopped:
+                    stopped = True
+                    os._exit(99)
+
+            STORE._remove_tree = stop_after_first_file
+        else:
+            os._exit(95)
         result, _, _ = store_install(home, source)
         os._exit(97 if result == 0 else 96)
     deadline = time.monotonic() + 30.0
@@ -869,15 +1064,20 @@ def main() -> int:
         )
 
         identical_home = new_home(root, "identical-concurrency-home")
-        first = start_cli(identical_home, direct_source)
-        second = start_cli(identical_home, direct_source)
-        identical_results = [finish_process(first), finish_process(second)]
-        identical_values = [json_object(item) for item in identical_results]
-        identical_changes = sorted(
-            value.get("changed")
-            for value in identical_values
-            if isinstance(value, dict) and isinstance(value.get("changed"), bool)
+        first_pid, first_release, first_pause = start_paused_publication(
+            identical_home,
+            direct_source,
         )
+        second = start_cli(identical_home, direct_source)
+        identical_waited = wait_for_lock_block(second)
+        if first_release >= 0:
+            try:
+                os.write(first_release, b"1")
+            finally:
+                os.close(first_release)
+        first_rc = finish_child(first_pid)
+        second_result = finish_process(second)
+        second_value = json_object(second_result)
         identical_inspect = cli(
             identical_home,
             "experiment",
@@ -886,14 +1086,19 @@ def main() -> int:
         )
         check(
             "IST-CONC-001",
-            [item.returncode for item in identical_results] == [0, 0]
-            and identical_changes == [False, True]
+            first_pause == 0
+            and identical_waited
+            and first_rc == 0
+            and second_result.returncode == 0
+            and isinstance(second_value, dict)
+            and second_value.get("changed") is False
             and identical_inspect.returncode == 0
             and not tuple((identical_home / "experiments" / ".staging").iterdir()),
-            "concurrent identical installs publish once and return one verified idempotent success",
+            "overlapping identical installs block at the store lock and publish once",
             (
-                f"rcs={[item.returncode for item in identical_results]!r} "
-                f"changes={identical_changes!r} inspect={identical_inspect.returncode}"
+                f"pause={first_pause} waited={identical_waited} first={first_rc} "
+                f"second={second_result.returncode}/{second_value!r} "
+                f"inspect={identical_inspect.returncode}"
             ),
         )
 
@@ -908,24 +1113,47 @@ def main() -> int:
             "conflict-source-two",
             command="winner-two",
         )
-        one = start_cli(conflict_home, conflict_one)
+        one_pid, one_release, one_pause = start_paused_publication(
+            conflict_home,
+            conflict_one,
+        )
         two = start_cli(conflict_home, conflict_two)
-        conflict_results = [finish_process(one), finish_process(two)]
+        conflict_waited = wait_for_lock_block(two)
+        if one_release >= 0:
+            try:
+                os.write(one_release, b"1")
+            finally:
+                os.close(one_release)
+        one_rc = finish_child(one_pid)
+        two_result = finish_process(two)
         conflict_inspect = cli(
             conflict_home,
             "experiment",
             "inspect",
             "first-experiment",
         )
+        conflict_artifact = (
+            conflict_home
+            / "experiments"
+            / "first-experiment"
+            / "artifact"
+            / "experiment.cue"
+        )
         check(
             "IST-CONC-002",
-            sorted(item.returncode for item in conflict_results) == [0, 1]
+            one_pause == 0
+            and conflict_waited
+            and one_rc == 0
+            and two_result.returncode == 1
             and conflict_inspect.returncode == 0
+            and conflict_artifact.is_file()
+            and conflict_artifact.read_bytes()
+            == (conflict_one / "experiment.cue").read_bytes()
             and not tuple((conflict_home / "experiments" / ".staging").iterdir()),
-            "concurrent different candidates have one winner and one ordinary conflict",
+            "overlapping different candidates serialize to the paused winner and one conflict",
             (
-                f"rcs={[item.returncode for item in conflict_results]!r} "
-                f"inspect={conflict_inspect.returncode}"
+                f"pause={one_pause} waited={conflict_waited} first={one_rc} "
+                f"second={two_result.returncode} inspect={conflict_inspect.returncode}"
             ),
         )
 
@@ -1020,6 +1248,44 @@ def main() -> int:
         output_inspect = cli(output_home, "experiment", "inspect", "first-experiment")
         output_retry = cli(output_home, "experiment", "install", str(direct_source))
         output_value = json_object(output_retry)
+        cleanup_crash_failures: list[str] = []
+        for phase in ("handoff", "remove"):
+            cleanup_crash_home = new_home(root, f"cleanup-{phase}-crash-home")
+            cleanup_child_rc = hard_exit_during_cleanup(
+                cleanup_crash_home,
+                direct_source,
+                phase,
+            )
+            cleanup_stage = cleanup_crash_home / "experiments" / ".staging"
+            cleanup_before_inspect = fingerprint(cleanup_stage)
+            cleanup_inspect = cli(
+                cleanup_crash_home,
+                "experiment",
+                "inspect",
+                "first-experiment",
+            )
+            cleanup_after_inspect = fingerprint(cleanup_stage)
+            cleanup_retry = cli(
+                cleanup_crash_home,
+                "experiment",
+                "install",
+                str(direct_source),
+            )
+            cleanup_retry_value = json_object(cleanup_retry)
+            if not (
+                cleanup_child_rc == 99
+                and cleanup_inspect.returncode == 0
+                and cleanup_before_inspect == cleanup_after_inspect
+                and cleanup_retry.returncode == 0
+                and isinstance(cleanup_retry_value, dict)
+                and cleanup_retry_value.get("changed") is False
+                and not tuple(cleanup_stage.iterdir())
+            ):
+                cleanup_crash_failures.append(
+                    f"{phase}:child={cleanup_child_rc}:inspect={cleanup_inspect.returncode}:"
+                    f"read_changed={cleanup_before_inspect != cleanup_after_inspect}:"
+                    f"retry={cleanup_retry.returncode}/{cleanup_retry_value!r}"
+                )
         check(
             "IST-CRASH-001",
             seam_rc == 0
@@ -1033,6 +1299,7 @@ def main() -> int:
             and output_retry.returncode == 0
             and isinstance(output_value, dict)
             and output_value.get("changed") is False
+            and not cleanup_crash_failures
             and preintent_child_rc == 99
             and preintent_inspect.returncode == 1
             and preintent_before == preintent_after_inspect
@@ -1054,6 +1321,7 @@ def main() -> int:
                 f"missing={sorted(set(FAULT_POINTS)-set(observed_points))!r} "
                 f"crashes={crash_failures[:3]!r} output={output_rc}/{output_error!r}/"
                 f"{output_inspect.returncode}/{output_retry.returncode}/{output_value!r} "
+                f"cleanup={cleanup_crash_failures[:2]!r} "
                 f"preintent={preintent_child_rc}/{preintent_inspect.returncode}/"
                 f"{preintent_before != preintent_after_inspect}/{preintent_retry.returncode}/"
                 f"{preintent_value!r} "
@@ -1113,6 +1381,62 @@ def main() -> int:
             order_ok = catalog_index < store_index < publish_index
         except ValueError:
             order_ok = False
+
+        live_race_home = new_home(root, "selected-entry-removal-race-home")
+        race_added = cli(
+            live_race_home,
+            "image",
+            "add",
+            "vendor.worker",
+            SUBJECT,
+        )
+        race_added_value = json_object(race_added)
+        race_entry_digest = (
+            race_added_value.get("entryDigest")
+            if isinstance(race_added_value, dict)
+            else None
+        )
+        race_install_pid = 0
+        race_release = -1
+        race_pause = -1
+        race_remove: subprocess.Popen[bytes] | None = None
+        race_remove_waited = False
+        race_install_rc = 124
+        race_remove_result = subprocess.CompletedProcess([], 125, b"", b"missing entry digest")
+        if isinstance(race_entry_digest, str):
+            race_install_pid, race_release, race_pause = start_paused_publication(
+                live_race_home,
+                local_source,
+            )
+            race_remove = start_remove(
+                live_race_home,
+                "vendor.worker",
+                race_entry_digest,
+            )
+            race_remove_waited = wait_for_lock_block(race_remove)
+        if race_release >= 0:
+            try:
+                os.write(race_release, b"1")
+            finally:
+                os.close(race_release)
+        if race_install_pid > 0:
+            race_install_rc = finish_child(race_install_pid)
+        if race_remove is not None:
+            race_remove_result = finish_process(race_remove)
+        race_retained = cli(
+            live_race_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+        race_before_retry = fingerprint(live_race_home / "experiments")
+        race_stale_retry = cli(
+            live_race_home,
+            "experiment",
+            "install",
+            str(local_source),
+        )
+        race_after_retry = fingerprint(live_race_home / "experiments")
         check(
             "IST-LIVE-001",
             added.returncode == 0
@@ -1125,13 +1449,24 @@ def main() -> int:
             and removed.returncode == 0
             and stale_retry.returncode == 1
             and store_before_retry == store_after_retry
-            and retained.returncode == 0,
-            "selected-entry and store locks remain held; removal blocks stale retry",
+            and retained.returncode == 0
+            and race_added.returncode == 0
+            and race_pause == 0
+            and race_remove_waited
+            and race_install_rc == 0
+            and race_remove_result.returncode == 0
+            and race_retained.returncode == 0
+            and race_stale_retry.returncode == 1
+            and race_before_retry == race_after_retry,
+            "selected-entry locks order correctly and serialize a real removal race",
             (
                 f"add={added.returncode} install={live_rc}/{live_error!r} events={live_events!r} "
                 f"held={held_catalog}/{held_store} remove={removed.returncode} "
                 f"retry={stale_retry.returncode}/{store_before_retry != store_after_retry} "
-                f"inspect={retained.returncode}"
+                f"inspect={retained.returncode} race={race_added.returncode}/{race_pause}/"
+                f"{race_remove_waited}/{race_install_rc}/{race_remove_result.returncode}/"
+                f"{race_retained.returncode}/{race_stale_retry.returncode}/"
+                f"{race_before_retry != race_after_retry}"
             ),
         )
 
@@ -1283,6 +1618,558 @@ def main() -> int:
             ),
         )
 
+        planning = load_module(
+            REPO_ROOT / "scripts" / "experiment.py",
+            "agent_lab_experiment_store_adversarial",
+        )
+
+        cue_home = new_home(root, "preflight-cue-home")
+        cue_source = source_directory(root, "preflight-cue-source")
+        cue_path = cue_source / "experiment.cue"
+        cue_raw = cue_path.read_bytes()
+        cue_path.write_bytes(
+            cue_raw.replace(
+                b'\t\tcommand: ["serve"]\n',
+                b'\t\tcommand: ["serve"]\n\t\tunknownField: true\n',
+                1,
+            )
+        )
+        cue_before = fingerprint(cue_home / "experiments")
+        cue_failure = cli(cue_home, "experiment", "install", str(cue_source))
+        cue_after = fingerprint(cue_home / "experiments")
+
+        contract_home = new_home(root, "preflight-contract-home")
+        contract_source = source_directory(root, "preflight-contract-source")
+        contract_before = fingerprint(contract_home / "experiments")
+        original_experiment_loader = STORE._experiment_module if STORE is not None else None
+        original_verify_contract = planning.verify_contract_snapshot
+
+        def report_contract_drift(repo_root: Path, expected: dict[str, bytes]) -> None:
+            del repo_root, expected
+            raise planning.InfrastructureError("contract snapshot changed during validation")
+
+        contract_rc: int | None = None
+        contract_error: BaseException | None = None
+        if STORE is not None:
+            STORE._experiment_module = lambda: planning
+            planning.verify_contract_snapshot = report_contract_drift
+            try:
+                contract_rc, _, contract_error = store_install(
+                    contract_home,
+                    contract_source,
+                )
+            finally:
+                planning.verify_contract_snapshot = original_verify_contract
+                STORE._experiment_module = original_experiment_loader
+        contract_after = fingerprint(contract_home / "experiments")
+
+        selected_home = new_home(root, "preflight-selected-home")
+        selected_add = cli(
+            selected_home,
+            "image",
+            "add",
+            "vendor.worker",
+            SUBJECT,
+        )
+        selected_add_value = json_object(selected_add)
+        selected_digest = (
+            selected_add_value.get("entryDigest")
+            if isinstance(selected_add_value, dict)
+            else None
+        )
+        selected_source = source_directory(
+            root,
+            "preflight-selected-source",
+            catalog_name="vendor.worker",
+        )
+        selected_before = fingerprint(selected_home / "experiments")
+        selected_remove: subprocess.CompletedProcess[bytes] | None = None
+        selected_rc: int | None = None
+        selected_error: BaseException | None = None
+        if STORE is not None and isinstance(selected_digest, str):
+            original_held_context = STORE._held_catalog_context
+
+            @contextmanager
+            def remove_selected_before_hold(home: Path, dependencies, fault):
+                nonlocal selected_remove
+                selected_remove = cli(
+                    home,
+                    "image",
+                    "remove",
+                    "vendor.worker",
+                    "--expect",
+                    selected_digest,
+                )
+                with original_held_context(home, dependencies, fault) as held:
+                    yield held
+
+            STORE._held_catalog_context = remove_selected_before_hold
+            try:
+                selected_rc, _, selected_error = store_install(
+                    selected_home,
+                    selected_source,
+                )
+            finally:
+                STORE._held_catalog_context = original_held_context
+        selected_after = fingerprint(selected_home / "experiments")
+        check(
+            "IST-PREFLIGHT-001",
+            cue_raw != cue_path.read_bytes()
+            and cue_failure.returncode == 1
+            and not cue_failure.stdout
+            and cue_before == cue_after
+            and contract_rc == 125
+            and contract_error is not None
+            and contract_before == contract_after
+            and selected_add.returncode == 0
+            and selected_remove is not None
+            and selected_remove.returncode == 0
+            and selected_rc == 1
+            and selected_error is not None
+            and selected_before == selected_after,
+            "CUE, contract, and selected-entry drift fail before store-visible effects",
+            (
+                f"cue={cue_failure.returncode}/{cue_before != cue_after} "
+                f"contract={contract_rc}/{contract_error!r}/{contract_before != contract_after} "
+                f"selected={selected_add.returncode}/"
+                f"{None if selected_remove is None else selected_remove.returncode}/"
+                f"{selected_rc}/{selected_error!r}/{selected_before != selected_after}"
+            ),
+        )
+
+        snapshot_mutation_home = new_home(root, "snapshot-after-mutation-home")
+        snapshot_mutation_source = source_directory(
+            root,
+            "snapshot-after-mutation-source",
+            requested_name="snapshot-mutated",
+        )
+        snapshot_mutation_path = snapshot_mutation_source / "experiment.cue"
+        snapshot_original = snapshot_mutation_path.read_bytes()
+        snapshot_changed = snapshot_original.replace(b"serve", b"mutat", 1)
+        original_authored_manifest = planning.authored_manifest
+        mutation_after_snapshot = False
+
+        def mutate_after_snapshot(snapshot):
+            nonlocal mutation_after_snapshot
+            snapshot_mutation_path.write_bytes(snapshot_changed)
+            mutation_after_snapshot = True
+            return original_authored_manifest(snapshot)
+
+        snapshot_mutation_rc: int | None = None
+        snapshot_mutation_error: BaseException | None = None
+        if STORE is not None:
+            STORE._experiment_module = lambda: planning
+            planning.authored_manifest = mutate_after_snapshot
+            try:
+                snapshot_mutation_rc, _, snapshot_mutation_error = store_install(
+                    snapshot_mutation_home,
+                    snapshot_mutation_source,
+                )
+            finally:
+                planning.authored_manifest = original_authored_manifest
+                STORE._experiment_module = original_experiment_loader
+        stored_mutation_artifact = (
+            snapshot_mutation_home
+            / "experiments"
+            / "snapshot-mutated"
+            / "artifact"
+            / "experiment.cue"
+        )
+
+        snapshot_deletion_home = new_home(root, "snapshot-after-deletion-home")
+        snapshot_deletion_source = source_directory(
+            root,
+            "snapshot-after-deletion-source",
+            requested_name="snapshot-deleted",
+        )
+        snapshot_deletion_path = snapshot_deletion_source / "experiment.cue"
+        deletion_original = snapshot_deletion_path.read_bytes()
+        deletion_after_snapshot = False
+
+        def delete_after_snapshot(snapshot):
+            nonlocal deletion_after_snapshot
+            snapshot_deletion_path.unlink()
+            deletion_after_snapshot = True
+            return original_authored_manifest(snapshot)
+
+        snapshot_deletion_rc: int | None = None
+        snapshot_deletion_error: BaseException | None = None
+        if STORE is not None:
+            STORE._experiment_module = lambda: planning
+            planning.authored_manifest = delete_after_snapshot
+            try:
+                snapshot_deletion_rc, _, snapshot_deletion_error = store_install(
+                    snapshot_deletion_home,
+                    snapshot_deletion_source,
+                )
+            finally:
+                planning.authored_manifest = original_authored_manifest
+                STORE._experiment_module = original_experiment_loader
+        stored_deletion_artifact = (
+            snapshot_deletion_home
+            / "experiments"
+            / "snapshot-deleted"
+            / "artifact"
+            / "experiment.cue"
+        )
+
+        snapshot_race_home = new_home(root, "snapshot-during-read-home")
+        snapshot_race_source = source_directory(
+            root,
+            "snapshot-during-read-source",
+            requested_name="snapshot-raced",
+        )
+        snapshot_race_path = snapshot_race_source / "experiment.cue"
+        race_original = snapshot_race_path.read_bytes()
+        race_changed = race_original.replace(b"serve", b"mutat", 1)
+        race_metadata = snapshot_race_path.stat()
+        snapshot_race_before = fingerprint(snapshot_race_home / "experiments")
+        original_planning_read = planning.os.read
+        race_mutated_during_read = False
+
+        def mutate_during_read(descriptor: int, maximum: int) -> bytes:
+            nonlocal race_mutated_during_read
+            data = original_planning_read(descriptor, maximum)
+            try:
+                target = os.readlink(f"/proc/self/fd/{descriptor}")
+            except OSError:
+                target = ""
+            if (
+                data
+                and not race_mutated_during_read
+                and target == str(snapshot_race_path)
+            ):
+                time.sleep(0.001)
+                snapshot_race_path.write_bytes(race_changed)
+                os.utime(
+                    snapshot_race_path,
+                    ns=(race_metadata.st_atime_ns, race_metadata.st_mtime_ns),
+                )
+                race_mutated_during_read = True
+            return data
+
+        snapshot_race_rc: int | None = None
+        snapshot_race_error: BaseException | None = None
+        if STORE is not None:
+            STORE._experiment_module = lambda: planning
+            planning.os.read = mutate_during_read
+            try:
+                snapshot_race_rc, _, snapshot_race_error = store_install(
+                    snapshot_race_home,
+                    snapshot_race_source,
+                )
+            finally:
+                planning.os.read = original_planning_read
+                STORE._experiment_module = original_experiment_loader
+        snapshot_race_after = fingerprint(snapshot_race_home / "experiments")
+        race_final_metadata = snapshot_race_path.stat()
+        check(
+            "IST-SNAPSHOT-001",
+            snapshot_original != snapshot_changed
+            and mutation_after_snapshot
+            and snapshot_mutation_rc == 0
+            and snapshot_mutation_error is None
+            and stored_mutation_artifact.is_file()
+            and stored_mutation_artifact.read_bytes() == snapshot_original
+            and deletion_after_snapshot
+            and snapshot_deletion_rc == 0
+            and snapshot_deletion_error is None
+            and not snapshot_deletion_path.exists()
+            and stored_deletion_artifact.is_file()
+            and stored_deletion_artifact.read_bytes() == deletion_original
+            and race_original != race_changed
+            and race_mutated_during_read
+            and race_final_metadata.st_mtime_ns == race_metadata.st_mtime_ns
+            and race_final_metadata.st_ctime_ns != race_metadata.st_ctime_ns
+            and snapshot_race_rc == 125
+            and snapshot_race_error is not None
+            and snapshot_race_before == snapshot_race_after,
+            "post-snapshot source drift cannot change bytes and during-read drift is uncertain",
+            (
+                f"mutation={mutation_after_snapshot}/{snapshot_mutation_rc}/"
+                f"{snapshot_mutation_error!r}/"
+                f"{stored_mutation_artifact.is_file() and stored_mutation_artifact.read_bytes() == snapshot_original} "
+                f"deletion={deletion_after_snapshot}/{snapshot_deletion_rc}/"
+                f"{snapshot_deletion_error!r}/"
+                f"{stored_deletion_artifact.is_file() and stored_deletion_artifact.read_bytes() == deletion_original} "
+                f"during={race_mutated_during_read}/{snapshot_race_rc}/"
+                f"{snapshot_race_error!r}/{snapshot_race_before != snapshot_race_after}/"
+                f"mtime={race_final_metadata.st_mtime_ns == race_metadata.st_mtime_ns}/"
+                f"ctime={race_final_metadata.st_ctime_ns != race_metadata.st_ctime_ns}"
+            ),
+        )
+
+        config_home = new_home(root, "changing-config-home")
+        config_source = source_directory(root, "changing-config-source")
+        config_path = config_home / "config.json"
+        config_raw = config_path.read_bytes()
+        config_stage = config_home / "experiments" / ".staging"
+        config_target = config_home / "experiments" / "first-experiment"
+        config_changed = False
+        config_rc: int | None = None
+        config_error: BaseException | None = None
+        if STORE is not None:
+            original_prepare_stage = STORE._prepare_stage
+
+            def change_config_after_staging(*args, **kwargs):
+                nonlocal config_changed
+                prepared = original_prepare_stage(*args, **kwargs)
+                config_path.write_bytes(config_raw + b" ")
+                config_changed = True
+                return prepared
+
+            STORE._prepare_stage = change_config_after_staging
+            try:
+                config_rc, _, config_error = store_install(config_home, config_source)
+            finally:
+                STORE._prepare_stage = original_prepare_stage
+        config_final_absent = not config_target.exists() and not config_target.is_symlink()
+        config_wrapper_count = len(tuple(config_stage.iterdir()))
+        config_path.write_bytes(config_raw)
+        config_before_inspect = fingerprint(config_stage)
+        config_inspect_before = cli(
+            config_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+        config_after_inspect = fingerprint(config_stage)
+        config_retry = cli(
+            config_home,
+            "experiment",
+            "install",
+            str(config_source),
+        )
+        config_retry_value = json_object(config_retry)
+        config_inspect_after = cli(
+            config_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+        check(
+            "IST-CONFIG-001",
+            config_changed
+            and config_rc == 125
+            and config_error is not None
+            and config_final_absent
+            and config_wrapper_count == 1
+            and config_inspect_before.returncode == 1
+            and config_before_inspect == config_after_inspect
+            and config_retry.returncode == 0
+            and isinstance(config_retry_value, dict)
+            and config_retry_value.get("changed") is True
+            and config_inspect_after.returncode == 0
+            and not tuple(config_stage.iterdir()),
+            "configuration drift before publication is uncertain and its owned residue is restartable",
+            (
+                f"changed={config_changed} install={config_rc}/{config_error!r} "
+                f"final_absent={config_final_absent} wrappers={config_wrapper_count} "
+                f"inspect={config_inspect_before.returncode}/"
+                f"{config_before_inspect != config_after_inspect} "
+                f"retry={config_retry.returncode}/{config_retry_value!r}/"
+                f"{config_inspect_after.returncode}"
+            ),
+        )
+
+        reader_home = new_home(root, "reader-tamper-home")
+        reader_install = cli(
+            reader_home,
+            "experiment",
+            "install",
+            str(direct_source),
+        )
+        reader_envelope = reader_home / "experiments" / "first-experiment"
+        reader_failures: list[str] = []
+        reader_paths = (
+            "artifact/experiment.cue",
+            "records/decision.json",
+            "records/plan.json",
+            "records/provenance.json",
+            "records/install.json",
+        )
+        if reader_install.returncode == 0:
+            for index, relative in enumerate(reader_paths):
+                path = reader_envelope / relative
+                raw = path.read_bytes()
+                link = root / f"reader-hardlink-{index}"
+                os.link(path, link)
+                linked_rc, _, linked_error = store_inspect(
+                    reader_home,
+                    "first-experiment",
+                )
+                link.unlink()
+                restored_link_rc, _, restored_link_error = store_inspect(
+                    reader_home,
+                    "first-experiment",
+                )
+                path.chmod(0o600)
+                path.write_bytes(bytes((raw[0] ^ 1,)) + raw[1:])
+                path.chmod(0o400)
+                corrupt_before_retry = fingerprint(reader_envelope)
+                corrupt_rc, _, corrupt_error = store_inspect(
+                    reader_home,
+                    "first-experiment",
+                )
+                retry_rc: int | None = 125
+                retry_error: BaseException | None = RuntimeError("not receipt")
+                retry_unchanged = True
+                if relative == "records/install.json":
+                    retry_rc, _, retry_error = store_install(reader_home, direct_source)
+                    retry_unchanged = corrupt_before_retry == fingerprint(reader_envelope)
+                path.chmod(0o600)
+                path.write_bytes(raw)
+                path.chmod(0o400)
+                restored_rc, _, restored_error = store_inspect(
+                    reader_home,
+                    "first-experiment",
+                )
+                if not (
+                    linked_rc == 125
+                    and linked_error is not None
+                    and restored_link_rc == 0
+                    and restored_link_error is None
+                    and corrupt_rc == 125
+                    and corrupt_error is not None
+                    and (
+                        relative != "records/install.json"
+                        or (retry_rc == 125 and retry_error is not None and retry_unchanged)
+                    )
+                    and restored_rc == 0
+                    and restored_error is None
+                ):
+                    reader_failures.append(
+                        f"{relative}:link={linked_rc}/{restored_link_rc}:"
+                        f"corrupt={corrupt_rc}:retry={retry_rc}/{retry_unchanged}:"
+                        f"restore={restored_rc}"
+                    )
+        check(
+            "IST-READ-001",
+            reader_install.returncode == 0 and not reader_failures,
+            "every stored byte record is safe-opened, digest-bound, and non-overwritable",
+            f"install={reader_install.returncode} failures={reader_failures[:5]!r}",
+        )
+
+        fault_source = source_directory(
+            root,
+            "fault-matrix-source",
+            requested_name="fault-experiment",
+        )
+        fault_data = (fault_source / "experiment.cue").read_bytes()
+        fault_fixture = FaultFixtureExperiment(fault_data, "fault-experiment")
+        fault_failures: list[str] = []
+        fault_counts: dict[str, int] = {}
+        primitives = ("open", "write", "chmod", "fsync", "rename_noreplace")
+        if STORE is not None:
+            original_fault_loader = STORE._experiment_module
+            STORE._experiment_module = lambda: fault_fixture
+            try:
+                for primitive in primitives:
+                    baseline_home = new_home(root, f"fault-{primitive}-baseline-home")
+                    if primitive == "rename_noreplace":
+                        owner = STORE
+                        attribute = "_rename_noreplace"
+                    else:
+                        owner = STORE.os
+                        attribute = primitive
+                    original_primitive = getattr(owner, attribute)
+                    observed_calls = 0
+
+                    def observe_primitive(*args, _original=original_primitive, **kwargs):
+                        nonlocal observed_calls
+                        observed_calls += 1
+                        return _original(*args, **kwargs)
+
+                    setattr(owner, attribute, observe_primitive)
+                    try:
+                        baseline_rc, baseline_value, baseline_error = store_install(
+                            baseline_home,
+                            fault_source,
+                        )
+                    finally:
+                        setattr(owner, attribute, original_primitive)
+                    fault_counts[primitive] = observed_calls
+                    if not (
+                        baseline_rc == 0
+                        and isinstance(baseline_value, dict)
+                        and baseline_error is None
+                        and observed_calls > 0
+                    ):
+                        fault_failures.append(
+                            f"{primitive}:baseline={baseline_rc}/{baseline_error!r}/"
+                            f"calls={observed_calls}"
+                        )
+                        continue
+                    for ordinal in range(1, observed_calls + 1):
+                        injected_home = new_home(
+                            root,
+                            f"fault-{primitive}-{ordinal:02d}-home",
+                        )
+                        injected_calls = 0
+                        injected_hit = False
+
+                        def inject_primitive(*args, _original=original_primitive, **kwargs):
+                            nonlocal injected_calls, injected_hit
+                            injected_calls += 1
+                            if injected_calls == ordinal:
+                                injected_hit = True
+                                raise OSError(errno.EIO, f"injected {primitive} failure")
+                            return _original(*args, **kwargs)
+
+                        setattr(owner, attribute, inject_primitive)
+                        try:
+                            injected_rc, injected_value, injected_error = store_install(
+                                injected_home,
+                                fault_source,
+                            )
+                        finally:
+                            setattr(owner, attribute, original_primitive)
+                        before_retry_rc, _, _ = store_inspect(
+                            injected_home,
+                            "fault-experiment",
+                        )
+                        retry_rc, retry_value, retry_error = store_install(
+                            injected_home,
+                            fault_source,
+                        )
+                        final_rc, _, final_error = store_inspect(
+                            injected_home,
+                            "fault-experiment",
+                        )
+                        staging_empty = not tuple(
+                            (injected_home / "experiments" / ".staging").iterdir()
+                        )
+                        if not (
+                            injected_hit
+                            and injected_rc == 125
+                            and injected_value is None
+                            and injected_error is not None
+                            and before_retry_rc in (0, 1, 125)
+                            and retry_rc == 0
+                            and isinstance(retry_value, dict)
+                            and retry_error is None
+                            and final_rc == 0
+                            and final_error is None
+                            and staging_empty
+                        ):
+                            fault_failures.append(
+                                f"{primitive}[{ordinal}/{observed_calls}]:"
+                                f"hit={injected_hit}:first={injected_rc}/{injected_error!r}:"
+                                f"before={before_retry_rc}:retry={retry_rc}/{retry_error!r}:"
+                                f"final={final_rc}/{final_error!r}:empty={staging_empty}"
+                            )
+            finally:
+                STORE._experiment_module = original_fault_loader
+        check(
+            "IST-FAULT-001",
+            STORE is not None
+            and set(fault_counts) == set(primitives)
+            and all(count > 0 for count in fault_counts.values())
+            and not fault_failures,
+            "every store open/write/chmod/fsync/rename failure is uncertain and restartable",
+            f"counts={fault_counts!r} failures={fault_failures[:8]!r}",
+        )
+
     expected = [
         "IST-STATE-001",
         "IST-LOCK-001",
@@ -1295,11 +2182,16 @@ def main() -> int:
         "IST-LIVE-001",
         "IST-PLAT-001",
         "IST-PROV-001",
+        "IST-PREFLIGHT-001",
+        "IST-SNAPSHOT-001",
+        "IST-CONFIG-001",
+        "IST-READ-001",
+        "IST-FAULT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA install state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=11 expected=11 failures={FAILURES} infra={INFRA}")
+    print(f"SUMMARY assertions=16 expected=16 failures={FAILURES} infra={INFRA}")
     if INFRA:
         return 125
     return 0 if FAILURES == 0 else 1
@@ -1313,6 +2205,6 @@ if __name__ == "__main__":
     except BaseException as error:
         print(f"INFRA install state harness failed: {error!r}", file=sys.stderr)
         print(
-            f"SUMMARY assertions={len(OBSERVED)} expected=11 failures={FAILURES} infra=1"
+            f"SUMMARY assertions={len(OBSERVED)} expected=16 failures={FAILURES} infra=1"
         )
         raise SystemExit(125)
