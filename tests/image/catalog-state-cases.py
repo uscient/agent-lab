@@ -270,15 +270,23 @@ def stored_oracle_sensitivity(home: Path, expected: list[str]) -> bool:
     try:
         snapshot_path, snapshot, _snapshot_digest = current_snapshot(home)
         original = snapshot_path.read_bytes()
+        original_mode = stat.S_IMODE(snapshot_path.lstat().st_mode)
+        snapshot_path.chmod(0o644)
+        mode_rejected = stored_active_names(home) is None
+        snapshot_path.chmod(original_mode)
         mutated = dict(snapshot)
         revision = mutated.get("revision")
         if not isinstance(revision, int) or isinstance(revision, bool):
             return False
         mutated["revision"] = revision + 1
         snapshot_path.write_bytes(canonical(mutated) + b"\n")
-        rejected = stored_active_names(home) is None
+        content_rejected = stored_active_names(home) is None
         snapshot_path.write_bytes(original)
-        return rejected and stored_active_names(home) == expected
+        return (
+            mode_rejected
+            and content_rejected
+            and stored_active_names(home) == expected
+        )
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -1260,7 +1268,11 @@ def main() -> int:
                     f"retry={retry.returncode}:final={final_names!r}"
                 )
         matrix_cli_calls = CLI_CALLS - matrix_cli_start
-        expected_matrix_cli_calls = 2 * (len(bootstrap_points) + len(later_points))
+        if len(bootstrap_points) != 44 or len(later_points) != 42:
+            matrix_failures.append(
+                f"seam-counts:{len(bootstrap_points)}/{len(later_points)}:expected=44/42"
+            )
+        expected_matrix_cli_calls = 172
         if matrix_cli_calls != expected_matrix_cli_calls:
             matrix_failures.append(
                 f"cli-calls:{matrix_cli_calls}:expected={expected_matrix_cli_calls}"
