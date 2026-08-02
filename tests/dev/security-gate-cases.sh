@@ -241,7 +241,7 @@ dns-contract-unit tests/egress/dns-contract-cases.sh SUMMARY failures=0
 wrapper-context tests/wrap-image/context-cases.sh SUMMARY failures=0
 adapter-idempotence tests/agent/render-adapters-idempotence.sh PASS generated adapters match tracked files and are idempotent
 serena-config tests/serena/config-cases.sh SUMMARY failures=0
-policy-probe tests/agent/policy-verify.sh SUMMARY pass=44 fail=0 skip=0
+policy-probe tests/agent/policy-verify.sh SUMMARY pass=46 fail=0 skip=0
 containment-static tools/containment-lint.sh containment-lint: 0 fail, 0 warn
 EOF
 actual_suites="$work/actual-fast-suites"
