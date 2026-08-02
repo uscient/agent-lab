@@ -20,6 +20,7 @@ import tempfile
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_LAB = REPO_ROOT / "scripts" / "agent-lab"
 AGENT_LAB_MODULE = REPO_ROOT / "scripts" / "agent-lab.py"
+CATALOG_MODULE = REPO_ROOT / "scripts" / "image_catalog.py"
 SUBJECT = "registry.example/operator/worker@sha256:" + "a" * 64
 OTHER_SUBJECT = "registry.example/operator/other@sha256:" + "b" * 64
 ENTRY_DOMAIN = b"agent-lab.local-image-entry.v1\0"
@@ -45,6 +46,19 @@ def load_module():
 
 
 MODULE = load_module()
+
+
+def load_catalog_module():
+    spec = spec_from_file_location("agent_lab_catalog_contract", CATALOG_MODULE)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Agent Lab catalog module cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+CATALOG = load_catalog_module()
 FAILURES = 0
 OBSERVED: list[str] = []
 
@@ -150,6 +164,30 @@ def fingerprint(root: Path) -> tuple[tuple[str, str, int, int, str], ...]:
     return tuple(records)
 
 
+def write_record(root: Path, domain: bytes, value: dict[str, object]) -> Path:
+    record_digest = digest(domain, value)
+    path = root / f"{record_digest[7:]}.json"
+    path.write_bytes(canonical(value) + b"\n")
+    path.chmod(0o600)
+    return path
+
+
+def hard_exit_add(home: Path, name: str, subject: str, point: str) -> int:
+    pid = os.fork()
+    if pid == 0:
+        def stop_at(observed: str) -> None:
+            if observed == point:
+                os._exit(99)
+
+        try:
+            CATALOG.add_image(home, name, subject, fault=stop_at)
+        except BaseException:
+            os._exit(98)
+        os._exit(97)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
 class BrokenOutput(io.StringIO):
     def write(self, value: str) -> int:
         raise OSError("injected result-output failure")
@@ -207,7 +245,13 @@ def main() -> int:
         corrupt_path = corrupt_home / "images" / "catalog" / "snapshots" / f"{corrupt_digest[7:]}.json"
         corrupt_path.write_bytes(canonical(snapshot) + b"\n")
         (corrupt_home / "images" / "catalog" / "current.json").write_bytes(
-            canonical({"snapshotDigest": corrupt_digest}) + b"\n"
+            canonical(
+                {
+                    "apiVersion": "agent-lab.local-image-current/v0alpha1",
+                    "snapshotDigest": corrupt_digest,
+                }
+            )
+            + b"\n"
         )
         completed = cli(corrupt_home, "image", "list")
         check(
@@ -337,6 +381,103 @@ def main() -> int:
             f"rc={completed.returncode}",
         )
 
+        orphan_home = new_home(root, "orphan-history-home")
+        add(orphan_home)
+        orphan_entry = {
+            "apiVersion": "agent-lab.local-image-entry/v0alpha1",
+            "generation": 2,
+            "name": "orphan.image",
+            "previousEntryDigest": "sha256:" + "e" * 64,
+            "state": "removed",
+            "subject": OTHER_SUBJECT,
+            "subjectDigest": OTHER_SUBJECT.rsplit("@", 1)[1],
+        }
+        orphan_path = write_record(
+            orphan_home / "images" / "catalog" / "entries",
+            ENTRY_DOMAIN,
+            orphan_entry,
+        )
+        before = orphan_path.read_bytes()
+        completed = cli(orphan_home, "image", "list", "--all")
+        check(
+            "CAT-STATE-013",
+            completed.returncode == 125 and completed.stdout == b"" and orphan_path.read_bytes() == before,
+            "malformed unreachable tombstone history fails closed without repair",
+            f"rc={completed.returncode}",
+        )
+
+        conflict_home = new_home(root, "conflicting-history-home")
+        add(conflict_home)
+        conflicting_entry = {
+            "apiVersion": "agent-lab.local-image-entry/v0alpha1",
+            "generation": 1,
+            "name": "vendor.worker",
+            "previousEntryDigest": None,
+            "state": "active",
+            "subject": OTHER_SUBJECT,
+            "subjectDigest": OTHER_SUBJECT.rsplit("@", 1)[1],
+        }
+        conflict_path = write_record(
+            conflict_home / "images" / "catalog" / "entries",
+            ENTRY_DOMAIN,
+            conflicting_entry,
+        )
+        before = conflict_path.read_bytes()
+        completed = cli(conflict_home, "image", "list", "--all")
+        check(
+            "CAT-STATE-014",
+            completed.returncode == 125 and completed.stdout == b"" and conflict_path.read_bytes() == before,
+            "conflicting unreachable generation history fails closed without repair",
+            f"rc={completed.returncode}",
+        )
+
+        marker_home = new_home(root, "marker-home")
+        add(marker_home)
+        marker_lock = marker_home / "state" / "locks" / "image-catalog.lock"
+        marker_lock.write_bytes(b"")
+        truncated = cli(marker_home, "image", "list")
+        moved_catalog = root / "marker-moved-catalog"
+        (marker_home / "images" / "catalog").rename(moved_catalog)
+        missing = cli(marker_home, "image", "list")
+        check(
+            "CAT-STATE-015",
+            truncated.returncode == 125
+            and missing.returncode == 125
+            and truncated.stdout == b""
+            and missing.stdout == b"",
+            "truncated initialization evidence never turns an existing or lost catalog into pristine state",
+            f"truncated_rc={truncated.returncode} missing_rc={missing.returncode}",
+        )
+
+        replacement_home = new_home(root, "replacement-home")
+        add(replacement_home)
+        replacement_lock = replacement_home / "state" / "locks" / "image-catalog.lock"
+        lock_bytes = replacement_lock.read_bytes()
+        replacement_lock.rename(root / "original-image-catalog.lock")
+        replacement_lock.write_bytes(lock_bytes)
+        replacement_lock.chmod(0o600)
+        completed = cli(replacement_home, "image", "list")
+        check(
+            "CAT-STATE-016",
+            completed.returncode == 125 and completed.stdout == b"",
+            "the immutable home receipt detects a pre-invocation stable-lock replacement",
+            f"rc={completed.returncode}",
+        )
+
+        nested_home = new_home(root, "nested-json-home")
+        add(nested_home)
+        nested_current = nested_home / "images" / "catalog" / "current.json"
+        nested_current.write_bytes(b"[" * 30_000 + b"0" + b"]" * 30_000 + b"\n")
+        completed = cli(nested_home, "image", "list")
+        check(
+            "CAT-STATE-017",
+            completed.returncode == 125
+            and completed.stdout == b""
+            and b"Traceback" not in completed.stderr,
+            "bounded deeply nested JSON is classified as infrastructure uncertainty without traceback",
+            f"rc={completed.returncode} stderr={completed.stderr[-120:]!r}",
+        )
+
         names_home = new_home(root, "names-bound-home")
         names_ok = True
         for index in range(256):
@@ -370,12 +511,13 @@ def main() -> int:
 
         fsync_home = new_home(root, "fsync-home")
         original_fsync = MODULE.os.fsync
-        fsync_calls = 0
+        record_fsync_failed = False
 
         def fail_first_fsync(descriptor: int) -> None:
-            nonlocal fsync_calls
-            fsync_calls += 1
-            if fsync_calls == 1:
+            nonlocal record_fsync_failed
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+            if not record_fsync_failed and "/payload/catalog/entries/" in target:
+                record_fsync_failed = True
                 raise OSError("injected fsync failure")
             original_fsync(descriptor)
 
@@ -390,20 +532,23 @@ def main() -> int:
             "CAT-CRASH-001",
             first_rc == 125
             and first_error is None
+            and record_fsync_failed
             and retry.returncode == 0
             and json.loads(retry.stdout).get("changed") is True
             and not staged,
-            "record fsync failure is contained and the next effectful retry reconciles safely",
+            "staged immutable-record fsync failure is contained and retry reconciles safely",
             f"first_rc={first_rc} error={first_error!r} retry_rc={retry.returncode} staged={len(staged)}",
         )
 
         replace_home = new_home(root, "replace-home")
+        add(replace_home)
         original_replace = MODULE.os.replace
         replace_calls = 0
 
         def fail_pointer_replace(source: os.PathLike[str] | str, target: os.PathLike[str] | str) -> None:
             nonlocal replace_calls
-            if Path(target).name == "current.json":
+            final_pointer = replace_home / "images" / "catalog" / "current.json"
+            if Path(target) == final_pointer:
                 replace_calls += 1
                 if replace_calls == 1:
                     raise OSError("injected pointer publication failure")
@@ -411,10 +556,15 @@ def main() -> int:
 
         MODULE.os.replace = fail_pointer_replace
         try:
-            first_rc, _, _, first_error = module_image(replace_home, "add", "vendor.worker", SUBJECT)
+            first_rc, _, _, first_error = module_image(
+                replace_home,
+                "add",
+                "vendor.second",
+                OTHER_SUBJECT,
+            )
         finally:
             MODULE.os.replace = original_replace
-        retry = cli(replace_home, "image", "add", "vendor.worker", SUBJECT)
+        retry = cli(replace_home, "image", "add", "vendor.second", OTHER_SUBJECT)
         staged = list((replace_home / "images" / ".staging").iterdir())
         check(
             "CAT-CRASH-002",
@@ -489,6 +639,31 @@ def main() -> int:
             ),
         )
 
+        atomic_home = new_home(root, "atomic-record-home")
+        add(atomic_home)
+        exit_code = hard_exit_add(
+            atomic_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "catalog immutable entry.before_noreplace",
+        )
+        observed = cli(atomic_home, "image", "list")
+        observed_value = json.loads(observed.stdout) if observed.returncode == 0 else []
+        retry = cli(atomic_home, "image", "add", "vendor.second", OTHER_SUBJECT)
+        check(
+            "CAT-CRASH-005",
+            exit_code == 99
+            and observed.returncode == 0
+            and [item.get("name") for item in observed_value] == ["vendor.worker"]
+            and retry.returncode == 0
+            and json.loads(retry.stdout).get("changed") is True,
+            "hard exit at immutable-record no-replace publication exposes the old complete view and retries",
+            (
+                f"child_rc={exit_code} list_rc={observed.returncode} "
+                f"list={observed_value!r} retry_rc={retry.returncode}"
+            ),
+        )
+
         platform_home = new_home(root, "platform-home")
         before = fingerprint(platform_home)
         original_platform = MODULE.sys.platform
@@ -521,18 +696,24 @@ def main() -> int:
         "CAT-STATE-010",
         "CAT-STATE-011",
         "CAT-STATE-012",
+        "CAT-STATE-013",
+        "CAT-STATE-014",
+        "CAT-STATE-015",
+        "CAT-STATE-016",
+        "CAT-STATE-017",
         "CAT-BOUND-001",
         "CAT-BOUND-002",
         "CAT-CRASH-001",
         "CAT-CRASH-002",
         "CAT-CRASH-003",
         "CAT-CRASH-004",
+        "CAT-CRASH-005",
         "CAT-PLAT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=19 expected=19 failures={FAILURES} infra=0")
+    print(f"SUMMARY assertions=25 expected=25 failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
