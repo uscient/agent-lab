@@ -52,7 +52,8 @@ suite guard-mount tests/guard/cases.sh SUMMARY failures=0
 suite config-authority tests/agent/config-guard.sh SUMMARY failures=0
 suite experiment-contract tests/experiment/contract-cases.sh EXPERIMENT CONTRACT PASS
 suite experiment-authorization tests/experiment/authorization-cases.sh EXPERIMENT AUTHORIZATION PASS
-suite experiment-local-lifecycle tests/experiment/local-lifecycle-cases.sh EXPERIMENT LOCAL LIFECYCLE PASS
+suite experiment-local-lifecycle tests/experiment/local-onboarding-cases.sh EXPERIMENT LOCAL LIFECYCLE PASS
+suite experiment-install-lifecycle tests/experiment/install-lifecycle-cases.sh EXPERIMENT INSTALL LIFECYCLE PASS
 suite experiment-source-adapters tests/experiment/source-adapter-cases.sh EXPERIMENT SOURCE ADAPTERS PASS
 suite config-matrix tests/agent/config-matrix.sh SUMMARY failures=0
 suite allowlist-schema tests/agent/allowlist-cases.sh SUMMARY failures=0
