@@ -12,14 +12,19 @@ from pathlib import Path
 import re
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from typing import NamedTuple, NoReturn
+import zlib
 
 
 MAX_MANIFEST_BYTES = 262_144
+MAX_ARCHIVE_BYTES = 1_048_576
+MAX_SOURCE_BYTES = MAX_MANIFEST_BYTES
+ZIP_DECODE_TIMEOUT_SECONDS = 5
 SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
 PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
 BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
@@ -105,6 +110,7 @@ class PlanBinding(NamedTuple):
 class SourceSnapshot(NamedTuple):
     data: bytes
     digest: str
+    transport: dict[str, object]
 
 
 class PlanResolution(NamedTuple):
@@ -225,6 +231,148 @@ def read_manifest_once(
     return data
 
 
+def source_digest(data: bytes) -> str:
+    name = b"experiment.cue"
+    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
+    digest.update(len(name).to_bytes(4, "big"))
+    digest.update(name)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _zip_reject(code: str, detail: str) -> NoReturn:
+    raise InvalidManifest(f"zip archive {code} {detail}")
+
+
+def _read_zip_archive_once(path: str) -> bytes:
+    try:
+        path_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ cannot be inspected") from error
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+        raise InfrastructureError("zip archive ZIP-READ is not a safe regular file")
+    if path_stat.st_size > MAX_ARCHIVE_BYTES:
+        _zip_reject("ZIP-SIZE", f"exceeds the {MAX_ARCHIVE_BYTES}-byte limit")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ cannot be opened") from error
+
+    opened_stat: os.stat_result | None = None
+    final_stat: os.stat_result | None = None
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _manifest_identity(opened_stat) != _manifest_identity(path_stat)
+        ):
+            raise InfrastructureError("zip archive ZIP-READ identity changed before read")
+        chunks: list[bytes] = []
+        remaining = MAX_ARCHIVE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        archive = b"".join(chunks)
+        final_stat = os.fstat(descriptor)
+    except InfrastructureError:
+        raise
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ could not be read completely") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise InfrastructureError("zip archive ZIP-READ descriptor could not be closed") from error
+
+    assert opened_stat is not None and final_stat is not None
+    try:
+        current_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ cannot be reverified") from error
+    expected = _manifest_identity(path_stat)
+    if (
+        _manifest_identity(opened_stat) != expected
+        or _manifest_identity(final_stat) != expected
+        or _manifest_identity(current_stat) != expected
+        or len(archive) != final_stat.st_size
+    ):
+        raise InfrastructureError("zip archive ZIP-READ changed while being read")
+    if len(archive) > MAX_ARCHIVE_BYTES:
+        _zip_reject("ZIP-SIZE", f"exceeds the {MAX_ARCHIVE_BYTES}-byte limit")
+    return archive
+
+
+def _zip_eocd(archive: bytes) -> tuple[int, tuple[object, ...]]:
+    eocd_offset = archive.rfind(b"PK\x05\x06")
+    if eocd_offset < 0 or len(archive) - eocd_offset < 22:
+        _zip_reject("ZIP-TRUNC", "has no complete end record")
+    try:
+        record = struct.unpack_from("<4s4H2IH", archive, eocd_offset)
+    except struct.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC has an incomplete end record") from error
+    comment_size = int(record[-1])
+    if eocd_offset + 22 + comment_size != len(archive):
+        _zip_reject("ZIP-TRAIL", "has bytes outside its canonical end")
+    if comment_size != 0:
+        _zip_reject("ZIP-META", "has an archive comment")
+    return eocd_offset, record
+
+
+def _zip_decode(payload: bytes, expanded_size: int) -> bytes:
+    try:
+        deadline = time.monotonic() + ZIP_DECODE_TIMEOUT_SECONDS
+        decoder = zlib.decompressobj(-15)
+        output: list[bytes] = []
+        produced = 0
+        offset = 0
+        while offset < len(payload):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("zip decoder deadline")
+            chunk = payload[offset : offset + 65_536]
+            offset += len(chunk)
+            while chunk:
+                remaining = MAX_SOURCE_BYTES + 1 - produced
+                if remaining <= 0:
+                    _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+                decoded = decoder.decompress(chunk, remaining)
+                output.append(decoded)
+                produced += len(decoded)
+                chunk = decoder.unconsumed_tail
+                if produced > MAX_SOURCE_BYTES:
+                    _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("zip decoder deadline")
+        remaining = MAX_SOURCE_BYTES + 1 - produced
+        decoded = decoder.flush(remaining)
+        output.append(decoded)
+        produced += len(decoded)
+        if produced > MAX_SOURCE_BYTES:
+            _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+        if not decoder.eof:
+            _zip_reject("ZIP-TRUNC", "deflate stream ended early")
+        if decoder.unused_data or decoder.unconsumed_tail:
+            _zip_reject("ZIP-TRAIL", "deflate stream has unused input")
+        data = b"".join(output)
+        if len(data) != expanded_size:
+            _zip_reject("ZIP-LENGTH", "decoded length disagrees with its header")
+    except InvalidManifest:
+        raise
+    except zlib.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC has an invalid deflate stream") from error
+    except TimeoutError as error:
+        raise InfrastructureError("zip archive ZIP-TIMEOUT decoder deadline expired") from error
+    except Exception as error:
+        raise InfrastructureError("zip archive ZIP-DECODE decoder result is uncertain") from error
+    return data
+
+
 def read_directory_snapshot(path: str) -> SourceSnapshot:
     try:
         directory_stat = os.lstat(path)
@@ -259,13 +407,175 @@ def read_directory_snapshot(path: str) -> SourceSnapshot:
         final_directory_stat.st_ino,
     ):
         raise InfrastructureError("source directory changed while snapshotting")
-    name = b"experiment.cue"
-    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
-    digest.update(len(name).to_bytes(4, "big"))
-    digest.update(name)
-    digest.update(len(data).to_bytes(8, "big"))
-    digest.update(data)
-    return SourceSnapshot(data=data, digest=f"sha256:{digest.hexdigest()}")
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={"kind": "directory"},
+    )
+
+
+def read_zip_snapshot(path: str) -> SourceSnapshot:
+    """Inspect and bounded-decode one canonical in-memory ZIP source."""
+
+    archive = _read_zip_archive_once(path)
+    eocd_offset, eocd = _zip_eocd(archive)
+    (
+        _signature,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        _comment_size,
+    ) = eocd
+    if (
+        disk_number != 0
+        or central_disk != 0
+        or disk_entries == 0xFFFF
+        or total_entries == 0xFFFF
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+    ):
+        _zip_reject("ZIP-ZIP64", "uses ZIP64 or multiple disks")
+    if disk_entries != 1 or total_entries != 1:
+        _zip_reject("ZIP-COUNT", "must contain exactly one entry")
+    if central_offset + central_size != eocd_offset:
+        _zip_reject("ZIP-HEADER", "central directory bounds disagree")
+    if central_size < 46 or central_offset < 30:
+        _zip_reject("ZIP-TRUNC", "central directory is incomplete")
+    try:
+        central = struct.unpack_from("<4s6H3I5H2I", archive, central_offset)
+    except struct.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC central header is incomplete") from error
+    (
+        central_signature,
+        version_made,
+        version_needed,
+        flags,
+        method,
+        modified_time,
+        modified_date,
+        crc,
+        compressed_size,
+        expanded_size,
+        name_size,
+        central_extra_size,
+        member_comment_size,
+        member_disk,
+        _internal_attributes,
+        external_attributes,
+        local_offset,
+    ) = central
+    if central_signature != b"PK\x01\x02":
+        _zip_reject("ZIP-HEADER", "central signature is invalid")
+    if (
+        version_needed >= 45
+        or compressed_size == 0xFFFFFFFF
+        or expanded_size == 0xFFFFFFFF
+        or local_offset == 0xFFFFFFFF
+        or member_disk != 0
+    ):
+        _zip_reject("ZIP-ZIP64", "uses ZIP64 or multiple disks")
+    central_record_size = 46 + name_size + central_extra_size + member_comment_size
+    if central_record_size != central_size:
+        _zip_reject("ZIP-HEADER", "central record size disagrees")
+    if central_offset + central_record_size > eocd_offset:
+        _zip_reject("ZIP-TRUNC", "central record is incomplete")
+    if central_extra_size != 0 or member_comment_size != 0:
+        _zip_reject("ZIP-META", "contains member metadata")
+    if method not in (0, 8):
+        _zip_reject("ZIP-METHOD", "uses unsupported compression")
+    allowed_flags = 0x800 | (0x6 if method == 8 else 0)
+    if flags & ~allowed_flags:
+        _zip_reject("ZIP-FLAG", "uses unsupported general-purpose flags")
+    minimum_version = 20 if method == 8 else 10
+    if version_needed < minimum_version:
+        _zip_reject("ZIP-HEADER", "version is too old for its compression method")
+    if expanded_size > MAX_SOURCE_BYTES:
+        _zip_reject("ZIP-SIZE", f"source exceeds the {MAX_SOURCE_BYTES}-byte limit")
+    central_name = archive[central_offset + 46 : central_offset + 46 + name_size]
+    create_system = version_made >> 8
+    unix_mode = external_attributes >> 16
+    unix_type = stat.S_IFMT(unix_mode)
+    dos_attributes = external_attributes & 0xFFFF
+    if (
+        create_system not in (0, 3, 10, 14)
+        or dos_attributes & 0x458
+        or (create_system == 3 and unix_type not in (0, stat.S_IFREG))
+    ):
+        _zip_reject("ZIP-TYPE", "member is not a regular file")
+    if local_offset != 0:
+        _zip_reject("ZIP-HEADER", "local header is not at the canonical offset")
+
+    try:
+        local = struct.unpack_from("<4s5H3I2H", archive, local_offset)
+    except struct.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC local header is incomplete") from error
+    (
+        local_signature,
+        local_version,
+        local_flags,
+        local_method,
+        local_time,
+        local_date,
+        local_crc,
+        local_compressed_size,
+        local_expanded_size,
+        local_name_size,
+        local_extra_size,
+    ) = local
+    if local_signature != b"PK\x03\x04":
+        _zip_reject("ZIP-HEADER", "local signature is invalid")
+    local_record_size = 30 + local_name_size + local_extra_size
+    if local_record_size > central_offset:
+        _zip_reject("ZIP-TRUNC", "local header is incomplete")
+    local_name = archive[30 : 30 + local_name_size]
+    if local_extra_size != 0:
+        _zip_reject("ZIP-META", "contains local member metadata")
+    if (
+        local_version != version_needed
+        or local_flags != flags
+        or local_method != method
+        or local_time != modified_time
+        or local_date != modified_date
+        or local_crc != crc
+        or local_compressed_size != compressed_size
+        or local_expanded_size != expanded_size
+        or local_name != central_name
+    ):
+        _zip_reject("ZIP-HEADER", "local and central records disagree")
+    try:
+        decoded_name = central_name.decode("ascii")
+    except UnicodeError as error:
+        raise InvalidManifest("zip archive ZIP-PATH member name is not ASCII") from error
+    if decoded_name != "experiment.cue":
+        _zip_reject("ZIP-PATH", "member name must be exactly experiment.cue")
+    payload_end = local_record_size + compressed_size
+    if payload_end != central_offset:
+        _zip_reject("ZIP-LENGTH", "compressed payload bounds disagree")
+    payload = archive[local_record_size:payload_end]
+    if len(payload) != compressed_size:
+        _zip_reject("ZIP-TRUNC", "compressed payload is incomplete")
+    if method == 0:
+        if compressed_size != expanded_size:
+            _zip_reject("ZIP-LENGTH", "stored member lengths disagree")
+        data = payload
+    else:
+        data = _zip_decode(payload, expanded_size)
+    if len(data) != expanded_size:
+        _zip_reject("ZIP-LENGTH", "decoded length disagrees with its header")
+    if (zlib.crc32(data) & 0xFFFFFFFF) != crc:
+        _zip_reject("ZIP-CRC", "member checksum disagrees")
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={
+            "archiveBytes": len(archive),
+            "archiveDigest": "sha256:" + hashlib.sha256(archive).hexdigest(),
+            "kind": "zip",
+        },
+    )
 
 
 def authored_manifest(snapshot: SourceSnapshot) -> object:
@@ -1405,20 +1715,36 @@ def write_decision(decision: object) -> None:
         raise InfrastructureError("authorization decision could not be written") from error
 
 
+def write_checked_source(checked: object) -> None:
+    output = canonical_json(checked) + b"\n"
+    try:
+        written = sys.stdout.buffer.write(output)
+        if written != len(output):
+            raise OSError("partial checked-source output")
+        sys.stdout.buffer.flush()
+    except (BrokenPipeError, OSError) as error:
+        raise InfrastructureError("checked source output could not be written") from error
+
+
 def main(argv: list[str]) -> int:
     directory_checking = len(argv) == 3 and argv[1] == "check-directory"
     directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
-    if directory_checking or directory_authorizing:
+    zip_checking = len(argv) == 3 and argv[1] == "check-zip"
+    zip_authorizing = len(argv) == 3 and argv[1] == "authorize-zip"
+    if directory_checking or directory_authorizing or zip_checking or zip_authorizing:
         try:
-            snapshot = read_directory_snapshot(argv[2])
+            if zip_checking or zip_authorizing:
+                snapshot = read_zip_snapshot(argv[2])
+            else:
+                snapshot = read_directory_snapshot(argv[2])
             manifest = authored_manifest(snapshot)
             resolution = cue_plan_with_evidence(manifest)
             plan = resolution.plan
-            if directory_checking:
+            if directory_checking or zip_checking:
                 checked: dict[str, object] = {
                     "digest": plan_digest(plan),
                     "plan": plan,
-                    "source": {"digest": snapshot.digest, "kind": "directory"},
+                    "source": {"digest": snapshot.digest, **snapshot.transport},
                 }
                 catalog = catalog_resolution_evidence(
                     resolution.bundled_catalog,
@@ -1426,7 +1752,7 @@ def main(argv: list[str]) -> int:
                 )
                 if catalog is not None:
                     checked["catalog"] = catalog
-                sys.stdout.buffer.write(canonical_json(checked) + b"\n")
+                write_checked_source(checked)
                 return 0
             decision, result = authorize_plan(plan, snapshot.digest)
             write_decision(decision)
