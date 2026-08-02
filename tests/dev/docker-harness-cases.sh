@@ -39,7 +39,7 @@ wrapper-context-runtime tests/docker/wrapper-context.sh SUMMARY failures=0
 network-boundary tests/docker/network-boundary.sh SUMMARY failures=0
 dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
 runtime-inspect-differential tests/docker/runtime-inspect-differential.sh SUMMARY failures=0
-runtime-hardening tests/docker/runtime-hardening.sh SUMMARY failures=0
+runtime-hardening tests/docker/runtime-hardening.sh RUNTIME HARDENING SUMMARY failures=0
 secret-nondisclosure tests/docker/secret-nondisclosure.sh SUMMARY failures=0
 serena-runtime tests/docker/serena-runtime.sh SERENA RUNTIME SUMMARY failures=0
 EOF
@@ -58,6 +58,14 @@ if [ "$(grep -Fxc "printf 'SERENA RUNTIME SUMMARY failures=%s\\n' \"\$failures\"
   pass "Serena runtime owns one suite-specific completion marker"
 else
   fail "Serena runtime owns one suite-specific completion marker"
+fi
+
+runtime_hardening="$repo_root/tests/docker/runtime-hardening.sh"
+if [ "$(grep -Fxc "printf 'RUNTIME HARDENING SUMMARY failures=%s\\n' \"\$failures\"" "$runtime_hardening")" -eq 1 ] &&
+   ! grep -Fq "printf 'SUMMARY failures=%s\\n' \"\$failures\"" "$runtime_hardening"; then
+  pass "runtime hardening owns one suite-specific completion marker"
+else
+  fail "runtime hardening owns one suite-specific completion marker"
 fi
 if grep -Fxq 'tool python3' "$fast_manifest" &&
    ! grep -Fxq 'tool timeout' "$fast_manifest" &&
