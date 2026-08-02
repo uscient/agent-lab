@@ -340,6 +340,20 @@ def main() -> int:
             or bounded_self_test.stderr
         ):
             raise RuntimeError("bounded command helper self-test failed")
+        wrapper_self_test = work / "wrapper-self-test"
+        wrapper_self_test.mkdir()
+        try:
+            run_command(
+                repo,
+                wrapper_self_test,
+                "reserved-status",
+                [sys.executable, "-I", "-B", "-c", "raise SystemExit(125)"],
+                {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("bounded command wrapper accepted reserved status 125")
         fixtures = work / "fixtures"
         generated = subprocess.run(
             [
