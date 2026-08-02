@@ -11,8 +11,11 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
+import stat
+import subprocess
 import sys
 import tempfile
 
@@ -40,6 +43,16 @@ EXPECTED = (
     "GIT-PGROUP-001",
     "GIT-CLEANUP-001",
     "GIT-TAXONOMY-001",
+    "GIT-CHECK-001",
+    "GIT-AUTH-001",
+    "GIT-DENY-001",
+    "GIT-INSTALL-001",
+    "GIT-IDENTITY-001",
+    "GIT-RETRY-001",
+    "GIT-ADAPTER-001",
+    "GIT-NOEF-001",
+    "GIT-RUNTIME-001",
+    "GIT-DIAG-001",
 )
 URL = "https://github.com/uscient/experiment-fixture.git"
 COMMIT = "1cffa1a28f96d2f2cb898b1bad70d281e359a5b5"
@@ -79,6 +92,56 @@ def invoke(module, argv: list[str]) -> tuple[int, str, str]:
     with redirect_stdout(stdout), redirect_stderr(stderr):
         result = module.main(argv)
     return result, stdout.getvalue(), stderr.getvalue()
+
+
+def invoke_with_exit(module, argv: list[str]) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        try:
+            result = module.main(argv)
+        except SystemExit as error:
+            result = error.code if isinstance(error.code, int) else 1
+    return result, stdout.getvalue(), stderr.getvalue()
+
+
+def tree_fingerprint(root: Path) -> str:
+    records: list[tuple[str, str, int, str]] = []
+    if root.exists():
+        for path in sorted(
+            root.rglob("*"), key=lambda item: os.fsencode(str(item.relative_to(root)))
+        ):
+            metadata = path.lstat()
+            relative = str(path.relative_to(root))
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISREG(metadata.st_mode):
+                kind = "file"
+                content = sha256(path.read_bytes()).hexdigest()
+            elif stat.S_ISDIR(metadata.st_mode):
+                kind = "directory"
+                content = ""
+            elif stat.S_ISLNK(metadata.st_mode):
+                kind = "symlink"
+                content = os.readlink(path)
+            else:
+                kind = "other"
+                content = ""
+            records.append((relative, kind, mode, content))
+    return sha256(repr(records).encode("utf-8")).hexdigest()
+
+
+def make_writable(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        try:
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                path.chmod(stat.S_IMODE(metadata.st_mode) | stat.S_IRWXU)
+            elif stat.S_ISREG(metadata.st_mode):
+                path.chmod(stat.S_IMODE(metadata.st_mode) | stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
 
 
 def main() -> int:
@@ -942,6 +1005,618 @@ def main() -> int:
                         "stable absence is rejection while provider uncertainty is infrastructure",
                     )
                 )
+
+                fixture_directory = (
+                    repo / "tests/experiment/fixtures/directories/minimal"
+                )
+                zip_fixture_module = load_module(
+                    repo / "tests/experiment/zip-fixtures.py",
+                    "git_intake_zip_fixture",
+                )
+                common_zip = Path(raw_home) / "common-source.zip"
+                common_zip.write_bytes(zip_fixture_module.one("experiment.cue", source))
+                directory_snapshot = experiment.read_directory_snapshot(
+                    str(fixture_directory)
+                )
+                zip_snapshot = experiment.read_zip_snapshot(str(common_zip))
+                git_snapshot = snapshot
+
+                prior_tools = {
+                    "AGENT_LAB_CUE_TOOL_DIR": os.environ.get(
+                        "AGENT_LAB_CUE_TOOL_DIR"
+                    ),
+                    "AGENT_LAB_CEDAR_TOOL_DIR": os.environ.get(
+                        "AGENT_LAB_CEDAR_TOOL_DIR"
+                    ),
+                }
+                os.environ["AGENT_LAB_CUE_TOOL_DIR"] = str(
+                    repo / ".cache/dev/tools/cue"
+                )
+                os.environ["AGENT_LAB_CEDAR_TOOL_DIR"] = str(
+                    repo / ".cache/dev/tools/cedar"
+                )
+
+                identity_ready = git_snapshot is not None
+                directory_manifest = None
+                zip_manifest = None
+                git_manifest = None
+                directory_resolution = None
+                zip_resolution = None
+                git_resolution = None
+                directory_decision = None
+                zip_decision = None
+                git_decision = None
+                if identity_ready:
+                    try:
+                        directory_manifest = experiment.authored_manifest(
+                            directory_snapshot
+                        )
+                        zip_manifest = experiment.authored_manifest(zip_snapshot)
+                        git_manifest = experiment.authored_manifest(git_snapshot)
+                        directory_resolution = experiment.cue_plan_with_evidence(
+                            directory_manifest
+                        )
+                        zip_resolution = experiment.cue_plan_with_evidence(zip_manifest)
+                        git_resolution = experiment.cue_plan_with_evidence(git_manifest)
+                        directory_decision = experiment.authorize_plan(
+                            directory_resolution.plan, directory_snapshot.digest
+                        )[0]
+                        zip_decision = experiment.authorize_plan(
+                            zip_resolution.plan, zip_snapshot.digest
+                        )[0]
+                        git_decision = experiment.authorize_plan(
+                            git_resolution.plan, git_snapshot.digest
+                        )[0]
+                    except (AttributeError, OSError, RuntimeError):
+                        identity_ready = False
+
+                preview_home = Path(raw_home) / "preview-home"
+                preview_init = invoke(
+                    agent_lab, ["--home", str(preview_home), "init"]
+                )
+                preview_before = tree_fingerprint(preview_home)
+                source_before = sha256(source).hexdigest()
+                original_agent_experiment_module = agent_lab.experiment_module
+                original_read_git_snapshot = experiment.read_git_snapshot
+                original_authored_manifest = experiment.authored_manifest
+                original_cue_plan = experiment.cue_plan_with_evidence
+                original_authorize_plan = experiment.authorize_plan
+                original_write_checked = experiment.write_checked_source
+                original_write_decision = experiment.write_decision
+                active_operation = [""]
+                operation_log: list[tuple[str, str]] = []
+                snapshot_handoffs: list[bool] = []
+                checked_values: list[object] = []
+                decision_values: list[object] = []
+
+                def injected_git_snapshot(url, commit):
+                    operation_log.append((active_operation[0], "snapshot"))
+                    if url != URL or commit != COMMIT or git_snapshot is None:
+                        raise experiment.InfrastructureError(
+                            "git source GIT-TEST fixture is unavailable"
+                        )
+                    return git_snapshot
+
+                def logged_manifest(value):
+                    operation_log.append((active_operation[0], "manifest"))
+                    snapshot_handoffs.append(value is git_snapshot)
+                    return original_authored_manifest(value)
+
+                def logged_plan(value):
+                    operation_log.append((active_operation[0], "plan"))
+                    return original_cue_plan(value)
+
+                def logged_authorize(value, digest):
+                    operation_log.append((active_operation[0], "authorize"))
+                    return original_authorize_plan(value, digest)
+
+                experiment.read_git_snapshot = injected_git_snapshot
+                experiment.authored_manifest = logged_manifest
+                experiment.cue_plan_with_evidence = logged_plan
+                experiment.authorize_plan = logged_authorize
+                experiment.write_checked_source = checked_values.append
+                experiment.write_decision = decision_values.append
+                agent_lab.experiment_module = lambda: experiment
+                try:
+                    active_operation[0] = "check"
+                    checked_result = invoke_with_exit(
+                        agent_lab,
+                        [
+                            "--home",
+                            str(preview_home),
+                            "experiment",
+                            "check",
+                            "--git",
+                            URL,
+                            "--commit",
+                            COMMIT,
+                        ],
+                    )
+                    active_operation[0] = "authorize"
+                    authorized_result = invoke_with_exit(
+                        agent_lab,
+                        [
+                            "--home",
+                            str(preview_home),
+                            "experiment",
+                            "authorize",
+                            "install",
+                            "--git",
+                            URL,
+                            "--commit",
+                            COMMIT,
+                        ],
+                    )
+                finally:
+                    agent_lab.experiment_module = original_agent_experiment_module
+                    experiment.read_git_snapshot = original_read_git_snapshot
+                    experiment.authored_manifest = original_authored_manifest
+                    experiment.cue_plan_with_evidence = original_cue_plan
+                    experiment.authorize_plan = original_authorize_plan
+                    experiment.write_checked_source = original_write_checked
+                    experiment.write_decision = original_write_decision
+
+                expected_checked = None
+                if identity_ready and git_resolution is not None:
+                    expected_checked = {
+                        "digest": experiment.plan_digest(git_resolution.plan),
+                        "plan": git_resolution.plan,
+                        "source": {
+                            "digest": git_snapshot.digest,
+                            **git_snapshot.transport,
+                        },
+                    }
+                    catalog = experiment.catalog_resolution_evidence(
+                        git_resolution.bundled_catalog,
+                        git_resolution.local_catalog,
+                    )
+                    if catalog is not None:
+                        expected_checked["catalog"] = catalog
+                results.append(
+                    (
+                        "GIT-CHECK-001",
+                        checked_result == (0, "", "")
+                        and checked_values == [expected_checked],
+                        "public Git check uses the common checked-source path",
+                    )
+                )
+                results.append(
+                    (
+                        "GIT-AUTH-001",
+                        authorized_result == (0, "", "")
+                        and identity_ready
+                        and decision_values == [directory_decision]
+                        and directory_decision == zip_decision == git_decision,
+                        "Git authorization uses the common source-bound Cedar decision",
+                    )
+                )
+
+                expected_log = [
+                    ("check", "snapshot"),
+                    ("check", "manifest"),
+                    ("check", "plan"),
+                    ("authorize", "snapshot"),
+                    ("authorize", "manifest"),
+                    ("authorize", "plan"),
+                    ("authorize", "authorize"),
+                ]
+                adapter_downstream_calls: list[str] = []
+
+                def forbidden_adapter_downstream(*_args, **_kwargs):
+                    adapter_downstream_calls.append("reached")
+                    raise AssertionError("Git adapter crossed into the common pipeline")
+
+                experiment.authored_manifest = forbidden_adapter_downstream
+                experiment.cue_plan_with_evidence = forbidden_adapter_downstream
+                experiment.authorize_plan = forbidden_adapter_downstream
+                try:
+                    try:
+                        adapter_snapshot = original_read_git_snapshot(
+                            URL, COMMIT, requester=requester
+                        )
+                    except (experiment.InvalidManifest, experiment.InfrastructureError):
+                        adapter_snapshot = None
+                finally:
+                    experiment.authored_manifest = original_authored_manifest
+                    experiment.cue_plan_with_evidence = original_cue_plan
+                    experiment.authorize_plan = original_authorize_plan
+                results.append(
+                    (
+                        "GIT-ADAPTER-001",
+                        identity_ready
+                        and operation_log == expected_log
+                        and snapshot_handoffs == [True, True]
+                        and adapter_snapshot == git_snapshot
+                        and adapter_downstream_calls == [],
+                        "Git acquisition returns one snapshot to each unchanged common pipeline",
+                    )
+                )
+                preview_after = tree_fingerprint(preview_home)
+                results.append(
+                    (
+                        "GIT-NOEF-001",
+                        preview_init[0] == 0
+                        and checked_result[0] == 0
+                        and authorized_result[0] == 0
+                        and preview_before == preview_after
+                        and source_before == sha256(source).hexdigest()
+                        and operation_log == expected_log,
+                        "Git previews leave initialized home and source bytes unchanged",
+                    )
+                )
+
+                hostile_marker = b"caller-private-diagnostic"
+
+                def hostile_read(url, commit):
+                    def hostile_requester(
+                        _authority, _path, _headers, _maximum, _deadline
+                    ):
+                        return (
+                            500,
+                            (
+                                ("content-length", str(len(hostile_marker))),
+                                (
+                                    "content-type",
+                                    "application/json; charset=utf-8",
+                                ),
+                            ),
+                            hostile_marker,
+                        )
+
+                    return original_read_git_snapshot(
+                        url, commit, requester=hostile_requester
+                    )
+
+                experiment.read_git_snapshot = hostile_read
+                agent_lab.experiment_module = lambda: experiment
+                try:
+                    diagnostic_result = invoke_with_exit(
+                        agent_lab,
+                        [
+                            "--home",
+                            str(preview_home),
+                            "experiment",
+                            "check",
+                            "--git",
+                            URL,
+                            "--commit",
+                            COMMIT,
+                        ],
+                    )
+                finally:
+                    experiment.read_git_snapshot = original_read_git_snapshot
+                    agent_lab.experiment_module = original_agent_experiment_module
+                results.append(
+                    (
+                        "GIT-DIAG-001",
+                        diagnostic_result[0] == 125
+                        and diagnostic_result[1] == ""
+                        and "GIT-STATUS" in diagnostic_result[2]
+                        and hostile_marker.decode("ascii") not in diagnostic_result[2],
+                        "hostile provider diagnostics never reach public output",
+                    )
+                )
+
+                store = load_module(
+                    repo / "scripts/experiment_store.py", "git_intake_store"
+                )
+                original_store_experiment_module = store._experiment_module
+
+                class ExperimentFacade:
+                    def __init__(self, *, deny: bool = False):
+                        self.deny = deny
+                        self.acquisitions: list[tuple[str, str]] = []
+
+                    def __getattr__(self, name):
+                        return getattr(experiment, name)
+
+                    def read_git_snapshot(self, url, commit):
+                        self.acquisitions.append((url, commit))
+                        if url != URL or commit != COMMIT or git_snapshot is None:
+                            raise experiment.InfrastructureError(
+                                "git source GIT-TEST fixture is unavailable"
+                            )
+                        return git_snapshot
+
+                    def authorize_plan(self, plan, digest):
+                        decision, status = original_authorize_plan(plan, digest)
+                        if not self.deny:
+                            return decision, status
+                        denied = json.loads(
+                            json.dumps(
+                                decision,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                        )
+                        denied["verdict"] = "deny"
+                        return denied, 1
+
+                def initialized_home(name: str) -> tuple[Path, bool]:
+                    home = Path(raw_home) / name
+                    outcome = invoke(agent_lab, ["--home", str(home), "init"])
+                    return home, outcome[0] == 0 and outcome[2] == ""
+
+                def store_call(name: str, *arguments):
+                    operation = getattr(store, name, None)
+                    if not callable(operation):
+                        return "missing", None
+                    try:
+                        return "ok", operation(*arguments)
+                    except store.StoreReject as error:
+                        return "reject", str(error)
+                    except store.StoreInfrastructure as error:
+                        return "infra", str(error)
+                    except Exception as error:
+                        return "error", type(error).__name__
+
+                deny_home, deny_home_ready = initialized_home("git-deny-home")
+                deny_before = tree_fingerprint(deny_home)
+                deny_facade = ExperimentFacade(deny=True)
+                store._experiment_module = lambda: deny_facade
+                deny_outcome = store_call("install_git", deny_home, URL, COMMIT)
+                deny_after = tree_fingerprint(deny_home)
+                results.append(
+                    (
+                        "GIT-DENY-001",
+                        deny_home_ready
+                        and deny_outcome[0] == "reject"
+                        and "authorization denied" in str(deny_outcome[1])
+                        and deny_facade.acquisitions == [(URL, COMMIT)]
+                        and deny_before == deny_after,
+                        "denied Git install leaves the initialized home byte-identical",
+                    )
+                )
+
+                install_home, install_home_ready = initialized_home("git-install-home")
+                install_facade = ExperimentFacade()
+                store._experiment_module = lambda: install_facade
+                install_outcome = store_call(
+                    "install_git", install_home, URL, COMMIT
+                )
+                installed_root = install_home / "experiments/first-experiment"
+                installed_provenance = None
+                installed_artifact = None
+                if install_outcome[0] == "ok":
+                    try:
+                        installed_provenance = json.loads(
+                            (installed_root / "records/provenance.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        installed_artifact = (
+                            installed_root / "artifact/experiment.cue"
+                        ).read_bytes()
+                    except (OSError, UnicodeError, ValueError):
+                        installed_provenance = None
+                        installed_artifact = None
+                closed_git_provenance = (
+                    isinstance(installed_provenance, dict)
+                    and set(installed_provenance)
+                    == {
+                        "apiVersion",
+                        "authorizationDigest",
+                        "catalog",
+                        "contractDigest",
+                        "kind",
+                        "planDigest",
+                        "selectedEntries",
+                        "source",
+                        "transport",
+                    }
+                    and installed_provenance.get("source")
+                    == {
+                        "bytes": len(source),
+                        "digest": SOURCE_DIGEST,
+                        "entryCount": 1,
+                        "fileCount": 1,
+                        "format": "agent-lab.experiment-tree/v1",
+                        "kind": "directory",
+                    }
+                    and installed_provenance.get("transport") == expected_transport
+                )
+                results.append(
+                    (
+                        "GIT-INSTALL-001",
+                        install_home_ready
+                        and install_outcome[0] == "ok"
+                        and isinstance(install_outcome[1], dict)
+                        and install_outcome[1].get("changed") is True
+                        and install_facade.acquisitions == [(URL, COMMIT)]
+                        and installed_artifact == source
+                        and closed_git_provenance,
+                        "permitted Git install publishes the common artifact and closed provenance",
+                    )
+                )
+
+                directory_home, directory_home_ready = initialized_home(
+                    "identity-directory-home"
+                )
+                zip_home, zip_home_ready = initialized_home("identity-zip-home")
+                store._experiment_module = lambda: ExperimentFacade()
+                directory_install = store_call(
+                    "install_directory", directory_home, fixture_directory
+                )
+                zip_install = store_call("install_zip", zip_home, common_zip)
+
+                def installed_bytes(home: Path, relative: str) -> bytes | None:
+                    try:
+                        return (
+                            home / "experiments/first-experiment" / relative
+                        ).read_bytes()
+                    except OSError:
+                        return None
+
+                directory_key = (
+                    directory_install[1].get("installationKey")
+                    if directory_install[0] == "ok"
+                    and isinstance(directory_install[1], dict)
+                    else None
+                )
+                zip_key = (
+                    zip_install[1].get("installationKey")
+                    if zip_install[0] == "ok" and isinstance(zip_install[1], dict)
+                    else None
+                )
+                git_key = (
+                    install_outcome[1].get("installationKey")
+                    if install_outcome[0] == "ok"
+                    and isinstance(install_outcome[1], dict)
+                    else None
+                )
+                semantic_identity = (
+                    identity_ready
+                    and directory_snapshot.digest
+                    == zip_snapshot.digest
+                    == git_snapshot.digest
+                    == SOURCE_DIGEST
+                    and directory_manifest == zip_manifest == git_manifest
+                    and directory_resolution.plan
+                    == zip_resolution.plan
+                    == git_resolution.plan
+                    and directory_decision == zip_decision == git_decision
+                )
+                stored_identity = (
+                    directory_home_ready
+                    and zip_home_ready
+                    and directory_install[0] == "ok"
+                    and zip_install[0] == "ok"
+                    and install_outcome[0] == "ok"
+                    and directory_key == zip_key == git_key
+                    and directory_key is not None
+                    and installed_bytes(directory_home, "artifact/experiment.cue")
+                    == installed_bytes(zip_home, "artifact/experiment.cue")
+                    == installed_bytes(install_home, "artifact/experiment.cue")
+                    == source
+                    and installed_bytes(directory_home, "records/plan.json")
+                    == installed_bytes(zip_home, "records/plan.json")
+                    == installed_bytes(install_home, "records/plan.json")
+                    and installed_bytes(directory_home, "records/decision.json")
+                    == installed_bytes(zip_home, "records/decision.json")
+                    == installed_bytes(install_home, "records/decision.json")
+                )
+                results.append(
+                    (
+                        "GIT-IDENTITY-001",
+                        semantic_identity and stored_identity,
+                        "directory, ZIP, and Git share manifest, plan, Cedar, key, and artifact identity",
+                    )
+                )
+
+                retry_home, retry_home_ready = initialized_home("git-retry-home")
+                retry_facade = ExperimentFacade()
+                store._experiment_module = lambda: retry_facade
+                retry_directory = store_call(
+                    "install_directory", retry_home, fixture_directory
+                )
+                retry_receipt_path = (
+                    retry_home
+                    / "experiments/first-experiment/records/install.json"
+                )
+                retry_receipt_first = installed_bytes(retry_home, "records/install.json")
+                retry_zip = store_call("install_zip", retry_home, common_zip)
+                retry_receipt_second = installed_bytes(retry_home, "records/install.json")
+                retry_git = store_call("install_git", retry_home, URL, COMMIT)
+                retry_receipt_third = installed_bytes(retry_home, "records/install.json")
+                results.append(
+                    (
+                        "GIT-RETRY-001",
+                        retry_home_ready
+                        and retry_directory[0] == "ok"
+                        and retry_zip[0] == "ok"
+                        and retry_git[0] == "ok"
+                        and isinstance(retry_zip[1], dict)
+                        and isinstance(retry_git[1], dict)
+                        and retry_zip[1].get("changed") is False
+                        and retry_git[1].get("changed") is False
+                        and retry_facade.acquisitions == [(URL, COMMIT)]
+                        and retry_receipt_path.is_file()
+                        and retry_receipt_first
+                        == retry_receipt_second
+                        == retry_receipt_third,
+                        "second and third equivalent transports preserve the first receipt",
+                    )
+                )
+                store._experiment_module = original_store_experiment_module
+
+                runtime_manifest = repo / "packaging/agent-lab-local.manifest"
+                expected_runtime = (
+                    repo / "tests/install/fixtures/expected-runtime-files.txt"
+                )
+                runtime_root = Path(raw_home) / "installed-runtime"
+                runtime_ready = runtime_manifest.read_bytes() == expected_runtime.read_bytes()
+                runtime_names = expected_runtime.read_text(encoding="utf-8").splitlines()
+                for runtime_name in runtime_names:
+                    source_path = repo / runtime_name
+                    target_path = runtime_root / runtime_name
+                    if not runtime_name or not source_path.is_file():
+                        runtime_ready = False
+                        continue
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, target_path)
+                unrelated = Path(raw_home) / "unrelated-cwd"
+                runtime_home = Path(raw_home) / "runtime-home"
+                runtime_tmp = Path(raw_home) / "runtime-tmp"
+                unrelated.mkdir()
+                runtime_tmp.mkdir()
+                runtime_environment = {
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": str(Path(raw_home) / "runtime-user-home"),
+                    "TMPDIR": str(runtime_tmp),
+                    "LC_ALL": "C",
+                    "AGENT_LAB_CUE_TOOL_DIR": str(repo / ".cache/dev/tools/cue"),
+                    "AGENT_LAB_CEDAR_TOOL_DIR": str(
+                        repo / ".cache/dev/tools/cedar"
+                    ),
+                }
+                runtime_command = [
+                    str(runtime_root / "scripts/agent-lab"),
+                    "--home",
+                    str(runtime_home),
+                    "experiment",
+                    "check",
+                    "--git",
+                    "https://example.com/uscient/experiment-fixture.git",
+                    "--commit",
+                    COMMIT,
+                ]
+                try:
+                    runtime_result = subprocess.run(
+                        runtime_command,
+                        cwd=unrelated,
+                        env=runtime_environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                        check=False,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    runtime_result = None
+                results.append(
+                    (
+                        "GIT-RUNTIME-001",
+                        runtime_ready
+                        and runtime_result is not None
+                        and runtime_result.returncode == 1
+                        and runtime_result.stdout == b""
+                        and b"GIT-URL" in runtime_result.stderr
+                        and str(repo).encode("utf-8") not in runtime_result.stderr
+                        and not any(runtime_root.rglob("__pycache__")),
+                        "installed CLI reaches Git validation from a minimal unrelated runtime",
+                    )
+                )
+
+                cycle4_results = {item[0]: item for item in results[-10:]}
+                del results[-10:]
+                results.extend(cycle4_results[item] for item in EXPECTED[-10:])
+
+                for name, value in prior_tools.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+                make_writable(Path(raw_home))
             finally:
                 if prior_home is None:
                     os.environ.pop("AGENT_LAB_HOME", None)
