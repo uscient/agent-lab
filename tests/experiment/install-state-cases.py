@@ -2071,16 +2071,23 @@ def main() -> int:
         fault_fixture = FaultFixtureExperiment(fault_data, "fault-experiment")
         fault_failures: list[str] = []
         fault_counts: dict[str, int] = {}
-        primitives = ("open", "write", "chmod", "fsync", "rename_noreplace")
+        primitives = (
+            "open",
+            "write",
+            "chmod",
+            "fsync",
+            "link_unnamed",
+            "rename_noreplace",
+        )
         if STORE is not None:
             original_fault_loader = STORE._experiment_module
             STORE._experiment_module = lambda: fault_fixture
             try:
                 for primitive in primitives:
                     baseline_home = new_home(root, f"fault-{primitive}-baseline-home")
-                    if primitive == "rename_noreplace":
+                    if primitive in {"link_unnamed", "rename_noreplace"}:
                         owner = STORE
-                        attribute = "_rename_noreplace"
+                        attribute = f"_{primitive}"
                     else:
                         owner = STORE.os
                         attribute = primitive

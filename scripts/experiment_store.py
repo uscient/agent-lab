@@ -21,6 +21,7 @@ from typing import Callable, Iterator, NamedTuple, NoReturn, Sequence
 
 
 INSTALL_KEY_DOMAIN = b"agent-lab.experiment-installation-key.v1\0"
+PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
 DECISION_DOMAIN = b"agent-lab.experiment-decision.v1\0"
 PROVENANCE_DOMAIN = b"agent-lab.experiment-provenance.v1\0"
 RECEIPT_DOMAIN = b"agent-lab.experiment-install-receipt.v1\0"
@@ -119,6 +120,10 @@ def canonical(value: object) -> bytes:
 
 def digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _plan_digest(plan: object) -> str:
+    return digest(PLAN_DOMAIN + canonical(plan))
 
 
 def _reject(message: str) -> NoReturn:
@@ -707,6 +712,45 @@ def _installation_identity(
         _infra("installation identity cannot be derived", error)
 
 
+def _validate_catalog_evidence(
+    selected: Sequence[dict[str, object]],
+    evidence: object,
+) -> None:
+    origins = {item["origin"] for item in selected}
+    expected_keys: set[str] = set()
+    if "agent-lab" in origins:
+        expected_keys.add("bundled")
+    if "local" in origins:
+        expected_keys.add("local")
+    if not expected_keys:
+        if evidence is not None:
+            _infra("unexpected image catalog provenance")
+        return
+    if not isinstance(evidence, dict) or set(evidence) != expected_keys:
+        _infra("image catalog provenance is incomplete")
+    try:
+        if "bundled" in expected_keys:
+            bundled = evidence["bundled"]
+            if (
+                not isinstance(bundled, dict)
+                or set(bundled) != {"snapshotDigest"}
+                or SHA256.fullmatch(str(bundled.get("snapshotDigest"))) is None
+            ):
+                raise ValueError("bundled evidence")
+        if "local" in expected_keys:
+            local = evidence["local"]
+            if (
+                not isinstance(local, dict)
+                or set(local) != {"revision", "snapshotDigest"}
+                or type(local.get("revision")) is not int
+                or int(local["revision"]) < 1
+                or SHA256.fullmatch(str(local.get("snapshotDigest"))) is None
+            ):
+                raise ValueError("local evidence")
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("image catalog provenance is invalid", error)
+
+
 def _candidate(
     snapshot: object,
     plan: dict[str, object],
@@ -720,18 +764,7 @@ def _candidate(
         _infra("source snapshot is malformed")
     if source_digest != _source_digest(source_data):
         _infra("source snapshot digest is inconsistent")
-    local_selected = [item for item in selected if item["origin"] == "local"]
-    if local_selected:
-        if (
-            not isinstance(catalog_evidence, dict)
-            or set(catalog_evidence) != {"revision", "snapshotDigest"}
-            or type(catalog_evidence.get("revision")) is not int
-            or int(catalog_evidence["revision"]) < 1
-            or SHA256.fullmatch(str(catalog_evidence.get("snapshotDigest"))) is None
-        ):
-            _infra("initial local image catalog evidence is invalid")
-    elif catalog_evidence is not None:
-        _infra("unexpected initial local image catalog evidence")
+    _validate_catalog_evidence(selected, catalog_evidence)
     identity = _installation_identity(source_digest, plan, decision, selected)
     installation_key = digest(INSTALL_KEY_DOMAIN + canonical(identity))
     plan_bytes = canonical(plan) + b"\n"
@@ -771,7 +804,7 @@ def _candidate(
             "schema": decision.get("apiVersion"),
         },
         "records/plan.json": {
-            "digest": digest(plan_bytes),
+            "digest": _plan_digest(plan),
             "schema": plan.get("apiVersion"),
         },
         "records/provenance.json": {
@@ -938,7 +971,7 @@ def _verify_envelope(
             or SHA256.fullmatch(str(contract.get("digest"))) is None  # type: ignore[union-attr]
         ):
             raise ValueError("contract")
-        plan_digest = digest(canonical(plan))
+        plan_digest = _plan_digest(plan)
         if (
             set(decision) != {"action", "apiVersion", "binding", "kind", "principal", "resource", "verdict"}
             or decision.get("apiVersion") != "agent-lab.authorization/v0alpha1"
@@ -983,18 +1016,7 @@ def _verify_envelope(
         ):
             raise ValueError("provenance")
         catalog = provenance.get("catalog")
-        local_selected = [item for item in selected if item["origin"] == "local"]
-        if local_selected:
-            if (
-                not isinstance(catalog, dict)
-                or set(catalog) != {"revision", "snapshotDigest"}
-                or type(catalog.get("revision")) is not int
-                or int(catalog["revision"]) < 1
-                or SHA256.fullmatch(str(catalog.get("snapshotDigest"))) is None
-            ):
-                raise ValueError("catalog provenance")
-        elif catalog is not None:
-            raise ValueError("unexpected catalog provenance")
+        _validate_catalog_evidence(selected, catalog)
         installation_key = digest(INSTALL_KEY_DOMAIN + canonical(identity))
         if (
             set(receipt) != {"apiVersion", "identity", "installationKey", "kind", "name", "records"}
@@ -1014,7 +1036,7 @@ def _verify_envelope(
         expected_digests = {
             "artifact/experiment.cue": digest(raw["artifact/experiment.cue"]),
             "records/decision.json": digest(DECISION_DOMAIN + canonical(decision)),
-            "records/plan.json": digest(raw["records/plan.json"]),
+            "records/plan.json": plan_digest,
             "records/provenance.json": digest(PROVENANCE_DOMAIN + canonical(provenance)),
         }
         for record_path in RECORD_PATHS:
@@ -1921,7 +1943,14 @@ def install_directory(
             manifest = experiment.authored_manifest(snapshot)
             resolution = experiment.cue_plan_with_evidence(manifest)
             plan = resolution.plan
-            initial_catalog = resolution.local_catalog
+            initial_catalog_entries: dict[str, object] = {}
+            bundled_catalog = getattr(resolution, "bundled_catalog", None)
+            local_catalog = getattr(resolution, "local_catalog", None)
+            if bundled_catalog is not None:
+                initial_catalog_entries["bundled"] = bundled_catalog
+            if local_catalog is not None:
+                initial_catalog_entries["local"] = local_catalog
+            initial_catalog = initial_catalog_entries or None
             if not isinstance(plan, dict):
                 _infra("CUE produced a malformed Experiment plan")
             decision, status = experiment.authorize_plan(plan, snapshot.digest)
@@ -1947,6 +1976,7 @@ def install_directory(
                 _verify_held_catalog(held, dependencies)
             with _store_lock(authority, fault):
                 _revalidate_authority(authority)
+                experiment.verify_trusted_inputs(plan, decision)
                 _reconcile(authority)
                 files, _, key, receipt_digest = _candidate(
                     snapshot,
@@ -1976,6 +2006,7 @@ def install_directory(
                 )
                 _revalidate_authority(authority)
                 _fault(fault, "experiment envelope.before_noreplace")
+                experiment.verify_trusted_inputs(plan, decision)
                 _rename_noreplace(wrapper / "payload", authority.store / name)
                 _fsync_directory(
                     wrapper,
