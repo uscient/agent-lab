@@ -5,7 +5,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && 
 subcases=(
   "$repo_root/tests/experiment/zip-intake-cases.sh"
 )
-expected_count=1
+expected_count=16
 work=""
 
 cleanup_work() {
@@ -28,7 +28,10 @@ trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 expected="$work/expected"
 observed="$work/observed"
 printf '%s\n' \
-  ZIP-001 > "$expected"
+  ZIP-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
+  ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001 \
+  ZIP-LENGTH-001 ZIP-SIZE-001 ZIP-BOMB-001 ZIP-TRUNC-001 ZIP-TRAIL-001 \
+  ZIP-READ-001 > "$expected"
 : > "$observed"
 
 infrastructure=0
