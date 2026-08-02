@@ -80,6 +80,7 @@ write_fixture() {
     fi
     if [ "$execution_id" = catalog-cases.sh ]; then
       printf 'if [ "${AGENT_LAB_CATALOG_AGG_SIGNAL_MODE:-}" = cooperative ]; then\n'
+      printf '  printf "%%s\\n" "$PPID" > "$control/bash-lane.pid" || exit 125\n'
       printf '  sleep 30 &\n'
       printf '  descendant_pid=$!\n'
       printf '  printf "%%s\\n" "$descendant_pid" > "$control/bash-descendant.pid" || exit 125\n'
@@ -87,6 +88,7 @@ write_fixture() {
       printf '  wait "$descendant_pid"\n'
       printf 'fi\n'
       printf 'if [ "${AGENT_LAB_CATALOG_AGG_SIGNAL_MODE:-}" = stubborn ]; then\n'
+      printf '  printf "%%s\\n" "$PPID" > "$control/bash-lane.pid" || exit 125\n'
       printf '  (\n'
       printf "    trap '' HUP INT QUIT TERM\n"
       printf '    printf "%%s\\n" "$BASHPID" > "$control/stubborn-descendant.pid" || exit 125\n'
@@ -147,6 +149,7 @@ write_python_fixture() {
       printf '        raise SystemExit(125)\n'
       printf '    time.sleep(0.01)\n'
       printf 'if os.environ.get("AGENT_LAB_CATALOG_AGG_SIGNAL_MODE") == "cooperative":\n'
+      printf '    (control / "python-lane.pid").write_text(str(os.getppid()) + "\\n", encoding="ascii")\n'
       printf '    descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
       printf '    (control / "python-descendant.pid").write_text(str(descendant.pid) + "\\n", encoding="ascii")\n'
       printf '    (control / "python-signal.ready").touch()\n'
@@ -428,51 +431,68 @@ else
   fail AGG-018 "malformed lane status fails closed before success"
 fi
 
-reset_fixtures
-signal_control="$work/signal-control"
-signal_tmp="$work/signal-tmp"
-mkdir "$signal_control" "$signal_tmp"
-: > "$signal_control/executions"
-AGENT_LAB_CATALOG_AGG_CONTROL="$signal_control" \
-AGENT_LAB_CATALOG_AGG_SIGNAL_MODE=cooperative \
-TMPDIR="$signal_tmp" \
-  bash "$replica_aggregate" > "$work/signal.out" 2>&1 &
-signal_pid=$!
-signal_setup=0
-bash_descendant=""
-python_descendant=""
-if wait_for_path "$signal_control/bash-signal.ready" &&
-   wait_for_path "$signal_control/python-signal.ready" &&
-   IFS= read -r bash_descendant < "$signal_control/bash-descendant.pid" &&
-   IFS= read -r python_descendant < "$signal_control/python-descendant.pid" &&
-   [[ "$bash_descendant" =~ ^[0-9]+$ ]] &&
-   [[ "$python_descendant" =~ ^[0-9]+$ ]] &&
-   kill -0 "$bash_descendant" 2>/dev/null &&
-   kill -0 "$python_descendant" 2>/dev/null; then
-  signal_setup=1
-fi
-kill -TERM "$signal_pid" 2>/dev/null || true
-signal_rc=0
-wait "$signal_pid" || signal_rc=$?
-bash_descendant_gone=0
-python_descendant_gone=0
-if [ -n "$bash_descendant" ] && wait_for_process_exit "$bash_descendant"; then
-  bash_descendant_gone=1
-fi
-if [ -n "$python_descendant" ] && wait_for_process_exit "$python_descendant"; then
-  python_descendant_gone=1
-fi
-if [ "$bash_descendant_gone" -ne 1 ] && [ -n "$bash_descendant" ]; then
-  kill -KILL "$bash_descendant" 2>/dev/null || true
-  wait_for_process_exit "$bash_descendant" || true
-fi
-if [ "$python_descendant_gone" -ne 1 ] && [ -n "$python_descendant" ]; then
-  kill -KILL "$python_descendant" 2>/dev/null || true
-  wait_for_process_exit "$python_descendant" || true
-fi
-if [ "$signal_setup" -eq 1 ] && [ "$signal_rc" -eq 143 ] &&
-   [ "$bash_descendant_gone" -eq 1 ] && [ "$python_descendant_gone" -eq 1 ] &&
-   ! grep -Fxq 'EXPERIMENT LOCAL IMAGE CATALOG PASS' "$work/signal.out"; then
+signal_names=(TERM INT QUIT)
+signal_numbers=(15 2 3)
+expected_signal_executions="$work/expected-signal-executions"
+printf '%s\n' catalog-cases.sh catalog-state-cases.py > "$expected_signal_executions"
+signal_contract=1
+for signal_index in "${!signal_names[@]}"; do
+  reset_fixtures
+  signal_control="$work/signal-control-$signal_index"
+  signal_tmp="$work/signal-tmp-$signal_index"
+  mkdir "$signal_control" "$signal_tmp"
+  : > "$signal_control/executions"
+  AGENT_LAB_CATALOG_AGG_CONTROL="$signal_control" \
+  AGENT_LAB_CATALOG_AGG_SIGNAL_MODE=cooperative \
+  TMPDIR="$signal_tmp" \
+    bash "$replica_aggregate" > "$work/signal-$signal_index.out" 2>&1 &
+  signal_pid=$!
+  signal_setup=0
+  bash_lane=""
+  python_lane=""
+  bash_descendant=""
+  python_descendant=""
+  if wait_for_path "$signal_control/bash-signal.ready" &&
+     wait_for_path "$signal_control/python-signal.ready" &&
+     IFS= read -r bash_lane < "$signal_control/bash-lane.pid" &&
+     IFS= read -r python_lane < "$signal_control/python-lane.pid" &&
+     IFS= read -r bash_descendant < "$signal_control/bash-descendant.pid" &&
+     IFS= read -r python_descendant < "$signal_control/python-descendant.pid" &&
+     [[ "$bash_lane" =~ ^[0-9]+$ ]] && [[ "$python_lane" =~ ^[0-9]+$ ]] &&
+     [[ "$bash_descendant" =~ ^[0-9]+$ ]] &&
+     [[ "$python_descendant" =~ ^[0-9]+$ ]] &&
+     kill -0 "$bash_lane" 2>/dev/null && kill -0 "$python_lane" 2>/dev/null &&
+     kill -0 "$bash_descendant" 2>/dev/null &&
+     kill -0 "$python_descendant" 2>/dev/null; then
+    signal_setup=1
+  fi
+  kill "-${signal_names[$signal_index]}" "$signal_pid" 2>/dev/null || true
+  signal_rc=0
+  wait "$signal_pid" || signal_rc=$?
+  signal_pids_gone=1
+  for observed_pid in \
+    "$bash_lane" "$python_lane" "$bash_descendant" "$python_descendant"; do
+    if [ -z "$observed_pid" ] || ! wait_for_process_exit "$observed_pid"; then
+      signal_pids_gone=0
+    fi
+  done
+  if [ "$signal_setup" -ne 1 ] ||
+     [ "$signal_rc" -ne "$((128 + signal_numbers[$signal_index]))" ] ||
+     [ "$signal_pids_gone" -ne 1 ] ||
+     grep -Fxq 'EXPERIMENT LOCAL IMAGE CATALOG PASS' "$work/signal-$signal_index.out" ||
+     ! cmp -s <(LC_ALL=C sort "$expected_signal_executions") \
+       <(LC_ALL=C sort "$signal_control/executions"); then
+    signal_contract=0
+  fi
+  for observed_pid in \
+    "$bash_descendant" "$python_descendant" "$bash_lane" "$python_lane"; do
+    if [ -n "$observed_pid" ]; then
+      kill -KILL "$observed_pid" 2>/dev/null || true
+      wait_for_process_exit "$observed_pid" || true
+    fi
+  done
+done
+if [ "$signal_contract" -eq 1 ]; then
   pass AGG-019 "catalog cancellation reaches cooperative lane descendants"
 else
   fail AGG-019 "catalog cancellation reaches cooperative lane descendants"
@@ -489,10 +509,14 @@ TMPDIR="$stubborn_tmp" \
   bash "$replica_aggregate" > "$work/stubborn.out" 2>&1 &
 stubborn_leader=$!
 stubborn_setup=0
+stubborn_lane=""
 stubborn_pid=""
 if wait_for_path "$stubborn_control/stubborn-signal.ready" &&
+   IFS= read -r stubborn_lane < "$stubborn_control/bash-lane.pid" &&
    IFS= read -r stubborn_pid < "$stubborn_control/stubborn-descendant.pid" &&
+   [[ "$stubborn_lane" =~ ^[0-9]+$ ]] &&
    [[ "$stubborn_pid" =~ ^[0-9]+$ ]] &&
+   kill -0 "$stubborn_lane" 2>/dev/null &&
    kill -0 "$stubborn_pid" 2>/dev/null; then
   stubborn_setup=1
 fi
@@ -501,6 +525,10 @@ stubborn_rc=0
 wait "$stubborn_leader" || stubborn_rc=$?
 stubborn_alive=0
 stubborn_output_preserved=0
+stubborn_lane_gone=0
+if [ -n "$stubborn_lane" ] && wait_for_process_exit "$stubborn_lane"; then
+  stubborn_lane_gone=1
+fi
 if [ -n "$stubborn_pid" ] && kill -0 "$stubborn_pid" 2>/dev/null; then
   stubborn_alive=1
   stubborn_output="$(readlink "/proc/$stubborn_pid/fd/1" 2>/dev/null || true)"
@@ -512,8 +540,15 @@ if [ -n "$stubborn_pid" ]; then
   kill -KILL "$stubborn_pid" 2>/dev/null || true
   wait_for_process_exit "$stubborn_pid" || true
 fi
+if [ -n "$stubborn_lane" ]; then
+  kill -KILL "$stubborn_lane" 2>/dev/null || true
+  wait_for_process_exit "$stubborn_lane" || true
+fi
 if [ "$stubborn_setup" -eq 1 ] && [ "$stubborn_rc" -eq 143 ] &&
-   [ "$stubborn_alive" -eq 1 ] && [ "$stubborn_output_preserved" -eq 1 ] &&
+   [ "$stubborn_alive" -eq 1 ] && [ "$stubborn_lane_gone" -eq 1 ] &&
+   [ "$stubborn_output_preserved" -eq 1 ] &&
+   cmp -s <(LC_ALL=C sort "$expected_signal_executions") \
+     <(LC_ALL=C sort "$stubborn_control/executions") &&
    ! grep -Fxq 'EXPERIMENT LOCAL IMAGE CATALOG PASS' "$work/stubborn.out"; then
   pass AGG-020 "catalog cancellation preserves stubborn descendant evidence"
 else
