@@ -333,15 +333,32 @@ write_fixture "$replica/tests/install/local-install-cases.sh" 125 "${uncertain_r
 subcase_infra_rc=0
 run_replica "$work/subcase-infra.out" env || subcase_infra_rc=$?
 reset_fixtures
+mixed_failed_records=()
+mixed_uncertain_records=()
+mapfile -t mixed_failed_records < <(pass_records "${installer_ids[@]}")
+mixed_failed_records[0]='FAIL:PKG-001'
+mapfile -t mixed_uncertain_records < <(pass_records "${config_ids[@]}")
+write_fixture "$replica/tests/install/local-install-cases.sh" 1 "${mixed_failed_records[@]}"
+write_fixture "$replica/tests/experiment/local-config-cases.sh" 125 "${mixed_uncertain_records[@]}"
+mixed_executions="$work/mixed-executions"
+: > "$mixed_executions"
+mixed_rc=0
+run_replica "$work/mixed.out" env \
+  AGENT_LAB_AGG_EXEC_LOG="$mixed_executions" || mixed_rc=$?
+reset_fixtures
 find "$replica/tests/install/local-install-cases.sh" -delete
 setup_infra_rc=0
 run_replica "$work/setup-infra.out" env || setup_infra_rc=$?
 if [ "$subcase_infra_rc" -eq 125 ] && [ "$setup_infra_rc" -eq 125 ] &&
+   [ "$mixed_rc" -eq 125 ] &&
+   grep -Fxq 'SUMMARY assertions=133 expected=133 failures=1 infra=1' "$work/mixed.out" &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$mixed_executions") &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/subcase-infra.out" &&
+   ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/mixed.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/setup-infra.out"; then
-  pass AGG-007 "setup and subcase uncertainty map to one hundred twenty-five"
+  pass AGG-007 "all lanes finish and uncertainty dominates assertion failure"
 else
-  fail AGG-007 "setup and subcase uncertainty map to one hundred twenty-five"
+  fail AGG-007 "all lanes finish and uncertainty dominates assertion failure"
 fi
 
 reset_fixtures

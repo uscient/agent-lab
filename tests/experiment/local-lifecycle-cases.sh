@@ -13,6 +13,8 @@ subcases=(
 )
 expected_count=133
 work=""
+lane_count=3
+lane_pids=()
 
 cleanup_work() {
   local failed=0
@@ -25,11 +27,36 @@ cleanup_work() {
   return "$failed"
 }
 
+stop_lanes() {
+  local pid
+  for pid in "${lane_pids[@]}"; do
+    [ -n "$pid" ] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${lane_pids[@]}"; do
+    [ -n "$pid" ] || continue
+    wait "$pid" 2>/dev/null || true
+  done
+  lane_pids=()
+}
+
+handle_signal() {
+  local status="$1"
+  trap - HUP INT QUIT TERM EXIT
+  stop_lanes
+  cleanup_work >/dev/null 2>&1 || true
+  exit "$status"
+}
+
 if ! work="$(mktemp -d)"; then
   printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 131' QUIT
+trap 'handle_signal 143' TERM
 
 expected="$work/expected"
 observed="$work/observed"
@@ -67,34 +94,86 @@ printf '%s\n' \
   M-STORE-LIVE-001 M-STORE-UNCERT-001 M-STORE-STAGE-001 > "$expected"
 : > "$observed"
 
-infrastructure=0
-for index in "${!subcases[@]}"; do
-  subcase="${subcases[$index]}"
-  output="$work/subcase-$index.out"
+run_subcase() {
+  local index="$1"
+  local subcase="${subcases[$index]}"
+  local output="$work/subcase-$index.out"
+  local status_file="$work/subcase-$index.status"
+  local rc
+
+  if ! : > "$output"; then
+    printf '125\n' > "$status_file" 2>/dev/null || true
+    return 125
+  fi
   if [ ! -f "$subcase" ]; then
+    rc=125
+  else
+    case "$subcase" in
+      *.py)
+        if python3 -I -B "$subcase" > "$output" 2>&1; then
+          rc=0
+        else
+          rc=$?
+        fi
+        ;;
+      *)
+        if bash "$subcase" > "$output" 2>&1; then
+          rc=0
+        else
+          rc=$?
+        fi
+        ;;
+    esac
+  fi
+  printf '%s\n' "$rc" > "$status_file"
+}
+
+run_lane() {
+  local lane="$1"
+  local index
+  local lane_infrastructure=0
+
+  for index in "${!subcases[@]}"; do
+    [ $((index % lane_count)) -eq "$lane" ] || continue
+    run_subcase "$index" || lane_infrastructure=1
+  done
+  [ "$lane_infrastructure" -eq 0 ]
+}
+
+infrastructure=0
+for ((lane = 0; lane < lane_count; lane++)); do
+  run_lane "$lane" &
+  lane_pids+=("$!")
+done
+for lane in "${!lane_pids[@]}"; do
+  pid="${lane_pids[$lane]}"
+  if ! wait "$pid"; then
+    infrastructure=1
+  fi
+  lane_pids[lane]=""
+done
+lane_pids=()
+
+failures=0
+for index in "${!subcases[@]}"; do
+  output="$work/subcase-$index.out"
+  status_file="$work/subcase-$index.status"
+  rc=125
+  if [ ! -f "$status_file" ] ||
+     [ "$(wc -l < "$status_file" 2>/dev/null)" -ne 1 ] ||
+     ! IFS= read -r rc < "$status_file"; then
+    infrastructure=1
+    rc=125
+  fi
+  if [ ! -f "$output" ]; then
     infrastructure=1
     continue
   fi
-  case "$subcase" in
-    *.py)
-      if python3 -I -B "$subcase" > "$output" 2>&1; then
-        rc=0
-      else
-        rc=$?
-      fi
-      ;;
-    *)
-      if bash "$subcase" > "$output" 2>&1; then
-        rc=0
-      else
-        rc=$?
-      fi
-      ;;
-  esac
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print}' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
   reported_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
   reported_failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
+  failures=$((failures + reported_failures))
   expected_summary="SUMMARY assertions=$reported_assertions expected=$reported_assertions failures=$reported_failures infra=0"
   matching_summaries="$(grep -Fxc "$expected_summary" "$output" || true)"
   all_summaries="$(grep -c '^SUMMARY ' "$output" || true)"
@@ -119,7 +198,6 @@ for index in "${!subcases[@]}"; do
 done
 
 assertions="$(wc -l < "$observed")"
-failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$work"/subcase-*.out 2>/dev/null)"
 if ! cmp -s "$expected" "$observed"; then
   failures=$((failures + 1))
 fi
