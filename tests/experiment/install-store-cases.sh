@@ -6,7 +6,7 @@ agent_lab="$repo_root/scripts/agent-lab"
 bounded_helper="$repo_root/tests/helpers/run-bounded.py"
 fixture="$repo_root/tests/experiment/fixtures/directories/minimal"
 runtime_manifest="$repo_root/packaging/agent-lab-local.manifest"
-expected_count=11
+expected_count=12
 work=""
 failures=0
 infrastructure=0
@@ -198,6 +198,9 @@ def canonical(value: object) -> bytes:
 def digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
+def identity_digest(domain: bytes, value: object) -> str:
+    return digest(domain + canonical(value))
+
 def strings(value: object) -> set[str]:
     found: set[str] = set()
     if isinstance(value, str):
@@ -259,17 +262,68 @@ assert decision["binding"]["planDigest"] == digest(canonical(plan))
 assert isinstance(provenance, dict) and isinstance(provenance.get("apiVersion"), str)
 assert not any(item.startswith("/") for item in strings(provenance))
 
-receipt_strings = strings(receipt)
-record_digests = {
-    digest(artifact_bytes),
-    digest(plan_bytes),
-    digest(decision_bytes),
-    digest(provenance_bytes),
+selected_entries: list[dict[str, object]] = []
+for member in plan["spec"]["members"]:
+    resolved = member["resolvedImage"]
+    selected: dict[str, object] = {
+        "member": member["name"],
+        "origin": resolved["origin"],
+        "subject": resolved["subject"],
+    }
+    if resolved["origin"] in {"agent-lab", "local"}:
+        selected.update({
+            "entryDigest": resolved["entryDigest"],
+            "generation": resolved["generation"],
+            "name": member["requestedSelector"]["catalogName"],
+        })
+    selected_entries.append(selected)
+selected_entries.sort(key=lambda item: (str(item["member"]).encode(), str(item["origin"]).encode()))
+
+identity = {
+    "authorizationDigest": decision["binding"]["authorizationDigest"],
+    "contractDigest": plan["contract"]["digest"],
+    "planDigest": decision["binding"]["planDigest"],
+    "selectedEntries": selected_entries,
+    "sourceDigest": decision["binding"]["sourceDigest"],
 }
-assert record_digests <= receipt_strings
-assert {plan["apiVersion"], decision["apiVersion"], provenance["apiVersion"], "agent-lab/v0alpha1"} <= receipt_strings
-installation_key = receipt.get("installationKey")
-assert isinstance(installation_key, str) and len(installation_key) == 71 and installation_key.startswith("sha256:")
+assert identity["sourceDigest"] == checked["source"]["digest"]
+assert provenance["authorizationDigest"] == identity["authorizationDigest"]
+assert provenance["contractDigest"] == identity["contractDigest"]
+assert provenance["planDigest"] == identity["planDigest"]
+assert provenance["selectedEntries"] == identity["selectedEntries"]
+assert provenance["source"]["digest"] == identity["sourceDigest"]
+
+decision_digest = identity_digest(b"agent-lab.experiment-decision.v1\0", decision)
+provenance_digest = identity_digest(b"agent-lab.experiment-provenance.v1\0", provenance)
+records = {
+    "artifact/experiment.cue": {
+        "digest": digest(artifact_bytes),
+        "schema": "agent-lab/v0alpha1",
+    },
+    "records/decision.json": {
+        "digest": decision_digest,
+        "schema": decision["apiVersion"],
+    },
+    "records/plan.json": {
+        "digest": digest(plan_bytes),
+        "schema": plan["apiVersion"],
+    },
+    "records/provenance.json": {
+        "digest": provenance_digest,
+        "schema": provenance["apiVersion"],
+    },
+}
+installation_key = identity_digest(b"agent-lab.experiment-installation-key.v1\0", identity)
+assert receipt == {
+    "apiVersion": "agent-lab.experiment-install/v0alpha1",
+    "identity": identity,
+    "installationKey": installation_key,
+    "kind": "ExperimentInstallationReceipt",
+    "name": name,
+    "records": records,
+}
+receipt_digest = identity_digest(b"agent-lab.experiment-install-receipt.v1\0", receipt)
+assert len({decision_digest, provenance_digest, receipt_digest}) == 3
 
 result_bytes = result_path.read_bytes()
 result = json.loads(result_bytes)
@@ -277,7 +331,7 @@ assert result_bytes == canonical(result) + b"\n"
 assert result.get("changed") is True
 assert result.get("name") == name
 assert result.get("installationKey") == installation_key
-assert result.get("receiptDigest") == digest(receipt_bytes)
+assert result.get("receiptDigest") == receipt_digest
 PY
 }
 
@@ -302,6 +356,42 @@ if [ "$CAPTURE_RC" -eq 1 ] && [ ! -s "$CAPTURE_OUT" ] \
   pass INST-UNKNOWN-001 "inspect reports an unknown name without mutating the initialized home"
 else
   fail INST-UNKNOWN-001 "inspect reports an unknown name without mutating the initialized home"
+fi
+
+name_home="$work/name-home"
+init_home "$name_home"
+name_source="$work/name-source"
+name_63="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+mkdir "$name_source"
+sed "s/first-experiment/$name_63/" "$fixture/experiment.cue" > "$name_source/experiment.cue"
+capture name-check "$agent_lab" --home "$name_home" experiment check "$name_source"
+name_check_rc="$CAPTURE_RC"
+name_check_out="$CAPTURE_OUT"
+name_check_err="$CAPTURE_ERR"
+capture name-decision "$agent_lab" --home "$name_home" experiment authorize install "$name_source"
+name_decision_rc="$CAPTURE_RC"
+name_decision_out="$CAPTURE_OUT"
+name_decision_err="$CAPTURE_ERR"
+capture name-install "$agent_lab" --home "$name_home" experiment install "$name_source"
+name_install_rc="$CAPTURE_RC"
+name_install_out="$CAPTURE_OUT"
+name_install_err="$CAPTURE_ERR"
+capture name-inspect "$agent_lab" --home "$name_home" experiment inspect "$name_63"
+name_inspect_rc="$CAPTURE_RC"
+name_inspect_out="$CAPTURE_OUT"
+name_inspect_err="$CAPTURE_ERR"
+if [ "${#name_63}" -eq 63 ] \
+   && [ "$name_check_rc" -eq 0 ] && [ ! -s "$name_check_err" ] \
+   && jq -e --arg name "$name_63" '.plan.metadata.requestedName == $name' "$name_check_out" >/dev/null 2>&1 \
+   && [ "$name_decision_rc" -eq 0 ] && [ ! -s "$name_decision_err" ] \
+   && jq -e --arg name "$name_63" '.verdict == "permit" and .resource.requestedName == $name' "$name_decision_out" >/dev/null 2>&1 \
+   && [ "$name_install_rc" -eq 0 ] && [ ! -s "$name_install_err" ] \
+   && jq -e --arg name "$name_63" '.changed == true and .name == $name' "$name_install_out" >/dev/null 2>&1 \
+   && [ "$name_inspect_rc" -eq 0 ] && [ ! -s "$name_inspect_err" ] \
+   && jq -e --arg name "$name_63" '.state == "installed" and .name == $name' "$name_inspect_out" >/dev/null 2>&1; then
+  pass INST-NAME-001 "the maximum-length valid Experiment name checks, authorizes, installs, and inspects"
+else
+  fail INST-NAME-001 "the maximum-length valid Experiment name checks, authorizes, installs, and inspects"
 fi
 
 capture core-check "$agent_lab" --home "$core_home" experiment check "$fixture"
@@ -494,7 +584,7 @@ fi
 
 expected="$work/expected"
 printf '%s\n' \
-  INST-HOME-001 INST-UNKNOWN-001 INST-PERMIT-001 INST-RECEIPT-001 \
+  INST-HOME-001 INST-UNKNOWN-001 INST-NAME-001 INST-PERMIT-001 INST-RECEIPT-001 \
   INST-INSPECT-001 INST-RETRY-001 INST-CONFLICT-001 INST-DENY-001 \
   INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then

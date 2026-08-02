@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 import io
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import stat
 import subprocess
@@ -114,6 +115,17 @@ def cli(home: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
 def start_cli(home: Path, source: Path) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [str(AGENT_LAB), "--home", str(home), "experiment", "install", str(source)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=command_environment(),
+        start_new_session=True,
+    )
+
+
+def start_inspect(home: Path, name: str) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [str(AGENT_LAB), "--home", str(home), "experiment", "inspect", name],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -267,6 +279,28 @@ def store_install(
         return None, None, error
 
 
+def store_inspect(
+    home: Path,
+    name: str,
+) -> tuple[int | None, dict[str, object] | None, BaseException | None]:
+    if STORE is None:
+        return None, None, STORE_LOAD_ERROR or RuntimeError("experiment store module is missing")
+    operation = getattr(STORE, "inspect_install", None)
+    if not callable(operation):
+        return None, None, RuntimeError("experiment_store.inspect_install is missing")
+    try:
+        value = operation(home, name)
+        if not isinstance(value, dict):
+            return None, None, RuntimeError("inspect_install returned a non-object")
+        return 0, value, None
+    except getattr(STORE, "StoreReject", ()) as error:
+        return 1, None, error
+    except getattr(STORE, "StoreInfrastructure", ()) as error:
+        return 125, None, error
+    except BaseException as error:  # An uncontained production fault is RED, not harness infra.
+        return None, None, error
+
+
 def module_main(
     home: Path,
     arguments: list[str],
@@ -315,6 +349,143 @@ def hard_exit_install(home: Path, source: Path, point: str) -> int:
     global INFRA
     INFRA += 1
     return 124
+
+
+def hard_exit_after_raw_publication(home: Path, source: Path) -> int:
+    """Exit after no-replace succeeds but before the final root becomes read-only."""
+
+    if STORE is None:
+        return 95
+    target = home / "experiments" / "first-experiment"
+    pid = os.fork()
+    if pid == 0:
+        original_chmod = STORE.os.chmod
+
+        def stop_before_final_chmod(path: object, mode: int, *args, **kwargs):
+            if Path(os.fsdecode(os.fspath(path))) == target and mode == 0o500:
+                os._exit(99)
+            return original_chmod(path, mode, *args, **kwargs)
+
+        STORE.os.chmod = stop_before_final_chmod
+        result, _, _ = store_install(home, source)
+        os._exit(97 if result == 0 else 96)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    global INFRA
+    INFRA += 1
+    return 124
+
+
+def hard_exit_before_intent(home: Path, source: Path) -> int:
+    """Exit after the operation wrapper exists but before intent bytes are written."""
+
+    if STORE is None:
+        return 95
+    pid = os.fork()
+    if pid == 0:
+        original_write_file = STORE._write_file
+
+        def stop_before_intent(path, data, purpose, fault):
+            if purpose == "experiment intent":
+                os._exit(99)
+            return original_write_file(path, data, purpose, fault)
+
+        STORE._write_file = stop_before_intent
+        result, _, _ = store_install(home, source)
+        os._exit(97 if result == 0 else 96)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    global INFRA
+    INFRA += 1
+    return 124
+
+
+def start_paused_publication(home: Path, source: Path) -> tuple[int, int, int]:
+    """Pause a child install while it holds the store lock before publication."""
+
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(ready_read)
+        os.close(release_write)
+        paused = False
+
+        def pause(point: str) -> None:
+            nonlocal paused
+            if point == "experiment envelope.before_noreplace" and not paused:
+                paused = True
+                os.write(ready_write, b"1")
+                if os.read(release_read, 1) != b"1":
+                    os._exit(94)
+
+        result, _, _ = store_install(home, source, fault=pause)
+        os._exit(0 if result == 0 else 96)
+    os.close(ready_write)
+    os.close(release_read)
+    readable, _, _ = select.select((ready_read,), (), (), 30.0)
+    if not readable or os.read(ready_read, 1) != b"1":
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+        os.close(ready_read)
+        os.close(release_write)
+        global INFRA
+        INFRA += 1
+        return 0, -1, -1
+    os.close(ready_read)
+    return pid, release_write, 0
+
+
+def finish_child(pid: int, timeout: float = 30.0) -> int:
+    if pid <= 0:
+        return 124
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    global INFRA
+    INFRA += 1
+    return 124
+
+
+def wait_for_lock_block(process: subprocess.Popen[bytes], timeout: float = 5.0) -> bool:
+    """Observe the Linux flock wait channel rather than infer blocking from a sleep."""
+
+    deadline = time.monotonic() + timeout
+    path = Path(f"/proc/{process.pid}/wchan")
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            channel = path.read_text(encoding="ascii").strip()
+        except OSError:
+            channel = ""
+        if channel == "locks_lock_inode_wait":
+            return True
+        time.sleep(0.005)
+    return False
 
 
 def lock_is_blocked(path: Path) -> bool:
@@ -455,16 +626,59 @@ def main() -> int:
             "install",
             str(direct_source),
         )
+
+        inspect_lock_home = new_home(root, "inspect-lock-home")
+        inspect_lock_install = cli(
+            inspect_lock_home,
+            "experiment",
+            "install",
+            str(direct_source),
+        )
+        inspect_lock = inspect_lock_home / "state" / "locks" / "experiments.lock"
+        os.link(inspect_lock, root / "second-inspect-lock-link")
+        hardlink_inspect = cli(
+            inspect_lock_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+
+        blocking_home = new_home(root, "inspect-blocking-home")
+        install_pid, release_write, pause_status = start_paused_publication(
+            blocking_home,
+            direct_source,
+        )
+        blocking_inspect = start_inspect(blocking_home, "first-experiment")
+        inspect_waited = wait_for_lock_block(blocking_inspect)
+        if release_write >= 0:
+            try:
+                os.write(release_write, b"1")
+            finally:
+                os.close(release_write)
+        blocking_install_rc = finish_child(install_pid)
+        blocking_inspect_result = finish_process(blocking_inspect)
+        blocking_inspect_value = json_object(blocking_inspect_result)
         check(
             "IST-LOCK-001",
             symlink_lock_result.returncode == 125
             and lock_before == lock_after
             and hardlink_result.returncode == 125
-            and not tuple((hardlink_lock_home / "experiments" / ".staging").iterdir()),
-            "the pre-created receipt-bound store lock is safe-opened with stable identity",
+            and not tuple((hardlink_lock_home / "experiments" / ".staging").iterdir())
+            and inspect_lock_install.returncode == 0
+            and hardlink_inspect.returncode == 125
+            and pause_status == 0
+            and inspect_waited
+            and blocking_install_rc == 0
+            and blocking_inspect_result.returncode == 0
+            and isinstance(blocking_inspect_value, dict)
+            and blocking_inspect_value.get("state") == "installed",
+            "the receipt-bound store lock protects install and read-only inspect",
             (
                 f"symlink={symlink_lock_result.returncode}/{lock_before != lock_after} "
-                f"hardlink={hardlink_result.returncode}"
+                f"hardlink={hardlink_result.returncode} inspect_install={inspect_lock_install.returncode} "
+                f"inspect_hardlink={hardlink_inspect.returncode} pause={pause_status} "
+                f"waited={inspect_waited} child={blocking_install_rc} "
+                f"inspect={blocking_inspect_result.returncode}/{blocking_inspect_value!r}"
             ),
         )
 
@@ -536,16 +750,46 @@ def main() -> int:
         bound_before = fingerprint(bound_stage)
         bound_result = cli(bound_home, "experiment", "install", str(direct_source))
         bound_after = fingerprint(bound_stage)
+
+        cleanup_home = new_home(root, "foreign-cleanup-home")
+        cleanup_wrapper = (
+            cleanup_home
+            / "experiments"
+            / ".staging"
+            / "experiment-install-cleanup"
+        )
+        cleanup_artifact = cleanup_wrapper / "payload" / "artifact"
+        cleanup_artifact.mkdir(parents=True)
+        for directory_path in (
+            cleanup_wrapper,
+            cleanup_wrapper / "payload",
+            cleanup_artifact,
+        ):
+            directory_path.chmod(0o700)
+        cleanup_canary = cleanup_artifact / "experiment.cue"
+        cleanup_canary.write_bytes(b"foreign cleanup canary\n")
+        cleanup_canary.chmod(0o600)
+        cleanup_before = fingerprint(cleanup_wrapper)
+        cleanup_result = cli(
+            cleanup_home,
+            "experiment",
+            "install",
+            str(direct_source),
+        )
+        cleanup_after = fingerprint(cleanup_wrapper)
         check(
             "IST-BOUND-001",
             foreign_result.returncode == 125
             and foreign_before == foreign_after
             and bound_result.returncode == 125
-            and bound_before == bound_after,
-            "unknown or over-bound staging residue blocks mutation without broad deletion",
+            and bound_before == bound_after
+            and cleanup_result.returncode == 125
+            and cleanup_before == cleanup_after,
+            "unknown, over-bound, or unproven cleanup residue is preserved",
             (
                 f"foreign={foreign_result.returncode}/{foreign_before != foreign_after} "
-                f"bound={bound_result.returncode}/{bound_before != bound_after}"
+                f"bound={bound_result.returncode}/{bound_before != bound_after} "
+                f"cleanup={cleanup_result.returncode}/{cleanup_before != cleanup_after}"
             ),
         )
 
@@ -579,15 +823,53 @@ def main() -> int:
                     f" link={linked_inspect.returncode} restore={restored_inspect.returncode} "
                     f"mode={mode_inspect.returncode} digest={digest_inspect.returncode}"
                 )
+
+        layout_home = new_home(root, "changing-layout-home")
+        layout_install = cli(layout_home, "experiment", "install", str(direct_source))
+        layout_target = layout_home / "experiments" / "first-experiment"
+        layout_changed = False
+        layout_rc: int | None = None
+        layout_error: BaseException | None = None
+        if STORE is not None and layout_install.returncode == 0:
+            original_listdir = STORE.os.listdir
+
+            def change_after_enumeration(path: object = "."):
+                nonlocal layout_changed
+                names = original_listdir(path)
+                try:
+                    rendered = Path(os.fsdecode(os.fspath(path)))
+                except TypeError:
+                    return names
+                if rendered == layout_target and not layout_changed:
+                    layout_changed = True
+                    layout_target.chmod(0o700)
+                    foreign = layout_target / "foreign-after-enumeration"
+                    foreign.write_bytes(b"foreign layout entry\n")
+                    foreign.chmod(0o400)
+                    layout_target.chmod(0o500)
+                return names
+
+            STORE.os.listdir = change_after_enumeration
+            try:
+                layout_rc, _, layout_error = store_inspect(
+                    layout_home,
+                    "first-experiment",
+                )
+            finally:
+                STORE.os.listdir = original_listdir
         check(
             "IST-STATE-003",
             installed.returncode == 0
             and link_detected
             and restored
             and mode_detected
-            and digest_detected,
-            "inspect safe-reopens the whole receipt and detects link, mode, and byte drift",
-            tamper_detail,
+            and digest_detected
+            and layout_install.returncode == 0
+            and layout_changed
+            and layout_rc == 125
+            and layout_error is not None,
+            "inspect detects link, mode, byte, and concurrent layout drift",
+            f"{tamper_detail} layout={layout_install.returncode}/{layout_changed}/{layout_rc}/{layout_error!r}",
         )
 
         identical_home = new_home(root, "identical-concurrency-home")
@@ -694,6 +976,45 @@ def main() -> int:
                     f"read_changed={before_inspect_stage != after_inspect_stage}"
                 )
 
+        preintent_home = new_home(root, "preintent-crash-home")
+        preintent_stage = preintent_home / "experiments" / ".staging"
+        preintent_child_rc = hard_exit_before_intent(preintent_home, direct_source)
+        preintent_before = fingerprint(preintent_stage)
+        preintent_inspect = cli(
+            preintent_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+        preintent_after_inspect = fingerprint(preintent_stage)
+        preintent_retry = cli(
+            preintent_home,
+            "experiment",
+            "install",
+            str(direct_source),
+        )
+        preintent_value = json_object(preintent_retry)
+
+        raw_home = new_home(root, "raw-publication-crash-home")
+        raw_child_rc = hard_exit_after_raw_publication(raw_home, direct_source)
+        raw_stage = raw_home / "experiments" / ".staging"
+        raw_before_inspect = fingerprint(raw_stage)
+        raw_inspect = cli(
+            raw_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+        raw_after_inspect = fingerprint(raw_stage)
+        raw_retry = cli(raw_home, "experiment", "install", str(direct_source))
+        raw_retry_value = json_object(raw_retry)
+        raw_final_inspect = cli(
+            raw_home,
+            "experiment",
+            "inspect",
+            "first-experiment",
+        )
+
         output_home = new_home(root, "result-output-home")
         output_rc, _, output_error = module_main(
             output_home,
@@ -715,13 +1036,34 @@ def main() -> int:
             and output_inspect.returncode == 0
             and output_retry.returncode == 0
             and isinstance(output_value, dict)
-            and output_value.get("changed") is False,
+            and output_value.get("changed") is False
+            and preintent_child_rc == 99
+            and preintent_inspect.returncode == 1
+            and preintent_before == preintent_after_inspect
+            and preintent_retry.returncode == 0
+            and isinstance(preintent_value, dict)
+            and preintent_value.get("changed") is True
+            and not tuple(preintent_stage.iterdir())
+            and raw_child_rc == 99
+            and raw_inspect.returncode == 125
+            and raw_before_inspect == raw_after_inspect
+            and raw_retry.returncode == 0
+            and isinstance(raw_retry_value, dict)
+            and raw_retry_value.get("changed") is False
+            and raw_final_inspect.returncode == 0
+            and not tuple(raw_stage.iterdir()),
             "fault seams preserve views, restart cleanup, and recover uncertain output",
             (
                 f"seam={seam_rc}/{seam_error!r} "
                 f"missing={sorted(set(FAULT_POINTS)-set(observed_points))!r} "
                 f"crashes={crash_failures[:3]!r} output={output_rc}/{output_error!r}/"
-                f"{output_inspect.returncode}/{output_retry.returncode}/{output_value!r}"
+                f"{output_inspect.returncode}/{output_retry.returncode}/{output_value!r} "
+                f"preintent={preintent_child_rc}/{preintent_inspect.returncode}/"
+                f"{preintent_before != preintent_after_inspect}/{preintent_retry.returncode}/"
+                f"{preintent_value!r} "
+                f"raw={raw_child_rc}/{raw_inspect.returncode}/"
+                f"{raw_before_inspect != raw_after_inspect}/{raw_retry.returncode}/"
+                f"{raw_retry_value!r}/{raw_final_inspect.returncode}"
             ),
         )
 
@@ -797,6 +1139,74 @@ def main() -> int:
             ),
         )
 
+        provenance_home = new_home(root, "provenance-snapshot-home")
+        provenance_add = cli(
+            provenance_home,
+            "image",
+            "add",
+            "vendor.worker",
+            SUBJECT,
+        )
+        provenance_source = source_directory(
+            root,
+            "provenance-source",
+            catalog_name="vendor.worker",
+        )
+        initial_check = cli(
+            provenance_home,
+            "experiment",
+            "check",
+            str(provenance_source),
+        )
+        initial_check_value = json_object(initial_check)
+        initial_catalog = None
+        if isinstance(initial_check_value, dict):
+            catalog_value = initial_check_value.get("catalog")
+            if isinstance(catalog_value, dict):
+                initial_catalog = catalog_value.get("local")
+        provenance_rc: int | None = None
+        provenance_value: dict[str, object] | None = None
+        provenance_error: BaseException | None = None
+        unrelated_result: subprocess.CompletedProcess[bytes] | None = None
+        provenance_record: dict[str, object] | None = None
+        if STORE is not None:
+            original_held_catalog = STORE._held_catalog_context
+
+            @contextmanager
+            def mutate_unrelated_before_hold(home: Path, dependencies, fault):
+                nonlocal unrelated_result
+                unrelated_result = cli(
+                    home,
+                    "image",
+                    "add",
+                    "vendor.unrelated",
+                    OTHER_SUBJECT,
+                )
+                with original_held_catalog(home, dependencies, fault) as held:
+                    yield held
+
+            STORE._held_catalog_context = mutate_unrelated_before_hold
+            try:
+                provenance_rc, provenance_value, provenance_error = store_install(
+                    provenance_home,
+                    provenance_source,
+                )
+            finally:
+                STORE._held_catalog_context = original_held_catalog
+            provenance_path = (
+                provenance_home
+                / "experiments"
+                / "first-experiment"
+                / "records"
+                / "provenance.json"
+            )
+            if provenance_path.is_file():
+                try:
+                    loaded_provenance = json.loads(provenance_path.read_bytes())
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    loaded_provenance = None
+                if isinstance(loaded_provenance, dict):
+                    provenance_record = loaded_provenance
         platform_home = new_home(root, "platform-home")
         platform_source = source_directory(root, "platform-source")
         platform_before = fingerprint(platform_home)
@@ -856,6 +1266,26 @@ def main() -> int:
                 f"source_touched={source_touched} changed={platform_before != platform_after}"
             ),
         )
+        check(
+            "IST-PROV-001",
+            provenance_add.returncode == 0
+            and initial_check.returncode == 0
+            and isinstance(initial_catalog, dict)
+            and unrelated_result is not None
+            and unrelated_result.returncode == 0
+            and provenance_rc == 0
+            and isinstance(provenance_value, dict)
+            and provenance_error is None
+            and isinstance(provenance_record, dict)
+            and provenance_record.get("catalog") == initial_catalog,
+            "provenance retains the authorized initial resolution snapshot across unrelated catalog mutation",
+            (
+                f"add={provenance_add.returncode} check={initial_check.returncode}/{initial_catalog!r} "
+                f"unrelated={None if unrelated_result is None else unrelated_result.returncode} "
+                f"install={provenance_rc}/{provenance_error!r} "
+                f"stored={None if provenance_record is None else provenance_record.get('catalog')!r}"
+            ),
+        )
 
     expected = [
         "IST-STATE-001",
@@ -868,11 +1298,12 @@ def main() -> int:
         "IST-CRASH-001",
         "IST-LIVE-001",
         "IST-PLAT-001",
+        "IST-PROV-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA install state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=10 expected=10 failures={FAILURES} infra={INFRA}")
+    print(f"SUMMARY assertions=11 expected=11 failures={FAILURES} infra={INFRA}")
     if INFRA:
         return 125
     return 0 if FAILURES == 0 else 1
@@ -886,6 +1317,6 @@ if __name__ == "__main__":
     except BaseException as error:
         print(f"INFRA install state harness failed: {error!r}", file=sys.stderr)
         print(
-            f"SUMMARY assertions={len(OBSERVED)} expected=10 failures={FAILURES} infra=1"
+            f"SUMMARY assertions={len(OBSERVED)} expected=11 failures={FAILURES} infra=1"
         )
         raise SystemExit(125)
