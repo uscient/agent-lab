@@ -51,10 +51,17 @@ expected_ids=(
   RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001
   M-CAT-OCI-001 M-CAT-SHADOW-001 M-CAT-CAS-001 M-CAT-AUTH-001 M-RES-BIND-001
   M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001
+  INST-HOME-001 INST-UNKNOWN-001 INST-PERMIT-001 INST-RECEIPT-001
+  INST-INSPECT-001 INST-RETRY-001 INST-CONFLICT-001 INST-DENY-001
+  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001
+  IST-STATE-001 IST-LOCK-001 IST-STATE-002 IST-BOUND-001 IST-STATE-003
+  IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001
 )
 installer_ids=("${expected_ids[@]:0:5}")
 config_ids=("${expected_ids[@]:5:5}")
-catalog_ids=("${expected_ids[@]:10}")
+catalog_ids=("${expected_ids[@]:10:76}")
+install_ids=("${expected_ids[@]:86:11}")
+state_ids=("${expected_ids[@]:97:10}")
 
 write_fixture() {
   local path="$1"
@@ -80,6 +87,32 @@ write_fixture() {
   chmod +x "$path"
 }
 
+write_python_fixture() {
+  local path="$1"
+  local rc="$2"
+  shift 2
+  local record kind id fixture_failures=0
+  local execution_id="${path##*/}"
+  {
+    printf '#!/usr/bin/env python3\n'
+    printf 'import os\n'
+    printf 'log = os.environ.get("AGENT_LAB_AGG_EXEC_LOG")\n'
+    printf 'if log:\n'
+    printf '    with open(log, "a", encoding="ascii") as stream:\n'
+    printf "        stream.write('%s\\\\n')\n" "$execution_id"
+    for record in "$@"; do
+      kind="${record%%:*}"
+      id="${record#*:}"
+      [ "$kind" = "FAIL" ] && fixture_failures=$((fixture_failures + 1))
+      printf "print('%s %s fixture assertion')\n" "$kind" "$id"
+    done
+    printf "print('SUMMARY assertions=%s expected=%s failures=%s infra=0')\n" \
+      "$#" "$#" "$fixture_failures"
+    printf 'raise SystemExit(%s)\n' "$rc"
+  } > "$path"
+  chmod +x "$path"
+}
+
 pass_records() {
   local id
   for id in "$@"; do
@@ -89,12 +122,17 @@ pass_records() {
 
 reset_fixtures() {
   local installer_records=() config_records=() catalog_records=()
+  local install_records=() state_records=()
   mapfile -t installer_records < <(pass_records "${installer_ids[@]}")
   mapfile -t config_records < <(pass_records "${config_ids[@]}")
   mapfile -t catalog_records < <(pass_records "${catalog_ids[@]}")
+  mapfile -t install_records < <(pass_records "${install_ids[@]}")
+  mapfile -t state_records < <(pass_records "${state_ids[@]}")
   write_fixture "$replica/tests/install/local-install-cases.sh" 0 "${installer_records[@]}"
   write_fixture "$replica/tests/experiment/local-config-cases.sh" 0 "${config_records[@]}"
   write_fixture "$replica/tests/experiment/local-image-catalog-cases.sh" 0 "${catalog_records[@]}"
+  write_fixture "$replica/tests/experiment/install-store-cases.sh" 0 "${install_records[@]}"
+  write_python_fixture "$replica/tests/experiment/install-state-cases.py" 0 "${state_records[@]}"
 }
 
 run_replica() {
@@ -118,7 +156,9 @@ mutant_executions="$work/mutant-executions"
 printf '%s\n' \
   local-install-cases.sh \
   local-config-cases.sh \
-  local-image-catalog-cases.sh > "$expected_executions"
+  local-image-catalog-cases.sh \
+  install-store-cases.sh \
+  install-state-cases.py > "$expected_executions"
 : > "$baseline_executions"
 baseline_rc=0
 run_replica "$work/baseline.out" env \
@@ -144,7 +184,9 @@ printf '%s\n' \
   local-install-cases.sh \
   local-install-cases.sh \
   local-config-cases.sh \
-  local-image-catalog-cases.sh > "$mutant_expected"
+  local-image-catalog-cases.sh \
+  install-store-cases.sh \
+  install-state-cases.py > "$mutant_expected"
 
 if [ "$baseline_rc" -eq 0 ] &&
    cmp -s "$expected_executions" "$baseline_executions" &&
@@ -163,10 +205,10 @@ success_output="$work/success.out"
 success_rc=0
 run_replica "$success_output" env || success_rc=$?
 if [ "$success_rc" -eq 0 ] &&
-   [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 86 ] &&
-   [ "$(grep -Fxc 'SUMMARY assertions=86 expected=86 failures=0 infra=0' "$success_output")" -eq 1 ] &&
+   [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 107 ] &&
+   [ "$(grep -Fxc 'SUMMARY assertions=107 expected=107 failures=0 infra=0' "$success_output")" -eq 1 ] &&
    [ "$(tail -n 1 "$success_output")" = 'EXPERIMENT LOCAL LIFECYCLE PASS' ] &&
-   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=86 expected=86 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
+   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=107 expected=107 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
   pass AGG-002 "success forwards only assertions then one summary and marker"
 else
   fail AGG-002 "success forwards only assertions then one summary and marker"
@@ -215,7 +257,7 @@ write_fixture "$replica/tests/install/local-install-cases.sh" 1 "${failed_record
 assertion_rc=0
 run_replica "$work/assertion.out" env || assertion_rc=$?
 if [ "$assertion_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=86 expected=86 failures=1 infra=0' "$work/assertion.out" &&
+   grep -Fxq 'SUMMARY assertions=107 expected=107 failures=1 infra=0' "$work/assertion.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/assertion.out"; then
   pass AGG-006 "subcase assertion failure maps to one"
 else
@@ -248,7 +290,7 @@ chmod +x "$shim/rmdir"
 cleanup_rc=0
 run_replica "$work/cleanup.out" env PATH="$shim:$PATH" || cleanup_rc=$?
 if [ "$cleanup_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=86 expected=86 failures=0 infra=1' "$work/cleanup.out" &&
+   grep -Fxq 'SUMMARY assertions=107 expected=107 failures=0 infra=1' "$work/cleanup.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/cleanup.out"; then
   pass AGG-008 "cleanup uncertainty maps to one hundred twenty-five before the marker"
 else

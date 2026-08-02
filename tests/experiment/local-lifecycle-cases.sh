@@ -6,8 +6,10 @@ subcases=(
   "$repo_root/tests/install/local-install-cases.sh"
   "$repo_root/tests/experiment/local-config-cases.sh"
   "$repo_root/tests/experiment/local-image-catalog-cases.sh"
+  "$repo_root/tests/experiment/install-store-cases.sh"
+  "$repo_root/tests/experiment/install-state-cases.py"
 )
-expected_count=86
+expected_count=107
 work=""
 
 cleanup_work() {
@@ -48,7 +50,12 @@ printf '%s\n' \
   RES-ISOLATE-001 RES-STATE-001 RES-STATE-002 RES-STATE-003 RES-INPUT-001 \
   RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001 \
   M-CAT-OCI-001 M-CAT-SHADOW-001 M-CAT-CAS-001 M-CAT-AUTH-001 M-RES-BIND-001 \
-  M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001 > "$expected"
+  M-CAT-NOEF-001 M-CAT-ADMIT-001 M-CAT-ATOM-001 M-CAT-DUR-001 M-CAT-STAGE-001 \
+  INST-HOME-001 INST-UNKNOWN-001 INST-PERMIT-001 INST-RECEIPT-001 \
+  INST-INSPECT-001 INST-RETRY-001 INST-CONFLICT-001 INST-DENY-001 \
+  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 \
+  IST-STATE-001 IST-LOCK-001 IST-STATE-002 IST-BOUND-001 IST-STATE-003 \
+  IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001 > "$expected"
 : > "$observed"
 
 infrastructure=0
@@ -59,11 +66,22 @@ for index in "${!subcases[@]}"; do
     infrastructure=1
     continue
   fi
-  if bash "$subcase" > "$output" 2>&1; then
-    rc=0
-  else
-    rc=$?
-  fi
+  case "$subcase" in
+    *.py)
+      if python3 -I -B "$subcase" > "$output" 2>&1; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+    *)
+      if bash "$subcase" > "$output" 2>&1; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+  esac
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print}' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
   reported_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"
