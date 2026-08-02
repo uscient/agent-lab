@@ -783,18 +783,19 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
     store_home = support().initialized_home(runtime, root, "store-race-home")
     store_path = store_home / "experiments"
     parked_store = store_home / "experiments-parked"
-    store_before = support().tree_fingerprint(store_path)
     store = load_private_module(
         runtime / "scripts" / "experiment_store.py",
         f"agent_lab_integrity_store_race_{os.getpid()}_{id(root)}",
     )
     store_replaced = False
+    parked_before: tuple[tuple[object, ...], ...] | None = None
     replacement_before: tuple[tuple[object, ...], ...] | None = None
 
     def replace_store_after_lock(point: str) -> None:
-        nonlocal store_replaced, replacement_before
+        nonlocal store_replaced, parked_before, replacement_before
         if point == "experiment store lock.after_acquire" and not store_replaced:
             store_path.rename(parked_store)
+            parked_before = support().tree_fingerprint(parked_store)
             store_path.mkdir(mode=0o700)
             staging = store_path / ".staging"
             staging.mkdir(mode=0o700)
@@ -811,8 +812,8 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
             fault=replace_store_after_lock,
         )
     original_store_preserved = (
-        store_replaced
-        and support().tree_fingerprint(parked_store) == store_before
+        parked_before is not None
+        and support().tree_fingerprint(parked_store) == parked_before
     )
     replacement_store_preserved = (
         replacement_before is not None

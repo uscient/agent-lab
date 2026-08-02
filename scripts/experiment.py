@@ -154,11 +154,30 @@ def reject_non_finite_numbers(value: object) -> None:
             reject_non_finite_numbers(item)
 
 
-def read_manifest_once(path: str) -> bytes:
+def _manifest_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_manifest_once(
+    path: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> bytes:
     try:
         path_stat = os.lstat(path)
     except OSError as error:
         raise InfrastructureError("manifest cannot be inspected") from error
+    if expected is not None and _manifest_identity(path_stat) != _manifest_identity(expected):
+        raise InfrastructureError("manifest identity changed before read")
     if stat.S_ISLNK(path_stat.st_mode):
         raise InfrastructureError("manifest symlinks are not accepted")
     if not stat.S_ISREG(path_stat.st_mode):
@@ -177,7 +196,7 @@ def read_manifest_once(path: str) -> bytes:
         opened_stat = os.fstat(descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):
             raise InfrastructureError("manifest changed to a non-regular file")
-        if (opened_stat.st_dev, opened_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        if _manifest_identity(opened_stat) != _manifest_identity(path_stat):
             raise InfrastructureError("manifest identity changed before read")
         chunks: list[bytes] = []
         remaining = MAX_MANIFEST_BYTES + 1
@@ -199,20 +218,8 @@ def read_manifest_once(path: str) -> bytes:
 
     if len(data) > MAX_MANIFEST_BYTES:
         raise InvalidManifest(f"exceeds the {MAX_MANIFEST_BYTES}-byte limit")
-    before = (
-        opened_stat.st_dev,
-        opened_stat.st_ino,
-        opened_stat.st_size,
-        opened_stat.st_mtime_ns,
-        opened_stat.st_ctime_ns,
-    )
-    after = (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-        final_stat.st_ctime_ns,
-    )
+    before = _manifest_identity(opened_stat)
+    after = _manifest_identity(final_stat)
     if before != after or len(data) != final_stat.st_size:
         raise InfrastructureError("manifest changed while it was read")
     return data
@@ -241,7 +248,7 @@ def read_directory_snapshot(path: str) -> SourceSnapshot:
     authored_mode = stat.S_IMODE(authored_stat.st_mode)
     if authored_mode & 0o111 or authored_mode & 0o022:
         raise InvalidManifest("experiment.cue has a suspicious mode")
-    data = read_manifest_once(authored_path)
+    data = read_manifest_once(authored_path, expected=authored_stat)
     try:
         after = os.listdir(path)
         final_directory_stat = os.lstat(path)

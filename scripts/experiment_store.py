@@ -91,6 +91,10 @@ class HomeAuthority(NamedTuple):
     config_raw: bytes
     receipt_raw: bytes
     store_device: int
+    store_identity: tuple[int, int]
+    staging_identity: tuple[int, int]
+    state_identity: tuple[int, int]
+    locks_identity: tuple[int, int]
 
 
 class VerifiedInstall(NamedTuple):
@@ -395,9 +399,9 @@ def _load_home(home: Path) -> HomeAuthority:
         staging = store / ".staging"
         locks = state / "locks"
         store_metadata = _verify_directory(store)
-        _verify_directory(state)
-        _verify_directory(locks)
-        _verify_directory(staging, device=store_metadata.st_dev)
+        state_metadata = _verify_directory(state)
+        locks_metadata = _verify_directory(locks)
+        staging_metadata = _verify_directory(staging, device=store_metadata.st_dev)
         lock = locks / "experiments.lock"
         try:
             lock_metadata = lock.lstat()
@@ -420,6 +424,10 @@ def _load_home(home: Path) -> HomeAuthority:
             config_raw,
             receipt_raw,
             store_metadata.st_dev,
+            (store_metadata.st_dev, store_metadata.st_ino),
+            (staging_metadata.st_dev, staging_metadata.st_ino),
+            (state_metadata.st_dev, state_metadata.st_ino),
+            (locks_metadata.st_dev, locks_metadata.st_ino),
         )
     except StoreError:
         raise
@@ -446,11 +454,17 @@ def _revalidate_authority(authority: HomeAuthority) -> None:
     ):
         _infra("Agent Lab configuration changed during installation")
     store = _verify_directory(authority.store)
-    _verify_directory(authority.state)
-    _verify_directory(authority.locks)
-    _verify_directory(authority.staging, device=store.st_dev)
-    if store.st_dev != authority.store_device:
-        _infra("Experiment store filesystem changed during installation")
+    state = _verify_directory(authority.state)
+    locks = _verify_directory(authority.locks)
+    staging = _verify_directory(authority.staging, device=store.st_dev)
+    if (
+        store.st_dev != authority.store_device
+        or (store.st_dev, store.st_ino) != authority.store_identity
+        or (staging.st_dev, staging.st_ino) != authority.staging_identity
+        or (state.st_dev, state.st_ino) != authority.state_identity
+        or (locks.st_dev, locks.st_ino) != authority.locks_identity
+    ):
+        _infra("Experiment store directory authority changed during installation")
 
 
 @contextmanager
