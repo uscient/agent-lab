@@ -156,13 +156,53 @@ else
   fail M-FMT-001 "source-domain mutation changes the independent identity"
 fi
 
+if python3 -I - "$repo_root/scripts/experiment.py" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+import sys
+spec = spec_from_file_location("experiment_resolver", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+subject = "registry.example/lab/base@sha256:" + "b" * 64
+plan = {
+    "apiVersion": "agent-lab.request/v0alpha1",
+    "contract": {"digest": "sha256:" + "a" * 64, "name": "agent-lab.experiment", "version": "v0alpha1"},
+    "kind": "RequestedExperimentPlan",
+    "metadata": {"requestedName": "resolver-test"},
+    "spec": {"members": [{
+        "command": [], "name": "one", "resourceClass": "small",
+        "requestedSelector": {"catalogName": "agent-lab.base"},
+    }]},
+}
+catalog = {
+    "apiVersion": "agent-lab.experiment-images/v0alpha1",
+    "entries": [{"name": "agent-lab.base", "subject": subject}],
+}
+resolved = module.resolve_plan(plan, Path("/nonexistent"), catalog)
+image = resolved["spec"]["members"][0]["resolvedImage"]
+assert image["origin"] == "agent-lab"
+assert image["subject"] == subject
+assert image["generation"] == 1
+assert image["entryDigest"].startswith("sha256:")
+assert module.valid_catalog_name("vendor.image")
+for invalid in ("Agent.image", "vendor.image.extra", "vendor_1.image", "a" * 32 + ".image", "vendor.é"):
+    assert not module.valid_catalog_name(invalid), invalid
+PY
+then
+  pass SEL-002 "trusted bundled resolution binds exact names, subjects, and entry identity"
+else
+  fail SEL-002 "trusted bundled resolution binds exact names, subjects, and entry identity"
+fi
+
 expected="$work/expected"
 printf '%s\n' \
   FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 \
-  FMT-008 SEL-001 CUE-001 FMT-009 M-FMT-001 > "$expected"
+  FMT-008 SEL-001 CUE-001 FMT-009 M-FMT-001 SEL-002 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA assertion identity drift\n' >&2
   exit 125
 fi
-printf 'SUMMARY assertions=12 expected=12 failures=%s infra=0\n' "$failures"
+printf 'SUMMARY assertions=13 expected=13 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
