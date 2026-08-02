@@ -37,6 +37,25 @@ else
   fail CAT-003 "different-subject add never overwrites"
 fi
 
+cp -a "$repo_root/.cache/dev/tools/cue/." "$home/cache/tools/cue/"
+artifact="$work/catalog-artifact"
+mkdir "$artifact"
+sed 's#image: digestRef: "[^"]*"#image: catalogName: "vendor.worker"#' \
+  "$repo_root/tests/experiment/fixtures/directories/minimal/experiment.cue" > "$artifact/experiment.cue"
+capture "$agent_lab" --home "$home" experiment check "$artifact"
+if [ "$RC" -eq 0 ] && jq -e --arg entry "$entry" --arg subject "$subject" '
+  .plan.spec.members[0].resolvedImage == {
+    entryDigest: $entry,
+    generation: 1,
+    origin: "local",
+    subject: $subject
+  }
+' "$work/out" >/dev/null 2>&1; then
+  pass RES-001 "Experiment resolution binds the active local entry and subject"
+else
+  fail RES-001 "Experiment resolution binds the active local entry and subject"
+fi
+
 capture "$agent_lab" --home "$home" image remove vendor.worker --expect "$entry"
 if [ "$RC" -eq 0 ] && jq -e '.changed == true and .generation == 2 and .state == "removed"' "$work/out" >/dev/null 2>&1; then
   pass CAT-004 "exact CAS removal publishes a generation-two tombstone"
@@ -58,5 +77,5 @@ else
   fail CAT-006 "list all reports the immutable tombstone"
 fi
 
-printf 'SUMMARY assertions=6 expected=6 failures=%s infra=0\n' "$failures"
+printf 'SUMMARY assertions=7 expected=7 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
