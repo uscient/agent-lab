@@ -218,7 +218,17 @@ def read_directory_snapshot(path: str) -> SourceSnapshot:
         raise InfrastructureError("source directory cannot be listed") from error
     if before != ["experiment.cue"]:
         raise InvalidManifest("directory must contain only experiment.cue")
-    data = read_manifest_once(os.path.join(path, "experiment.cue"))
+    authored_path = os.path.join(path, "experiment.cue")
+    try:
+        authored_stat = os.lstat(authored_path)
+    except OSError as error:
+        raise InfrastructureError("authored file cannot be inspected") from error
+    if authored_stat.st_nlink != 1:
+        raise InvalidManifest("experiment.cue must have one link")
+    authored_mode = stat.S_IMODE(authored_stat.st_mode)
+    if authored_mode & 0o111 or authored_mode & 0o022:
+        raise InvalidManifest("experiment.cue has a suspicious mode")
+    data = read_manifest_once(authored_path)
     try:
         after = os.listdir(path)
         final_directory_stat = os.lstat(path)

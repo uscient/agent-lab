@@ -47,7 +47,8 @@ fi
 
 linked="$work/linked"
 mkdir "$linked"
-ln "$fixture/experiment.cue" "$linked/experiment.cue"
+cp "$fixture/experiment.cue" "$work/hardlink-source"
+ln "$work/hardlink-source" "$linked/experiment.cue"
 capture "$agent_lab" experiment check "$linked"
 if [ "$CAPTURE_RC" -eq 1 ] && [ ! -s "$work/stdout" ]; then
   pass FMT-005 "a multiply linked authored file is refused"
