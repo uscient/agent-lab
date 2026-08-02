@@ -1499,10 +1499,11 @@ def test_output_limits(work: Path) -> None:
     )
 
 
-def residual_flood_fixture(work: Path) -> tuple[Path, Path, Path]:
+def residual_flood_fixture(work: Path) -> tuple[Path, Path, Path, Path]:
     work.mkdir(parents=True, exist_ok=True)
     completion = work / "descendant-flood-completed"
     group_file = work / "residual-flood.group"
+    ready = work / "residual-flood.ready"
     flood = write_script(
         work,
         "residual-flood.sh",
@@ -1522,7 +1523,9 @@ PY
     : > "$FLOOD_COMPLETION"
     exit 0
   }
+  sleep "$FLOOD_ARM_DELAY"
   trap flood TERM
+  : > "$FLOOD_READY"
   while :; do sleep 1; done
 ) &
 exit 0
@@ -1536,11 +1539,12 @@ exit 0
         ),
         completion,
         group_file,
+        ready,
     )
 
 
 def test_residual_cleanup_output_limit(work: Path) -> None:
-    manifest, completion, group_file = residual_flood_fixture(work)
+    manifest, completion, group_file, ready = residual_flood_fixture(work)
     small_helper = transformed_helper(
         work,
         "residual-output-limit",
@@ -1566,8 +1570,10 @@ def test_residual_cleanup_output_limit(work: Path) -> None:
         1,
         helper=small_helper,
         extra_env={
+            "FLOOD_ARM_DELAY": "0.2",
             "FLOOD_COMPLETION": str(completion),
             "GROUP_FILE": str(group_file),
+            "FLOOD_READY": str(ready),
         },
     )
     check(result.rc == 125, "residual descendant output overflow returns infrastructure")
@@ -1911,14 +1917,16 @@ def test_sensitivity_mutants(work: Path) -> None:
     if residual_mutant is not None:
         fixture_work = work / "mutant-residual-output"
         fixture_work.mkdir(parents=True, exist_ok=True)
-        manifest, completion, group_file = residual_flood_fixture(fixture_work)
+        manifest, completion, group_file, ready = residual_flood_fixture(fixture_work)
         result = run_gate(
             manifest,
             1,
             helper=residual_mutant,
             extra_env={
+                "FLOOD_ARM_DELAY": "0.2",
                 "FLOOD_COMPLETION": str(completion),
                 "GROUP_FILE": str(group_file),
+                "FLOOD_READY": str(ready),
             },
         )
         check(
