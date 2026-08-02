@@ -58,6 +58,8 @@ Lab never extracts the archive or chooses a destination from caller data. The no
 digest is identical to directory intake for identical authored bytes; installation provenance also
 records the raw archive byte count and SHA-256 digest. Archive identity does not affect the plan,
 authorization binding, installation key, or idempotent cross-transport retry.
+Regular-file attributes are interpreted only for Unix and DOS-compatible FAT, NTFS, and VFAT
+creator systems; other creator systems are rejected when their member type cannot be proven.
 
 An exact retry freshly validates and authorizes again, verifies the complete installed envelope,
 and returns `changed:false` with the same `installationKey` and `receiptDigest`. The same requested

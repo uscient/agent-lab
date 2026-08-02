@@ -500,7 +500,7 @@ def read_zip_snapshot(path: str) -> SourceSnapshot:
     unix_type = stat.S_IFMT(unix_mode)
     dos_attributes = external_attributes & 0xFFFF
     if (
-        create_system not in (0, 3)
+        create_system not in (0, 3, 10, 14)
         or dos_attributes & 0x18
         or (create_system == 3 and unix_type not in (0, stat.S_IFREG))
     ):
