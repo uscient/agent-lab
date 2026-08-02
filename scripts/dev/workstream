@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  scripts/dev/workstream start SLUG
+  scripts/dev/workstream slice NAME
+  scripts/dev/workstream pr [gh-pr-create options]
+  scripts/dev/workstream merge PR_NUMBER
+  scripts/dev/workstream final [gh-pr-create options]
+EOF
+  exit 2
+}
+
+die() { printf 'INFRA workstream: %s\n' "$1" >&2; exit 125; }
+refuse() { printf 'REFUSE workstream: %s\n' "$1" >&2; exit 1; }
+
+valid_component() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]
+}
+
+real_gh=""
+shim="$(readlink -f "$repo_root/tools/bin/gh" 2>/dev/null || true)"
+while IFS= read -r candidate; do
+  resolved="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+  [ "$resolved" = "$shim" ] && continue
+  real_gh="$candidate"
+  break
+done < <(type -aP gh 2>/dev/null)
+[ -n "$real_gh" ] || die "gh is unavailable"
+command -v jq >/dev/null 2>&1 || die "jq is unavailable"
+
+current_branch() {
+  git -C "$repo_root" symbolic-ref --short -q HEAD 2>/dev/null \
+    || die "the checkout is detached"
+}
+
+reject_routing_options() {
+  local argument
+  for argument in "$@"; do
+    case "$argument" in
+      --base | --base=* | -B | -B?* | --head | --head=* | -H | -H?* | \
+      --repo | --repo=* | -R | -R?* | --hostname | --hostname=*)
+        refuse "base, head, repository, and hostname are derived from the workstream"
+        ;;
+    esac
+  done
+}
+
+command_name="${1:-}"
+[ -n "$command_name" ] || usage
+shift
+
+case "$command_name" in
+  start)
+    [ "$#" -eq 1 ] || usage
+    slug="$1"
+    valid_component "$slug" || refuse "invalid workstream slug: $slug"
+    [ -z "$(git -C "$repo_root" status --porcelain)" ] || refuse "the tracked checkout is not clean"
+    git -C "$repo_root" fetch origin dev
+    dev_sha="$(git -C "$repo_root" rev-parse --verify origin/dev)" \
+      || die "origin/dev is unavailable"
+    repository="$($real_gh repo view --json nameWithOwner --jq .nameWithOwner)" \
+      || die "cannot resolve the current GitHub repository"
+    [ -n "$repository" ] || die "GitHub returned an empty repository identity"
+    "$real_gh" api --method POST "repos/$repository/git/refs" \
+      -f "ref=refs/heads/work/$slug" -f "sha=$dev_sha" >/dev/null \
+      || die "cannot create work/$slug at origin/dev"
+    git -C "$repo_root" fetch origin "work/$slug"
+    git -C "$repo_root" switch -c "work/$slug" --track "origin/work/$slug"
+    ;;
+  slice)
+    [ "$#" -eq 1 ] || usage
+    name="$1"
+    valid_component "$name" || refuse "invalid slice name: $name"
+    branch="$(current_branch)"
+    case "$branch" in
+      work/*) slug="${branch#work/}" ;;
+      *) refuse "slice creation requires the matching work/<slug> branch" ;;
+    esac
+    valid_component "$slug" || refuse "invalid current workstream branch"
+    [ -z "$(git -C "$repo_root" status --porcelain)" ] || refuse "the tracked checkout is not clean"
+    git -C "$repo_root" fetch origin "work/$slug"
+    git -C "$repo_root" switch -c "slice/$slug/$name" "origin/work/$slug"
+    ;;
+  pr)
+    reject_routing_options "$@"
+    branch="$(current_branch)"
+    case "$branch" in
+      slice/*/*)
+        remainder="${branch#slice/}"
+        slug="${remainder%%/*}"
+        name="${remainder#*/}"
+        ;;
+      *) refuse "slice PR creation requires slice/<slug>/<name>" ;;
+    esac
+    valid_component "$slug" && valid_component "$name" \
+      || refuse "invalid slice branch"
+    exec "$real_gh" pr create --base "work/$slug" --head "$branch" "$@"
+    ;;
+  merge)
+    [ "$#" -eq 1 ] || usage
+    pr_number="$1"
+    [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || refuse "PR number must be a positive integer"
+    metadata="$($real_gh pr view "$pr_number" \
+      --json number,state,isDraft,baseRefName,headRefName,headRefOid,mergeStateStatus,reviewDecision,statusCheckRollup)" \
+      || die "cannot read PR $pr_number"
+    if ! printf '%s' "$metadata" | jq -e '
+      .state == "OPEN" and
+      (.isDraft == false) and
+      (.baseRefName | test("^work/[a-z0-9][a-z0-9-]{0,47}$")) and
+      (.headRefName | test("^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$")) and
+      ((.baseRefName | sub("^work/"; "")) ==
+       (.headRefName | capture("^slice/(?<slug>[^/]+)/").slug)) and
+      (.headRefOid | test("^[0-9a-f]{40}$")) and
+      (.mergeStateStatus == "CLEAN") and
+      (.reviewDecision != "CHANGES_REQUESTED") and
+      ((.statusCheckRollup | length) > 0) and
+      (any(.statusCheckRollup[]; .name == "Required gates" and
+        .status == "COMPLETED" and .conclusion == "SUCCESS")) and
+      (all(.statusCheckRollup[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
+    ' >/dev/null; then
+      refuse "PR $pr_number is not a clean matching slice with every check successful"
+    fi
+    head_sha="$(printf '%s' "$metadata" | jq -r .headRefOid)"
+    exec "$real_gh" pr merge "$pr_number" --merge --match-head-commit "$head_sha"
+    ;;
+  final)
+    reject_routing_options "$@"
+    branch="$(current_branch)"
+    case "$branch" in
+      work/*) slug="${branch#work/}" ;;
+      *) refuse "final PR creation requires work/<slug>" ;;
+    esac
+    valid_component "$slug" || refuse "invalid current workstream branch"
+    exec "$real_gh" pr create --base dev --head "$branch" --draft "$@"
+    ;;
+  *) usage ;;
+esac

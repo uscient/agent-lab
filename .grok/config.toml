@@ -76,6 +76,7 @@ allow = [
   "Bash(git rebase*)",
   "Bash(git push*)",
   "Bash(gh pr*)",
+  "Bash(gh run*)",
   "Bash(cat*)",
   "Bash(ls*)",
   "Bash(grep*)",

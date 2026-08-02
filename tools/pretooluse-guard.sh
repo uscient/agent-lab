@@ -241,7 +241,15 @@ validate_push() {
 validate_gh() {
   local words=() sub arg i base="" head=""
   read -r -a words <<<"$scan"
-  [ "${words[0]:-}" = gh ] && [ "${words[1]:-}" = pr ] || return 1
+  [ "${words[0]:-}" = gh ] || return 1
+  if [ "${words[1]:-}" = run ]; then
+    case "${words[2]:-}" in list | view | watch) ;; *) return 1 ;; esac
+    for arg in "${words[@]:3}"; do
+      case "$arg" in -R | -R?* | --repo | --repo=* | --hostname | --hostname=*) return 1 ;; esac
+    done
+    return 0
+  fi
+  [ "${words[1]:-}" = pr ] || return 1
   sub="${words[2]:-}"
   for arg in "${words[@]:3}"; do
     case "$arg" in -R | -R?* | --repo | --repo=* | --hostname | --hostname=*) return 1 ;; esac
@@ -332,7 +340,7 @@ if matches_line "$scan" "$git_remote_rebase_re"; then
 fi
 if matches_line "$shell_scan" "$gh_command_re" \
   && ! is_nonexecuting_search_data "$scan"; then
-  validate_gh || block "GitHub access is limited to direct read-only PR commands and creating the current work branch PR with explicit base dev" "Autonomy boundary"
+  validate_gh || block "GitHub access is limited to direct read-only PR/Actions commands and creating the current work branch PR with explicit base dev" "Autonomy boundary"
 fi
 
 match_any "$scan" "$pol/deny.patterns" \

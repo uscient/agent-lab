@@ -21,6 +21,7 @@ prefix_rule(pattern = ["git", "merge"], decision = "allow", justification = "age
 prefix_rule(pattern = ["git", "rebase"], decision = "allow", justification = "agent-lab local-git set")
 prefix_rule(pattern = ["git", "push"], decision = "allow", justification = "agent-lab local-git set")
 prefix_rule(pattern = ["gh", "pr"], decision = "allow", justification = "agent-lab scoped GitHub workflow")
+prefix_rule(pattern = ["gh", "run"], decision = "allow", justification = "agent-lab scoped GitHub workflow")
 
 # -- forbidden: authentication and remote mutations outside the scoped workflow --
 prefix_rule(pattern = ["git", "pull"], decision = "forbidden", justification = "agent-lab: outside the AGENTS.md scoped workflow")
