@@ -436,10 +436,26 @@ def read_git_snapshot(
         raise InfrastructureError("git provider GIT-BLOB response is inconsistent")
     encoded = blob_value["content"]
     assert isinstance(encoded, str)
-    if not encoded.isascii() or len(encoded) > ((MAX_SOURCE_BYTES + 2) // 3) * 4:
+    encoded_size = ((blob_size + 2) // 3) * 4
+    if not encoded.isascii() or "\r" in encoded:
+        raise InfrastructureError("git provider GIT-BLOB encoding exceeded its bound")
+    if "\n" in encoded:
+        if not encoded.endswith("\n"):
+            raise InfrastructureError("git provider GIT-BLOB wrapping is malformed")
+        lines = encoded[:-1].split("\n")
+        if (
+            not lines
+            or any(len(line) != 60 for line in lines[:-1])
+            or not 1 <= len(lines[-1]) <= 60
+        ):
+            raise InfrastructureError("git provider GIT-BLOB wrapping is malformed")
+        compact = "".join(lines)
+    else:
+        compact = encoded
+    if len(compact) != encoded_size:
         raise InfrastructureError("git provider GIT-BLOB encoding exceeded its bound")
     try:
-        data = base64.b64decode(encoded, validate=True)
+        data = base64.b64decode(compact, validate=True)
     except (ValueError, base64.binascii.Error) as error:
         raise InfrastructureError("git provider GIT-BLOB encoding is malformed") from error
     if len(data) != blob_size or _git_object_id("blob", data) != blob_id:
