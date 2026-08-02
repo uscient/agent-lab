@@ -340,6 +340,28 @@ def main() -> int:
             u32(data, central + 38, 0x20),
         ),
     )
+    fixtures["ntfs-device.zip"] = mutate(
+        stored,
+        lambda data, _local, central, _eocd: (
+            u16(
+                data,
+                central + 4,
+                (10 << 8) | (struct.unpack_from("<H", data, central + 4)[0] & 0x00FF),
+            ),
+            u32(data, central + 38, 0x40),
+        ),
+    )
+    fixtures["ntfs-reparse.zip"] = mutate(
+        stored,
+        lambda data, _local, central, _eocd: (
+            u16(
+                data,
+                central + 4,
+                (10 << 8) | (struct.unpack_from("<H", data, central + 4)[0] & 0x00FF),
+            ),
+            u32(data, central + 38, 0x420),
+        ),
+    )
     fixtures["vfat-archive-file.zip"] = mutate(
         stored,
         lambda data, _local, central, _eocd: (
