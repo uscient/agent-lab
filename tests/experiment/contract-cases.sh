@@ -6,7 +6,7 @@ subcases=(
   "$repo_root/tests/experiment/directory-intake-cases.sh"
   "$repo_root/tests/experiment/aggregate-harness-cases.sh"
 )
-expected_count=22
+expected_count=25
 work=""
 
 cleanup_work() {
@@ -31,7 +31,8 @@ observed="$work/observed"
 printf '%s\n' \
   FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 FMT-008 \
   SEL-001 CUE-001 FMT-009 M-FMT-001 SEL-002 \
-  AGG-001 AGG-002 AGG-003 AGG-004 AGG-005 AGG-006 AGG-007 AGG-008 AGG-009 > "$expected"
+  AGG-001 AGG-002 AGG-003 AGG-004 AGG-005 AGG-006 AGG-007 AGG-008 AGG-009 \
+  AGG-010 AGG-011 AGG-012 > "$expected"
 : > "$observed"
 
 infrastructure=0
