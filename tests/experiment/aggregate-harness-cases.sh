@@ -3,7 +3,7 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
-expected_count=12
+expected_count=13
 work=""
 
 cleanup_work() {
@@ -112,6 +112,16 @@ write_fixture() {
       printf '  descendant_pid=$!\n'
       printf '  printf "%%s\\n" "$descendant_pid" > "$AGENT_LAB_AGG_SIGNAL_DIR/descendant.pid" || exit 125\n'
       printf '  : > "$AGENT_LAB_AGG_SIGNAL_DIR/ready" || exit 125\n'
+      printf '  wait "$descendant_pid"\n'
+      printf 'fi\n'
+      printf 'if [ -n "${AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR:-}" ]; then\n'
+      printf '  (\n'
+      printf "    trap '' HUP INT QUIT TERM\n"
+      printf '    printf "%%s\\n" "$BASHPID" > "$AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR/descendant.pid" || exit 125\n'
+      printf '    : > "$AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR/ready" || exit 125\n'
+      printf '    sleep 30\n'
+      printf '  ) &\n'
+      printf '  descendant_pid=$!\n'
       printf '  wait "$descendant_pid"\n'
       printf 'fi\n'
     fi
@@ -232,7 +242,7 @@ wait_for_process_exit() {
   local attempts=0
   while kill -0 "$pid" 2>/dev/null; do
     attempts=$((attempts + 1))
-    [ "$attempts" -lt 500 ] || return 1
+    [ "$attempts" -lt 100 ] || return 1
     sleep 0.01
   done
 }
@@ -478,8 +488,10 @@ fi
 
 reset_fixtures
 signal_dir="$work/signal"
-mkdir "$signal_dir"
+signal_tmp="$work/signal-tmp"
+mkdir "$signal_dir" "$signal_tmp"
 AGENT_LAB_AGG_SIGNAL_DIR="$signal_dir" \
+  TMPDIR="$signal_tmp" \
   python3 -I -B -c \
     'import os, sys; os.setsid(); os.execvpe("bash", ["bash", sys.argv[1]], os.environ)' \
     "$replica_lifecycle" > "$work/signal.out" 2>&1 &
@@ -501,12 +513,64 @@ descendant_gone=0
 if [ -n "$descendant_pid" ] && wait_for_process_exit "$descendant_pid"; then
   descendant_gone=1
 fi
-kill -KILL -- "-$signal_pid" 2>/dev/null || true
+if [ "$descendant_gone" -ne 1 ]; then
+  surviving_group="$(ps -o pgid= -p "$descendant_pid" 2>/dev/null || true)"
+  surviving_group="${surviving_group//[[:space:]]/}"
+  if [ "$surviving_group" = "$signal_pid" ]; then
+    kill -KILL -- "-$signal_pid" 2>/dev/null || true
+    wait_for_process_exit "$descendant_pid" || true
+  fi
+fi
 if [ "$signal_rc" -eq 0 ] && [ "$observed_signal_rc" -eq 143 ] &&
    [ "$descendant_gone" -eq 1 ]; then
   pass AGG-012 "termination reaps active descendants before lifecycle exit"
 else
   fail AGG-012 "termination reaps active descendants before lifecycle exit"
+fi
+
+reset_fixtures
+stubborn_dir="$work/stubborn-signal"
+stubborn_tmp="$work/stubborn-tmp"
+mkdir "$stubborn_dir" "$stubborn_tmp"
+AGENT_LAB_AGG_STUBBORN_SIGNAL_DIR="$stubborn_dir" \
+  TMPDIR="$stubborn_tmp" \
+  python3 -I -B -c \
+    'import os, sys; os.setsid(); os.execvpe("bash", ["bash", sys.argv[1]], os.environ)' \
+    "$replica_lifecycle" > "$work/stubborn-signal.out" 2>&1 &
+stubborn_leader=$!
+stubborn_rc=0
+stubborn_pid=""
+if wait_for_path "$stubborn_dir/ready" &&
+   IFS= read -r stubborn_pid < "$stubborn_dir/descendant.pid" &&
+   [[ "$stubborn_pid" =~ ^[0-9]+$ ]] &&
+   kill -0 "$stubborn_pid" 2>/dev/null; then
+  kill -TERM "$stubborn_leader" 2>/dev/null || true
+else
+  stubborn_rc=125
+  kill -TERM "$stubborn_leader" 2>/dev/null || true
+fi
+observed_stubborn_rc=0
+wait "$stubborn_leader" || observed_stubborn_rc=$?
+stubborn_alive=0
+stubborn_output_preserved=0
+if [ -n "$stubborn_pid" ] && kill -0 "$stubborn_pid" 2>/dev/null; then
+  stubborn_alive=1
+  stubborn_output="$(readlink "/proc/$stubborn_pid/fd/1" 2>/dev/null || true)"
+  if [ -n "$stubborn_output" ] && [ -e "$stubborn_output" ]; then
+    stubborn_output_preserved=1
+  fi
+fi
+stubborn_group="$(ps -o pgid= -p "$stubborn_pid" 2>/dev/null || true)"
+stubborn_group="${stubborn_group//[[:space:]]/}"
+if [ "$stubborn_group" = "$stubborn_leader" ]; then
+  kill -KILL -- "-$stubborn_leader" 2>/dev/null || true
+  wait_for_process_exit "$stubborn_pid" || true
+fi
+if [ "$stubborn_rc" -eq 0 ] && [ "$observed_stubborn_rc" -eq 143 ] &&
+   [ "$stubborn_alive" -eq 1 ] && [ "$stubborn_output_preserved" -eq 1 ]; then
+  pass AGG-013 "signal exit preserves work owned by an uncooperative descendant"
+else
+  fail AGG-013 "signal exit preserves work owned by an uncooperative descendant"
 fi
 
 cleanup_infrastructure=0
