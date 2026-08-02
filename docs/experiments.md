@@ -39,6 +39,17 @@ effective home's pinned tool cache; it does not depend on a source checkout.
 Each member selects either an exact digest-pinned OCI reference with `digestRef` or a shared name
 with `catalogName`. Shared names have exactly two bounded lowercase components, `<vendor>.<image>`.
 The `agent-lab.*` namespace belongs to the release-owned bundled catalog; the catalog is initially
-empty. Other namespaces are reserved for the operator-local catalog introduced by the local image
-catalog work. A name is resolved to an immutable subject before authorization. Catalog membership
+empty. Other valid namespaces belong to the operator-local catalog shared by every Experiment using
+the same effective home:
+
+```bash
+agent-lab image add vendor.image registry.example/team/image@sha256:<64 lowercase hex>
+agent-lab image inspect vendor.image
+agent-lab image list [--all]
+agent-lab image remove vendor.image --expect sha256:<entry digest>
+```
+
+Add records a mapping only. Same-subject add is idempotent; a different subject never overwrites.
+Remove uses the active entry digest as a compare-and-swap token, creates a generation-two tombstone,
+and makes the name non-reusable in v0. A name is resolved to an immutable subject before authorization. Catalog membership
 is naming only, not image presence, admission, safety, or runnable status.
