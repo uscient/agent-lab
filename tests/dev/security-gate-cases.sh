@@ -363,6 +363,20 @@ suite fixture-empty $work/empty.sh PASS fixture
 EOF
 expect_rc 1 "empty zero-exit suite blocks the gate" "$work/empty.manifest" "missing completion marker"
 
+for marker_case in duplicate nonfinal prefixed suffixed; do
+  case "$marker_case" in
+    duplicate) marker_output=$'DONE exact\nDONE exact' ;;
+    nonfinal) marker_output=$'DONE exact\nafter cleanup' ;;
+    prefixed) marker_output='prefix DONE exact' ;;
+    suffixed) marker_output='DONE exact suffix' ;;
+  esac
+  write_script "$work/marker-$marker_case.sh" "$marker_output" 0
+  printf 'suite marker-%s %s DONE exact\n' \
+    "$marker_case" "$work/marker-$marker_case.sh" > "$work/marker-$marker_case.manifest"
+  expect_rc 1 "CI-005 rejects $marker_case completion markers" \
+    "$work/marker-$marker_case.manifest" "invalid completion marker"
+done
+
 cat > "$work/missing-tool.manifest" <<EOF
 tool agent_lab_missing_tool_for_test
 suite fixture-pass $work/pass.sh PASS fixture

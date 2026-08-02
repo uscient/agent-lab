@@ -864,6 +864,89 @@ def test_child_signal_mask(work: Path) -> None:
     check(result.rc == 0, "suite child inherits no blocked HUP INT QUIT or TERM")
 
 
+def test_ci_foundation_limits_and_deadlines(work: Path) -> None:
+    helper = load_helper()
+    check(
+        getattr(helper, "MODE_LIMITS", None)
+        == {"fast": (120.0, 600.0, 3.0), "docker": (900.0, 1800.0, 15.0)},
+        "CI-010 production suite phase and cleanup limits are exact",
+    )
+    check(
+        getattr(helper, "PREFLIGHT_EXECUTION_SECONDS", None) == 30.0
+        and getattr(helper, "PREFLIGHT_TERMINATION_SECONDS", None) == 1.0,
+        "CI-010 Docker preflight limits are exact",
+    )
+
+    timed_helper = transformed_helper(
+        work,
+        "short-deadlines",
+        (
+            (
+                '"fast": (120.0, 600.0, 3.0)',
+                '"fast": (0.15, 0.45, 0.05)',
+            ),
+            (
+                '"docker": (900.0, 1800.0, 15.0)',
+                '"docker": (0.15, 0.30, 0.05)',
+            ),
+            ("PREFLIGHT_EXECUTION_SECONDS = 30.0", "PREFLIGHT_EXECUTION_SECONDS = 0.15"),
+            ("PREFLIGHT_TERMINATION_SECONDS = 1.0", "PREFLIGHT_TERMINATION_SECONDS = 0.05"),
+        ),
+    )
+    if timed_helper is None:
+        fail_test("CI-001 through CI-011 deadline contract is implemented")
+        return
+
+    fixture = work / "fixtures"
+    hanging = write_script(fixture, "hang.sh", "printf 'DONE hang\\n'\nsleep 30\n")
+    passing = write_script(fixture, "pass.sh", "printf 'DONE pass\\n'\n")
+    queued = write_script(
+        fixture,
+        "queued.sh",
+        "printf 'queued\\n' >> \"$EXEC_LOG\"\nprintf 'DONE queued\\n'\n",
+    )
+    manifest = write_manifest(
+        fixture,
+        "suite-timeout.manifest",
+        [("hang", hanging, "DONE hang"), ("pass", passing, "DONE pass"), ("queued", queued, "DONE queued")],
+    )
+    execution_log = fixture / "execution.log"
+    result = run_gate(
+        manifest,
+        2,
+        helper=timed_helper,
+        extra_env={"EXEC_LOG": str(execution_log)},
+    )
+    check(result.rc == 125 and result.seconds < 2.0, "CI-001 and CI-004 suite timeout is bounded infrastructure")
+    check(
+        execution_log.read_text(encoding="utf-8").splitlines() == ["queued"],
+        "CI-008 fast timeout preserves completing and queued siblings",
+    )
+    check(headings(result.stdout) == ["hang", "pass", "queued"], "CI-008 timeout evidence remains manifest ordered")
+
+    phase_log = fixture / "phase.log"
+    phase_hang = write_script(fixture, "phase-hang.sh", "sleep 30\n")
+    phase_queued = write_script(
+        fixture,
+        "phase-queued.sh",
+        "printf 'launched\\n' >> \"$PHASE_LOG\"\nprintf 'DONE phase queued\\n'\n",
+    )
+    phase_manifest = write_manifest(
+        fixture,
+        "phase-timeout.manifest",
+        [("phase-hang", phase_hang, "DONE phase hang"), ("phase-queued", phase_queued, "DONE phase queued")],
+    )
+    phase_result = run_gate(
+        phase_manifest,
+        1,
+        mode="docker",
+        helper=timed_helper,
+        extra_env={"PHASE_LOG": str(phase_log), "PATH": str(fixture) + os.pathsep + os.environ["PATH"]},
+    )
+    check(phase_result.rc == 125 and phase_result.seconds < 2.0, "CI-006 and CI-011 Docker deadline is bounded infrastructure")
+    check(not phase_log.exists(), "CI-011 Docker timeout launches no queued suite")
+
+
 def process_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -1837,6 +1920,7 @@ def main() -> int:
         test_evidence_tampering(work / "evidence-tampering")
         test_cross_suite_capture_forgery(work / "cross-capture")
         test_child_signal_mask(work / "child-mask")
+        test_ci_foundation_limits_and_deadlines(work / "ci-foundation")
         test_signal_cleanup(work / "signal")
         test_output_limits(work / "output-limits")
         test_residual_cleanup_output_limit(work / "residual-output")
