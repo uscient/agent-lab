@@ -1032,9 +1032,14 @@ MUTATIONS: tuple[Mutation, ...] = (
             '            )\n'
             '        else:\n'
             '            Path(mutation_marker).touch()\n'
+            '            _fsync_directory(\n'
+            '                payload / "artifact",\n'
+            '                "Experiment committed records",\n'
+            '                modes=(0o500,),\n'
+            '            )\n'
         ),
         probe_publication_durability,
-        "the durability oracle detects publication before committed-directory fsync",
+        "the durability oracle detects committed-directory fsync path substitution",
     ),
     Mutation(
         "M-STORE-LAYOUT-001",
