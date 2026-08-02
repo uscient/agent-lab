@@ -1528,7 +1528,13 @@ PY
   : > "$FLOOD_READY"
   while :; do sleep 1; done
 ) &
-exit 0
+for ((attempt = 0; attempt < 500; attempt++)); do
+  if [ -f "$FLOOD_READY" ]; then
+    exit 0
+  fi
+  sleep 0.002
+done
+exit 125
 """,
     )
     return (
