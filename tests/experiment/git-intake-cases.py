@@ -1201,11 +1201,13 @@ def main() -> int:
                     experiment.GIT_ACQUISITION_TIMEOUT_SECONDS = original_timeout
 
                 original_worker_requester = experiment._github_api_request
+                worker_started_marker = Path(raw_home) / "timeout-worker-started"
 
                 def hanging_worker_requester(
                     _authority, _path, _headers, _maximum, _deadline
                 ):
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    worker_started_marker.touch()
                     while True:
                         signal.pause()
 
@@ -1215,7 +1217,11 @@ def main() -> int:
                 calibration_elapsed = (
                     __import__("time").monotonic() - calibration_started
                 )
-                worker_timeout_budget = 0.05
+                worker_operation_budget = 0.25
+                worker_cleanup_reserve = 2 * experiment.GIT_WORKER_GRACE_SECONDS
+                worker_timeout_budget = (
+                    worker_operation_budget + worker_cleanup_reserve
+                )
                 worker_timeout_tolerance = min(
                     0.10,
                     max(0.05, 4 * max(0.0, calibration_elapsed - 0.01)),
@@ -1243,9 +1249,11 @@ def main() -> int:
                         "GIT-TIMEOUT-001",
                         "GIT-TIMEOUT" in timeout_outcome
                         and "GIT-TIMEOUT" in worker_timeout_outcome
+                        and worker_started_marker.is_file()
+                        and worker_timeout_budget > worker_cleanup_reserve
                         and worker_timeout_elapsed
                         <= worker_timeout_budget + worker_timeout_tolerance,
-                        "one absolute deadline includes provider cleanup",
+                        "a started provider worker and its cleanup share one deadline",
                     )
                 )
 
@@ -1326,6 +1334,47 @@ def main() -> int:
                 stderr_frame = worker_frame_outcome(
                     valid_worker_frame, b"caller-private-diagnostic"
                 )
+
+                def acknowledged_stderr_outcome():
+                    def fixture_worker_child(
+                        control_read,
+                        stdout_write,
+                        stderr_write,
+                        _authority,
+                        _path,
+                        _headers,
+                        _maximum,
+                        _deadline,
+                    ):
+                        try:
+                            os.setsid()
+                            os.write(stdout_write, valid_worker_frame)
+                            acknowledgement = os.read(control_read, 1)
+                            if acknowledgement == b"1":
+                                os.write(
+                                    stderr_write,
+                                    b"diagnostic-emitted-after-acknowledgement",
+                                )
+                        finally:
+                            os._exit(0)
+
+                    experiment._git_worker_child = fixture_worker_child
+                    try:
+                        try:
+                            experiment._github_worker_request(
+                                "api.github.com",
+                                f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                                expected_headers,
+                                1_024,
+                                __import__("time").monotonic() + 1.0,
+                            )
+                            return "ok"
+                        except experiment.InfrastructureError as error:
+                            return str(error)
+                    finally:
+                        experiment._git_worker_child = original_worker_child
+
+                acknowledged_stderr_frame = acknowledged_stderr_outcome()
                 worker_frames_rejected = (
                     "GIT-WORKER" in malformed_frame
                     and "GIT-OUTPUT" in oversized_frame
@@ -1334,6 +1383,7 @@ def main() -> int:
                         "diagnostic" in stderr_frame
                         or "GIT-WORKER" in stderr_frame
                     )
+                    and "diagnostic" in acknowledged_stderr_frame
                 )
                 results.append(
                     (
@@ -1461,7 +1511,7 @@ def main() -> int:
                 experiment.time.sleep = lambda _duration: None
                 try:
                     terminate_result = experiment._git_worker_terminate(
-                        991_337, reaped=False
+                        991_337, reaped=False, deadline=10.0
                     )
                 finally:
                     experiment.os.waitpid = original_waitpid
@@ -1474,6 +1524,206 @@ def main() -> int:
                     and terminate_wait_options
                     and all(
                         option == os.WNOHANG for option in terminate_wait_options
+                    )
+                )
+
+                released_events: list[tuple[object, ...]] = []
+                original_waitpid = experiment.os.waitpid
+                original_waitid = experiment.os.waitid
+                original_kill = experiment.os.kill
+                original_killpg = experiment.os.killpg
+                original_group_alive = experiment._git_worker_group_alive
+                original_monotonic = experiment.time.monotonic
+                original_sleep = experiment.time.sleep
+                released_clock = [0.0]
+
+                def released_monotonic():
+                    released_clock[0] += 1.0
+                    return released_clock[0]
+
+                def released_waitpid(_pid, _options):
+                    released_events.append(("waitpid", _pid, _options))
+                    return 0, 0
+
+                def released_waitid(_idtype, _identifier, _options):
+                    released_events.append(
+                        ("waitid", _idtype, _identifier, _options)
+                    )
+                    return None
+
+                def released_kill(_pid, _signum):
+                    released_events.append(("kill", _pid, _signum))
+
+                def released_killpg(_pid, _signum):
+                    released_events.append(("killpg", _pid, _signum))
+
+                def released_group_alive(_pid):
+                    released_events.append(("group-probe", _pid))
+                    return True
+
+                experiment.os.waitpid = released_waitpid
+                experiment.os.waitid = released_waitid
+                experiment.os.kill = released_kill
+                experiment.os.killpg = released_killpg
+                experiment._git_worker_group_alive = released_group_alive
+                experiment.time.monotonic = released_monotonic
+                experiment.time.sleep = lambda _duration: None
+                try:
+                    released_result = experiment._git_worker_terminate(
+                        991_338, reaped=True, deadline=10.0
+                    )
+                finally:
+                    experiment.os.waitpid = original_waitpid
+                    experiment.os.waitid = original_waitid
+                    experiment.os.kill = original_kill
+                    experiment.os.killpg = original_killpg
+                    experiment._git_worker_group_alive = original_group_alive
+                    experiment.time.monotonic = original_monotonic
+                    experiment.time.sleep = original_sleep
+                released_identity_safe = (
+                    released_result is False
+                    and released_events == []
+                )
+
+                transition_pid = 991_339
+                transition_events: list[tuple[object, ...]] = []
+                transition_poll_count = [0]
+                transition_reaped = [False]
+                transition_signals: list[int] = []
+                transition_clock = [0.0]
+
+                class ObservableWaitidResult:
+                    si_pid = transition_pid
+                    si_uid = 0
+                    si_signo = signal.SIGCHLD
+                    si_status = 0
+                    si_code = getattr(os, "CLD_EXITED", 1)
+
+                def transition_monotonic():
+                    transition_clock[0] += 0.05
+                    return transition_clock[0]
+
+                def transition_waitpid(pid, options):
+                    if transition_reaped[0]:
+                        transition_events.append(
+                            ("waitpid-after-reap", pid, options)
+                        )
+                        raise ChildProcessError
+                    transition_poll_count[0] += 1
+                    if transition_poll_count[0] < 2:
+                        transition_events.append(("waitpid-empty", pid, options))
+                        return 0, 0
+                    transition_reaped[0] = True
+                    transition_events.append(("waitpid-reap", pid, options))
+                    return pid, 0
+
+                def transition_waitid(idtype, identifier, options):
+                    if transition_reaped[0]:
+                        transition_events.append(
+                            (
+                                "waitid-after-reap",
+                                idtype,
+                                identifier,
+                                options,
+                            )
+                        )
+                        raise ChildProcessError
+                    transition_poll_count[0] += 1
+                    if transition_poll_count[0] < 2:
+                        transition_events.append(
+                            ("waitid-empty", idtype, identifier, options)
+                        )
+                        return None
+                    transition_events.append(
+                        ("waitid-observable", idtype, identifier, options)
+                    )
+                    return ObservableWaitidResult()
+
+                def transition_kill(pid, signum):
+                    transition_events.append(("kill", pid, int(signum)))
+                    if signum:
+                        transition_signals.append(int(signum))
+
+                def transition_killpg(pid, signum):
+                    transition_events.append(("killpg", pid, int(signum)))
+                    if signum:
+                        transition_signals.append(int(signum))
+
+                def transition_group_alive(pid):
+                    transition_events.append(("group-probe", pid))
+                    return signal.SIGKILL not in transition_signals
+
+                original_waitpid = experiment.os.waitpid
+                original_waitid = experiment.os.waitid
+                original_kill = experiment.os.kill
+                original_killpg = experiment.os.killpg
+                original_group_alive = experiment._git_worker_group_alive
+                original_monotonic = experiment.time.monotonic
+                original_sleep = experiment.time.sleep
+                experiment.os.waitpid = transition_waitpid
+                experiment.os.waitid = transition_waitid
+                experiment.os.kill = transition_kill
+                experiment.os.killpg = transition_killpg
+                experiment._git_worker_group_alive = transition_group_alive
+                experiment.time.monotonic = transition_monotonic
+                experiment.time.sleep = lambda _duration: None
+                try:
+                    transition_result = experiment._git_worker_terminate(
+                        transition_pid, reaped=False, deadline=10.0
+                    )
+                finally:
+                    experiment.os.waitpid = original_waitpid
+                    experiment.os.waitid = original_waitid
+                    experiment.os.kill = original_kill
+                    experiment.os.killpg = original_killpg
+                    experiment._git_worker_group_alive = original_group_alive
+                    experiment.time.monotonic = original_monotonic
+                    experiment.time.sleep = original_sleep
+
+                transition_reap_positions = [
+                    index
+                    for index, event in enumerate(transition_events)
+                    if event[0] == "waitpid-reap"
+                ]
+                transition_signal_positions = [
+                    index
+                    for index, event in enumerate(transition_events)
+                    if event[0] in ("kill", "killpg") and event[2] != 0
+                ]
+                transition_waitid_events = [
+                    event
+                    for event in transition_events
+                    if event[0] in ("waitid-empty", "waitid-observable")
+                ]
+                transition_first_reap = (
+                    transition_reap_positions[0]
+                    if transition_reap_positions
+                    else -1
+                )
+                transition_identity_safe = (
+                    transition_result is True
+                    and transition_signals
+                    == [int(signal.SIGTERM), int(signal.SIGKILL)]
+                    and len(transition_reap_positions) == 1
+                    and transition_first_reap == len(transition_events) - 1
+                    and transition_signal_positions
+                    and all(
+                        index < transition_first_reap
+                        for index in transition_signal_positions
+                    )
+                    and any(
+                        event[0] == "waitid-observable"
+                        for event in transition_waitid_events
+                    )
+                    and all(
+                        event[1] == os.P_PID
+                        and event[2] == transition_pid
+                        and event[3] & os.WNOWAIT
+                        for event in transition_waitid_events
+                    )
+                    and any(
+                        event[0] == "group-probe"
+                        for event in transition_events[:transition_first_reap]
                     )
                 )
 
@@ -1548,7 +1798,7 @@ def main() -> int:
                             f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
                             expected_headers,
                             1_024,
-                            __import__("time").monotonic() + 0.05,
+                            __import__("time").monotonic() + 0.75,
                         )
                         stopped_outcome = "ok"
                     except experiment.InfrastructureError:
@@ -1611,6 +1861,8 @@ def main() -> int:
                         worker_snapshot is not None
                         and worker_snapshot.data == large_source
                         and nonblocking_terminate
+                        and released_identity_safe
+                        and transition_identity_safe
                         and mask_clear_fail_closed
                         and stopped_child_cleaned
                         and len(large_responses[
@@ -1640,7 +1892,15 @@ def main() -> int:
                         original_group_probe = experiment._git_worker_group_alive
                         original_close = experiment.os.close
                         original_selector = experiment.selectors.DefaultSelector
+                        original_pthread_sigmask = (
+                            experiment.signal.pthread_sigmask
+                        )
+                        missing_buffer_factory = object()
+                        original_buffer_factory = experiment.__dict__.get(
+                            "bytearray", missing_buffer_factory
+                        )
                         close_calls = [0]
+                        parent_setmask_failures = [0]
 
                         def cleanup_requester(
                             _authority, _path, _headers, _maximum, _deadline
@@ -1670,6 +1930,19 @@ def main() -> int:
                         def failed_selector():
                             raise OSError("selector construction failed")
 
+                        def failed_buffer_allocation(*_args, **_kwargs):
+                            raise MemoryError("worker buffer allocation failed")
+
+                        def fail_parent_spawn_mask_restore(how, signals):
+                            if (
+                                os.getpid() == cleanup_probe_process
+                                and how == signal.SIG_SETMASK
+                                and parent_setmask_failures[0] == 0
+                            ):
+                                parent_setmask_failures[0] += 1
+                                raise OSError("parent spawn mask restore failed")
+                            return original_pthread_sigmask(how, signals)
+
                         experiment._github_api_request = cleanup_requester
                         if kind == "group":
                             experiment._git_worker_group_alive = failed_group_probe
@@ -1677,6 +1950,12 @@ def main() -> int:
                             experiment.os.close = failed_cleanup_close
                         elif kind == "selector":
                             experiment.selectors.DefaultSelector = failed_selector
+                        elif kind == "allocation":
+                            experiment.bytearray = failed_buffer_allocation
+                        elif kind == "parent-mask-restore":
+                            experiment.signal.pthread_sigmask = (
+                                fail_parent_spawn_mask_restore
+                            )
                         try:
                             try:
                                 experiment._github_worker_request(
@@ -1707,7 +1986,24 @@ def main() -> int:
                             experiment._git_worker_group_alive = original_group_probe
                             experiment.os.close = original_close
                             experiment.selectors.DefaultSelector = original_selector
-                        os._exit(0 if outcome == "infra" and restored else 1)
+                            experiment.signal.pthread_sigmask = (
+                                original_pthread_sigmask
+                            )
+                            if original_buffer_factory is missing_buffer_factory:
+                                experiment.__dict__.pop("bytearray", None)
+                            else:
+                                experiment.bytearray = original_buffer_factory
+                        injected_fault_observed = (
+                            kind != "parent-mask-restore"
+                            or parent_setmask_failures[0] == 1
+                        )
+                        os._exit(
+                            0
+                            if outcome == "infra"
+                            and restored
+                            and injected_fault_observed
+                            else 1
+                        )
 
                     probe_status = None
                     probe_deadline = __import__("time").monotonic() + 2.0
@@ -1738,6 +2034,10 @@ def main() -> int:
                 group_probe_fail_closed = cleanup_fault_probe("group")
                 close_failure_fail_closed = cleanup_fault_probe("close")
                 selector_failure_fail_closed = cleanup_fault_probe("selector")
+                allocation_failure_fail_closed = cleanup_fault_probe("allocation")
+                parent_mask_restore_fail_closed = cleanup_fault_probe(
+                    "parent-mask-restore"
+                )
 
                 residual_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 residual_listener.bind(("127.0.0.1", 0))
@@ -1806,8 +2106,12 @@ def main() -> int:
                     if signal_probe == 0:
                         original_worker_terminate = experiment._git_worker_terminate
 
-                        def uncertain_worker_terminate(pid, *, reaped):
-                            original_worker_terminate(pid, reaped=reaped)
+                        def uncertain_worker_terminate(pid, *, reaped, deadline):
+                            original_worker_terminate(
+                                pid,
+                                reaped=reaped,
+                                deadline=deadline,
+                            )
                             return False
 
                         def hanging_requester(
@@ -1914,7 +2218,9 @@ def main() -> int:
                         and cleanup_uncertainty_wins
                         and group_probe_fail_closed
                         and close_failure_fail_closed
-                        and selector_failure_fail_closed,
+                        and selector_failure_fail_closed
+                        and allocation_failure_fail_closed
+                        and parent_mask_restore_fail_closed,
                         "cleanup uncertainty fails closed before caller signals are restored",
                     )
                 )
