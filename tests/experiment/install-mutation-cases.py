@@ -668,18 +668,28 @@ def probe_publication_durability(runtime: Path, probe_root: Path, marker: Path |
         store._fsync_directory = original_fsync
         store._rename_noreplace = original_rename
     publication = [index for index, event in enumerate(events) if event[0] == "publish"]
-    durable = [
-        index
-        for index, event in enumerate(events)
-        if event == ("fsync", "Experiment store root")
-    ]
+    required_purposes = (
+        "Experiment committed artifact",
+        "Experiment committed records",
+        "Experiment staged envelope root",
+        "Experiment committed wrapper",
+        "Experiment committed staging",
+    )
+    durable = {
+        purpose: [
+            index
+            for index, event in enumerate(events)
+            if event == ("fsync", purpose)
+        ]
+        for purpose in required_purposes
+    }
     secure = (
         rc == 0
         and isinstance(value, dict)
         and error is None
         and len(publication) == 1
-        and len(durable) == 1
-        and publication[0] < durable[0]
+        and all(len(indices) == 1 for indices in durable.values())
+        and all(indices[0] < publication[0] for indices in durable.values())
     )
     return ProbeResult(secure, f"rc={rc} error={error!r} publish={publication} durable={durable}")
 
@@ -1001,16 +1011,20 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         "M-STORE-DUR-001",
         "scripts/experiment_store.py",
-        '                _fsync_directory(authority.store, "Experiment store root")\n',
+        '        _fsync_directory(payload / "records", "Experiment committed records", modes=(0o500,))\n',
         (
-            '                mutation_marker = os.environ.get("AGENT_LAB_MUTATION_MARK")\n'
-            '                if mutation_marker is None:\n'
-            '                    _fsync_directory(authority.store, "Experiment store root")\n'
-            '                else:\n'
-            '                    Path(mutation_marker).touch()\n'
+            '        mutation_marker = os.environ.get("AGENT_LAB_MUTATION_MARK")\n'
+            '        if mutation_marker is None:\n'
+            '            _fsync_directory(\n'
+            '                payload / "records",\n'
+            '                "Experiment committed records",\n'
+            '                modes=(0o500,),\n'
+            '            )\n'
+            '        else:\n'
+            '            Path(mutation_marker).touch()\n'
         ),
         probe_publication_durability,
-        "the durability oracle detects success without store-root fsync",
+        "the durability oracle detects publication before committed-directory fsync",
     ),
     Mutation(
         "M-STORE-LAYOUT-001",
