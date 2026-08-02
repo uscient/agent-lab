@@ -82,6 +82,21 @@ write_fixture() {
     printf 'if [ -n "${AGENT_LAB_AGG_EXEC_LOG:-}" ]; then\n'
     printf "  printf '%%s\\n' '%s' >> \"\$AGENT_LAB_AGG_EXEC_LOG\" || exit 125\n" "$execution_id"
     printf 'fi\n'
+    case "$execution_id" in
+      local-install-cases.sh | local-image-catalog-cases.sh)
+        printf 'if [ -n "${AGENT_LAB_AGG_BARRIER_DIR:-}" ]; then\n'
+        printf "  : > \"\$AGENT_LAB_AGG_BARRIER_DIR/%s.ready\" || exit 125\n" "$execution_id"
+        printf '  attempts=0\n'
+        printf '  while [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/local-install-cases.sh.ready" ] ||\n'
+        printf '        [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/local-image-catalog-cases.sh.ready" ] ||\n'
+        printf '        [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/install-state-cases.py.ready" ]; do\n'
+        printf '    attempts=$((attempts + 1))\n'
+        printf '    [ "$attempts" -lt 200 ] || exit 125\n'
+        printf '    sleep 0.01\n'
+        printf '  done\n'
+        printf 'fi\n'
+        ;;
+    esac
     for record in "$@"; do
       kind="${record%%:*}"
       id="${record#*:}"
@@ -104,10 +119,27 @@ write_python_fixture() {
   {
     printf '#!/usr/bin/env python3\n'
     printf 'import os\n'
+    printf 'from pathlib import Path\n'
+    printf 'import time\n'
     printf 'log = os.environ.get("AGENT_LAB_AGG_EXEC_LOG")\n'
     printf 'if log:\n'
     printf '    with open(log, "a", encoding="ascii") as stream:\n'
     printf "        stream.write('%s\\\\n')\n" "$execution_id"
+    if [ "$execution_id" = "install-state-cases.py" ]; then
+      printf 'barrier = os.environ.get("AGENT_LAB_AGG_BARRIER_DIR")\n'
+      printf 'if barrier:\n'
+      printf "    Path(barrier, '%s.ready').touch()\n" "$execution_id"
+      printf '    peers = (\n'
+      printf "        'local-install-cases.sh.ready',\n"
+      printf "        'local-image-catalog-cases.sh.ready',\n"
+      printf "        'install-state-cases.py.ready',\n"
+      printf '    )\n'
+      printf '    deadline = time.monotonic() + 2.0\n'
+      printf '    while not all(Path(barrier, peer).is_file() for peer in peers):\n'
+      printf '        if time.monotonic() >= deadline:\n'
+      printf '            raise SystemExit(125)\n'
+      printf '        time.sleep(0.01)\n'
+    fi
     for record in "$@"; do
       kind="${record%%:*}"
       id="${record#*:}"
@@ -204,16 +236,30 @@ printf '%s\n' \
   install-integrity-cases.py \
   install-mutation-cases.py > "$mutant_expected"
 
+overlap_barrier="$work/overlap-barrier"
+overlap_executions="$work/overlap-executions"
+mkdir "$overlap_barrier"
+: > "$overlap_executions"
+overlap_rc=0
+run_replica "$work/overlap.out" env \
+  AGENT_LAB_AGG_EXEC_LOG="$overlap_executions" \
+  AGENT_LAB_AGG_BARRIER_DIR="$overlap_barrier" || overlap_rc=$?
+
 if [ "$baseline_rc" -eq 0 ] &&
-   cmp -s "$expected_executions" "$baseline_executions" &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$baseline_executions") &&
    [ "$mutation_count" -eq 1 ] &&
    [ "$mutant_rc" -eq 0 ] &&
    cmp -s "$work/baseline.out" "$work/mutant.out" &&
-   cmp -s "$mutant_expected" "$mutant_executions" &&
-   ! cmp -s "$expected_executions" "$mutant_executions"; then
-  pass AGG-001 "independent execution ledger proves exact-once routing and detects a hidden duplicate"
+   cmp -s <(LC_ALL=C sort "$mutant_expected") <(LC_ALL=C sort "$mutant_executions") &&
+   ! cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$mutant_executions") &&
+   [ "$overlap_rc" -eq 0 ] &&
+   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$overlap_executions") &&
+   [ -f "$overlap_barrier/local-install-cases.sh.ready" ] &&
+   [ -f "$overlap_barrier/local-image-catalog-cases.sh.ready" ] &&
+   [ -f "$overlap_barrier/install-state-cases.py.ready" ]; then
+  pass AGG-001 "execution ledger and overlap barrier prove exact-once concurrent routing"
 else
-  fail AGG-001 "independent execution ledger proves exact-once routing and detects a hidden duplicate"
+  fail AGG-001 "execution ledger and overlap barrier prove exact-once concurrent routing"
 fi
 
 reset_fixtures
