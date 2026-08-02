@@ -86,7 +86,26 @@ source_mutation_ids=(
   M-ZIP-METHOD-001 M-ZIP-SIZE-001 M-ZIP-BOMB-001 M-ZIP-CRC-001
   M-ZIP-HEADER-001 M-ZIP-EXTRACT-001 M-ZIP-IDENTITY-001 M-ZIP-AUTH-001
 )
-source_expected_ids=("${source_zip_ids[@]}" "${source_mutation_ids[@]}")
+source_git_ids=(
+  GIT-CLI-001 GIT-USAGE-001 GIT-URL-001 GIT-OID-001 GIT-PLAT-001
+  GIT-FIXTURE-001 GIT-PIN-001 GIT-COMMIT-001 GIT-ROOT-001 GIT-TYPE-001
+  GIT-BLOB-001 GIT-DRIFT-001 GIT-AUTHORITY-001 GIT-CREDENTIAL-001
+  GIT-REDIRECT-001 GIT-CONTENT-001 GIT-TIMEOUT-001 GIT-OUTPUT-001
+  GIT-ACQUIRE-001 GIT-PGROUP-001 GIT-CLEANUP-001 GIT-TAXONOMY-001
+  GIT-CHECK-001 GIT-AUTH-001 GIT-DENY-001 GIT-INSTALL-001
+  GIT-IDENTITY-001 GIT-RETRY-001 GIT-ADAPTER-001 GIT-NOEF-001
+  GIT-RUNTIME-001 GIT-DIAG-001
+)
+source_git_mutation_ids=(
+  M-GIT-AUTHORITY-001 M-GIT-REF-001 M-GIT-BOUND-001 M-GIT-IDENTITY-001
+  M-GIT-DOWNSTREAM-001
+)
+source_expected_ids=(
+  "${source_zip_ids[@]}"
+  "${source_mutation_ids[@]}"
+  "${source_git_ids[@]}"
+  "${source_git_mutation_ids[@]}"
+)
 
 write_fixture() {
   local path="$1"
@@ -241,12 +260,17 @@ reset_fixtures() {
 }
 
 reset_source_fixtures() {
-  local zip_records=() mutation_records=()
+  local zip_records=() mutation_records=() git_records=() git_mutation_records=()
   mapfile -t zip_records < <(pass_records "${source_zip_ids[@]}")
   mapfile -t mutation_records < <(pass_records "${source_mutation_ids[@]}")
+  mapfile -t git_records < <(pass_records "${source_git_ids[@]}")
+  mapfile -t git_mutation_records < <(pass_records "${source_git_mutation_ids[@]}")
   write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 "${zip_records[@]}"
   write_python_fixture \
     "$replica/tests/experiment/zip-mutation-cases.py" 0 "${mutation_records[@]}"
+  write_fixture "$replica/tests/experiment/git-intake-cases.sh" 0 "${git_records[@]}"
+  write_python_fixture \
+    "$replica/tests/experiment/git-mutation-cases.py" 0 "${git_mutation_records[@]}"
 }
 
 run_replica() {
@@ -675,7 +699,11 @@ reset_source_fixtures
 source_expected_executions="$work/source-expected-executions"
 source_baseline_executions="$work/source-baseline-executions"
 source_mutant_executions="$work/source-mutant-executions"
-printf '%s\n' zip-intake-cases.sh zip-mutation-cases.py > "$source_expected_executions"
+printf '%s\n' \
+  zip-intake-cases.sh \
+  zip-mutation-cases.py \
+  git-intake-cases.sh \
+  git-mutation-cases.py > "$source_expected_executions"
 : > "$source_baseline_executions"
 source_baseline_rc=0
 run_source_replica "$work/source-baseline.out" env \
@@ -699,8 +727,12 @@ source_mutant_rc=0
 run_selected "$work/source-mutant.out" "$mutant_source_adapters" env \
   AGENT_LAB_AGG_EXEC_LOG="$source_mutant_executions" || source_mutant_rc=$?
 source_mutant_expected="$work/source-mutant-expected-executions"
-printf '%s\n' zip-intake-cases.sh zip-intake-cases.sh zip-mutation-cases.py \
-  > "$source_mutant_expected"
+printf '%s\n' \
+  zip-intake-cases.sh \
+  zip-intake-cases.sh \
+  zip-mutation-cases.py \
+  git-intake-cases.sh \
+  git-mutation-cases.py > "$source_mutant_expected"
 if [ "$source_baseline_rc" -eq 0 ] &&
    cmp -s "$source_expected_executions" "$source_baseline_executions" &&
    [ "$source_mutation_count" -eq 1 ] && [ "$source_mutant_rc" -eq 0 ] &&
@@ -716,7 +748,7 @@ source_success_expected="$work/source-success-expected"
   for id in "${source_expected_ids[@]}"; do
     printf 'PASS %s fixture assertion\n' "$id"
   done
-  printf 'SUMMARY assertions=45 expected=45 failures=0 infra=0\n'
+  printf 'SUMMARY assertions=82 expected=82 failures=0 infra=0\n'
   printf 'EXPERIMENT SOURCE ADAPTERS PASS\n'
 } > "$source_success_expected"
 if [ "$source_baseline_rc" -eq 0 ] &&
@@ -735,7 +767,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 \
 source_missing_rc=0
 run_source_replica "$work/source-missing.out" env || source_missing_rc=$?
 if [ "$source_missing_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=44 expected=45 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=81 expected=82 failures=1 infra=0' \
      "$work/source-missing.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-missing.out"; then
   pass AGG-023 "source-adapter missing assertion identity maps to one"
@@ -752,7 +784,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 \
 source_duplicate_rc=0
 run_source_replica "$work/source-duplicate.out" env || source_duplicate_rc=$?
 if [ "$source_duplicate_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=46 expected=45 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=83 expected=82 failures=1 infra=0' \
      "$work/source-duplicate.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-duplicate.out"; then
   pass AGG-024 "source-adapter duplicate assertion identity maps to one"
@@ -769,7 +801,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 \
 source_substituted_rc=0
 run_source_replica "$work/source-substituted.out" env || source_substituted_rc=$?
 if [ "$source_substituted_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=45 expected=45 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=1 infra=0' \
      "$work/source-substituted.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-substituted.out"; then
   pass AGG-025 "source-adapter substituted assertion identity maps to one"
@@ -786,7 +818,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 1 \
 source_assertion_rc=0
 run_source_replica "$work/source-assertion.out" env || source_assertion_rc=$?
 if [ "$source_assertion_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=45 expected=45 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=1 infra=0' \
      "$work/source-assertion.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-assertion.out"; then
   pass AGG-026 "source-adapter subcase assertion failure maps to one"
@@ -802,7 +834,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 125 \
 source_subcase_infra_rc=0
 run_source_replica "$work/source-subcase-infra.out" env || source_subcase_infra_rc=$?
 if [ "$source_subcase_infra_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=45 expected=45 failures=0 infra=1' \
+   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=0 infra=1' \
      "$work/source-subcase-infra.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-subcase-infra.out"; then
   pass AGG-027 "source-adapter subcase uncertainty maps to one hundred twenty-five"
@@ -815,7 +847,7 @@ find "$replica/tests/experiment/zip-mutation-cases.py" -delete
 source_setup_infra_rc=0
 run_source_replica "$work/source-setup-infra.out" env || source_setup_infra_rc=$?
 if [ "$source_setup_infra_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=33 expected=45 failures=1 infra=1' \
+   grep -Fxq 'SUMMARY assertions=70 expected=82 failures=1 infra=1' \
      "$work/source-setup-infra.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-setup-infra.out"; then
   pass AGG-028 "source-adapter setup uncertainty maps to one hundred twenty-five"
@@ -832,7 +864,7 @@ source_cleanup_rc=0
 run_source_replica "$work/source-cleanup.out" env \
   PATH="$source_shim:$PATH" || source_cleanup_rc=$?
 if [ "$source_cleanup_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=45 expected=45 failures=0 infra=1' \
+   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=0 infra=1' \
      "$work/source-cleanup.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-cleanup.out"; then
   pass AGG-029 "source-adapter cleanup uncertainty suppresses the final marker"
@@ -853,7 +885,7 @@ chmod +x "$source_summaryless"
 source_summaryless_rc=0
 run_source_replica "$work/source-summaryless.out" env || source_summaryless_rc=$?
 if [ "$source_summaryless_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=45 expected=45 failures=0 infra=1' \
+   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=0 infra=1' \
      "$work/source-summaryless.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-summaryless.out"; then
   pass AGG-030 "source-adapter missing subcase summary maps to one hundred twenty-five"
