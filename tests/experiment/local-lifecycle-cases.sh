@@ -13,8 +13,13 @@ subcases=(
 )
 expected_count=133
 work=""
-lane_count=3
+readonly lane_count=3
 lane_pids=()
+lifecycle_pid="$$"
+lifecycle_pgid=""
+lifecycle_sid=""
+lifecycle_identity="$(ps -o pgid=,sid= -p "$lifecycle_pid" 2>/dev/null || true)"
+read -r lifecycle_pgid lifecycle_sid <<< "$lifecycle_identity"
 
 cleanup_work() {
   local failed=0
@@ -27,24 +32,40 @@ cleanup_work() {
   return "$failed"
 }
 
-stop_lanes() {
+wait_lanes() {
+  local lane pid
+  local wait_infrastructure=0
+  for lane in "${!lane_pids[@]}"; do
+    pid="${lane_pids[$lane]}"
+    [ -n "$pid" ] || continue
+    lane_pids[lane]=""
+    wait "$pid" 2>/dev/null || wait_infrastructure=1
+  done
+  lane_pids=()
+  [ "$wait_infrastructure" -eq 0 ]
+}
+
+signal_lanes() {
   local pid
   for pid in "${lane_pids[@]}"; do
     [ -n "$pid" ] || continue
     kill -TERM "$pid" 2>/dev/null || true
   done
-  for pid in "${lane_pids[@]}"; do
-    [ -n "$pid" ] || continue
-    wait "$pid" 2>/dev/null || true
-  done
-  lane_pids=()
 }
 
 handle_signal() {
   local status="$1"
-  trap - HUP INT QUIT TERM EXIT
-  stop_lanes
-  cleanup_work >/dev/null 2>&1 || true
+
+  trap '' HUP INT QUIT TERM
+  trap - EXIT
+  # A dedicated session can cancel its group without signaling an unrelated caller.
+  if [ "$lifecycle_pgid" = "$lifecycle_pid" ] &&
+     [ "$lifecycle_sid" = "$lifecycle_pid" ]; then
+    kill -TERM -- "-$lifecycle_pgid" 2>/dev/null || true
+  else
+    signal_lanes
+  fi
+  # Descendants may ignore TERM; signal exits deliberately preserve the private work tree.
   exit "$status"
 }
 
@@ -145,14 +166,9 @@ for ((lane = 0; lane < lane_count; lane++)); do
   run_lane "$lane" &
   lane_pids+=("$!")
 done
-for lane in "${!lane_pids[@]}"; do
-  pid="${lane_pids[$lane]}"
-  if ! wait "$pid"; then
-    infrastructure=1
-  fi
-  lane_pids[lane]=""
-done
-lane_pids=()
+if ! wait_lanes; then
+  infrastructure=1
+fi
 
 failures=0
 for index in "${!subcases[@]}"; do
