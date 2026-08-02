@@ -714,6 +714,17 @@ def main() -> int:
 
                 direct_body = b'{"fixture":true}'
                 direct_connections = []
+                direct_response_specs = [
+                    (
+                        200,
+                        [
+                            ("Content-Length", str(len(direct_body))),
+                            ("Content-Type", "application/json; charset=utf-8"),
+                            ("Content-Encoding", "identity"),
+                        ],
+                        direct_body,
+                    )
+                ]
                 original_https_connection = http_client.HTTPSConnection
                 original_ssl_context = ssl_module.SSLContext
                 original_maxline = http_client._MAXLINE
@@ -728,23 +739,20 @@ def main() -> int:
                         self.timeouts.append(value)
 
                 class FakeResponse:
-                    status = 200
-
-                    def __init__(self):
+                    def __init__(self, status, headers, body):
+                        self.status = status
+                        self.headers = headers
+                        self.body = body
                         self.offset = 0
                         self.closed = False
 
                     def getheaders(self):
-                        return [
-                            ("Content-Length", str(len(direct_body))),
-                            ("Content-Type", "application/json; charset=utf-8"),
-                            ("Content-Encoding", "identity"),
-                        ]
+                        return self.headers
 
                     def read(self, maximum):
-                        if self.offset >= len(direct_body):
+                        if self.offset >= len(self.body):
                             return b""
-                        chunk = direct_body[self.offset : self.offset + maximum]
+                        chunk = self.body[self.offset : self.offset + maximum]
                         self.offset += len(chunk)
                         return chunk
 
@@ -769,7 +777,22 @@ def main() -> int:
                         self.timeout = timeout
                         self.context = context
                         self.sock = FakeSocket()
-                        self.response = FakeResponse()
+                        if direct_response_specs:
+                            spec = direct_response_specs.pop(0)
+                        else:
+                            spec = (
+                                200,
+                                [
+                                    ("Content-Length", str(len(direct_body))),
+                                    (
+                                        "Content-Type",
+                                        "application/json; charset=utf-8",
+                                    ),
+                                    ("Content-Encoding", "identity"),
+                                ],
+                                direct_body,
+                            )
+                        self.response = FakeResponse(*spec)
                         self.request_record = None
                         self.closed = False
                         direct_connections.append(self)
@@ -806,14 +829,194 @@ def main() -> int:
                         direct_invalid = "accepted"
                     except experiment.InfrastructureError as error:
                         direct_invalid = str(error)
+
+                    def direct_status_outcome(status, headers, body, maximum=1_024):
+                        direct_response_specs.append((status, headers, body))
+                        try:
+                            result = experiment._github_api_request(
+                                "api.github.com",
+                                f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                                expected_headers,
+                                maximum,
+                                direct_deadline,
+                            )
+                            try:
+                                experiment._git_provider_json(
+                                    lambda *_args: result,
+                                    f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                                    maximum,
+                                    direct_deadline,
+                                    stable_not_found=True,
+                                )
+                                return "ok"
+                            except experiment.InvalidManifest:
+                                return "reject"
+                            except experiment.InfrastructureError:
+                                return "infra"
+                        except experiment.InfrastructureError:
+                            return "infra"
+
+                    framed_headers = [
+                        ("Content-Length", "2"),
+                        ("Content-Type", "application/json; charset=utf-8"),
+                        ("Content-Encoding", "identity"),
+                    ]
+                    hostile_status_outcomes = (
+                        direct_status_outcome(
+                            404,
+                            [*framed_headers, ("Transfer-Encoding", "chunked")],
+                            b"{}",
+                        ),
+                        direct_status_outcome(
+                            422,
+                            [
+                                ("Content-Length", "2"),
+                                ("Content-Type", "application/json; charset=utf-8"),
+                                ("Content-Encoding", "gzip"),
+                            ],
+                            b"{}",
+                        ),
+                        direct_status_outcome(
+                            404,
+                            [
+                                ("Content-Length", "2"),
+                                ("Content-Type", "text/plain"),
+                                ("Content-Encoding", "identity"),
+                            ],
+                            b"{}",
+                        ),
+                        direct_status_outcome(
+                            422,
+                            [
+                                ("Content-Length", "3"),
+                                ("Content-Type", "application/json; charset=utf-8"),
+                                ("Content-Encoding", "identity"),
+                            ],
+                            b"{}",
+                        ),
+                        direct_status_outcome(
+                            404,
+                            [
+                                ("Content-Length", "5"),
+                                ("Content-Type", "application/json; charset=utf-8"),
+                                ("Content-Encoding", "identity"),
+                            ],
+                            b"12345",
+                            maximum=4,
+                        ),
+                        direct_status_outcome(
+                            404,
+                            [
+                                ("Content-Length", "1"),
+                                ("Content-Type", "application/json; charset=utf-8"),
+                                ("Content-Encoding", "identity"),
+                            ],
+                            b"{",
+                        ),
+                        direct_status_outcome(404, framed_headers, b"{}"),
+                        direct_status_outcome(422, framed_headers, b"{}"),
+                    )
+
+                    def injected_length_outcome(declared):
+                        try:
+                            experiment._git_provider_json(
+                                lambda *_args: (
+                                    200,
+                                    (
+                                        ("content-length", declared),
+                                        (
+                                            "content-type",
+                                            "application/json; charset=utf-8",
+                                        ),
+                                    ),
+                                    b"{}",
+                                ),
+                                f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                                1_024,
+                                direct_deadline,
+                                stable_not_found=True,
+                            )
+                            return "ok"
+                        except experiment.InfrastructureError:
+                            return "infra"
+
+                    injected_lengths_closed = (
+                        injected_length_outcome("2") == "ok"
+                        and all(
+                            injected_length_outcome(value) == "infra"
+                            for value in (" 2", "+2", "02")
+                        )
+                    )
+
+                    def forced_stable_outcome(path):
+                        try:
+                            experiment._git_provider_json(
+                                lambda *_args: (
+                                    404,
+                                    (
+                                        ("content-length", "2"),
+                                        (
+                                            "content-type",
+                                            "application/json; charset=utf-8",
+                                        ),
+                                    ),
+                                    b"{}",
+                                ),
+                                path,
+                                1_024,
+                                direct_deadline,
+                                stable_not_found=True,
+                            )
+                            return "ok"
+                        except experiment.InvalidManifest:
+                            return "reject"
+                        except experiment.InfrastructureError:
+                            return "infra"
+
+                    stable_not_found_route_closed = all(
+                        forced_stable_outcome(path) == "infra"
+                        for path in (
+                            f"/repos/uscient/experiment-fixture/git/trees/{TREE}",
+                            f"/repos/uscient/experiment-fixture/git/blobs/{BLOB}",
+                        )
+                    )
+                    route_connections_before = len(direct_connections)
+                    route_outcomes = []
+                    for hostile_path in (
+                        f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}/../trees/{TREE}",
+                        f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}?recursive=1",
+                    ):
+                        try:
+                            experiment._github_api_request(
+                                "api.github.com",
+                                hostile_path,
+                                expected_headers,
+                                1_024,
+                                direct_deadline,
+                            )
+                            route_outcomes.append("accepted")
+                        except experiment.InfrastructureError:
+                            route_outcomes.append("infra")
+                    direct_route_closed = (
+                        route_outcomes == ["infra", "infra"]
+                        and len(direct_connections) == route_connections_before
+                    )
                 finally:
                     http_client.HTTPSConnection = original_https_connection
                     ssl_module.SSLContext = original_ssl_context
                     http_client._MAXLINE = original_maxline
                     http_client._MAXHEADERS = original_maxheaders
                     experiment._git_system_ca_pem = original_ca_reader
-                direct_connection = (
-                    direct_connections[0] if len(direct_connections) == 1 else None
+                direct_connection = direct_connections[0] if direct_connections else None
+                direct_status_framing_ok = hostile_status_outcomes == (
+                    "infra",
+                    "infra",
+                    "infra",
+                    "infra",
+                    "infra",
+                    "infra",
+                    "reject",
+                    "infra",
                 )
                 direct_https_ok = (
                     direct_https
@@ -854,7 +1057,8 @@ def main() -> int:
                         and all(call[2] == expected_headers for call in request_calls)
                         and request_calls[0][3] == 1_048_576
                         and request_calls[0][3] > request_calls[1][3] > request_calls[2][3]
-                        and direct_https_ok,
+                        and direct_https_ok
+                        and direct_route_closed,
                         "only the fixed credential-free provider authority is requested",
                     )
                 )
@@ -1001,10 +1205,21 @@ def main() -> int:
                 def hanging_worker_requester(
                     _authority, _path, _headers, _maximum, _deadline
                 ):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     while True:
                         signal.pause()
 
                 experiment._github_api_request = hanging_worker_requester
+                calibration_started = __import__("time").monotonic()
+                __import__("time").sleep(0.01)
+                calibration_elapsed = (
+                    __import__("time").monotonic() - calibration_started
+                )
+                worker_timeout_budget = 0.05
+                worker_timeout_tolerance = min(
+                    0.10,
+                    max(0.05, 4 * max(0.0, calibration_elapsed - 0.01)),
+                )
                 worker_timeout_started = __import__("time").monotonic()
                 try:
                     try:
@@ -1013,7 +1228,7 @@ def main() -> int:
                             f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
                             expected_headers,
                             1_024,
-                            worker_timeout_started + 0.05,
+                            worker_timeout_started + worker_timeout_budget,
                         )
                         worker_timeout_outcome = "ok"
                     except experiment.InfrastructureError as error:
@@ -1028,8 +1243,9 @@ def main() -> int:
                         "GIT-TIMEOUT-001",
                         "GIT-TIMEOUT" in timeout_outcome
                         and "GIT-TIMEOUT" in worker_timeout_outcome
-                        and worker_timeout_elapsed < 1.0,
-                        "one absolute acquisition deadline bounds all provider requests",
+                        and worker_timeout_elapsed
+                        <= worker_timeout_budget + worker_timeout_tolerance,
+                        "one absolute deadline includes provider cleanup",
                     )
                 )
 
@@ -1124,7 +1340,8 @@ def main() -> int:
                         "GIT-OUTPUT-001",
                         output_outcome[0] == "infra"
                         and "GIT-OUTPUT" in output_outcome[1]
-                        and worker_frames_rejected,
+                        and worker_frames_rejected
+                        and injected_lengths_closed,
                         "provider and worker output frames are strictly bounded",
                     )
                 )
@@ -1301,6 +1518,93 @@ def main() -> int:
                     "GIT-WORKER" in mask_failure_outcome
                     and not mask_failure_marker.exists()
                 )
+
+                stop_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                stop_listener.bind(("127.0.0.1", 0))
+                stop_listener.settimeout(1.0)
+                stop_address = stop_listener.getsockname()
+                original_worker_child = experiment._git_worker_child
+
+                def stopped_before_session(
+                    _control_read,
+                    _stdout_write,
+                    _stderr_write,
+                    _authority,
+                    _path,
+                    _headers,
+                    _maximum,
+                    _deadline,
+                ):
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                        sender.sendto(f"{os.getpid()}\n".encode("ascii"), stop_address)
+                    os.kill(os.getpid(), signal.SIGSTOP)
+                    os._exit(125)
+
+                experiment._git_worker_child = stopped_before_session
+                try:
+                    try:
+                        experiment._github_worker_request(
+                            "api.github.com",
+                            f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                            expected_headers,
+                            1_024,
+                            __import__("time").monotonic() + 0.05,
+                        )
+                        stopped_outcome = "ok"
+                    except experiment.InfrastructureError:
+                        stopped_outcome = "infra"
+                    except BaseException:
+                        stopped_outcome = "other"
+                finally:
+                    experiment._git_worker_child = original_worker_child
+                try:
+                    stopped_record = stop_listener.recv(64).decode("ascii").strip()
+                except (TimeoutError, UnicodeDecodeError):
+                    stopped_record = ""
+                finally:
+                    stop_listener.close()
+                stopped_pid = int(stopped_record) if stopped_record.isdigit() else None
+                stopped_reaped_before_return = False
+                stopped_reaped_by_harness = False
+                stopped_alive = False
+                if stopped_pid is not None:
+                    try:
+                        waited, _ = os.waitpid(stopped_pid, os.WNOHANG)
+                    except ChildProcessError:
+                        stopped_reaped_before_return = True
+                        stopped_reaped_by_harness = True
+                    else:
+                        stopped_reaped_by_harness = waited == stopped_pid
+                    try:
+                        os.kill(stopped_pid, 0)
+                    except ProcessLookupError:
+                        stopped_alive = False
+                    else:
+                        stopped_alive = True
+                    if not stopped_reaped_by_harness:
+                        if stopped_alive:
+                            try:
+                                os.kill(stopped_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        stop_reap_deadline = __import__("time").monotonic() + 1.0
+                        while __import__("time").monotonic() < stop_reap_deadline:
+                            try:
+                                waited, _ = os.waitpid(stopped_pid, os.WNOHANG)
+                            except ChildProcessError:
+                                stopped_reaped_by_harness = True
+                                break
+                            if waited == stopped_pid:
+                                stopped_reaped_by_harness = True
+                                break
+                            __import__("time").sleep(0.01)
+                if stopped_pid is None or not stopped_reaped_by_harness:
+                    raise RuntimeError("stopped worker fixture cleanup is uncertain")
+                stopped_child_cleaned = (
+                    stopped_outcome == "infra"
+                    and stopped_reaped_before_return
+                    and not stopped_alive
+                )
                 results.append(
                     (
                         "GIT-PGROUP-001",
@@ -1308,10 +1612,11 @@ def main() -> int:
                         and worker_snapshot.data == large_source
                         and nonblocking_terminate
                         and mask_clear_fail_closed
+                        and stopped_child_cleaned
                         and len(large_responses[
                             f"/repos/uscient/experiment-fixture/git/blobs/{large_blob}"
                         ][2]) > 65_536,
-                        "the fixed worker enforces limits, nonblocking cleanup, and a cleared mask",
+                        "the fixed worker enforces limits and cleans pre-session stops",
                     )
                 )
 
@@ -1334,6 +1639,7 @@ def main() -> int:
                         original_requester = experiment._github_api_request
                         original_group_probe = experiment._git_worker_group_alive
                         original_close = experiment.os.close
+                        original_selector = experiment.selectors.DefaultSelector
                         close_calls = [0]
 
                         def cleanup_requester(
@@ -1361,11 +1667,16 @@ def main() -> int:
                                     raise OSError("cleanup close failed")
                             return original_close(descriptor)
 
+                        def failed_selector():
+                            raise OSError("selector construction failed")
+
                         experiment._github_api_request = cleanup_requester
                         if kind == "group":
                             experiment._git_worker_group_alive = failed_group_probe
                         elif kind == "close":
                             experiment.os.close = failed_cleanup_close
+                        elif kind == "selector":
+                            experiment.selectors.DefaultSelector = failed_selector
                         try:
                             try:
                                 experiment._github_worker_request(
@@ -1395,6 +1706,7 @@ def main() -> int:
                             experiment._github_api_request = original_requester
                             experiment._git_worker_group_alive = original_group_probe
                             experiment.os.close = original_close
+                            experiment.selectors.DefaultSelector = original_selector
                         os._exit(0 if outcome == "infra" and restored else 1)
 
                     probe_status = None
@@ -1425,6 +1737,7 @@ def main() -> int:
 
                 group_probe_fail_closed = cleanup_fault_probe("group")
                 close_failure_fail_closed = cleanup_fault_probe("close")
+                selector_failure_fail_closed = cleanup_fault_probe("selector")
 
                 residual_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 residual_listener.bind(("127.0.0.1", 0))
@@ -1600,13 +1913,14 @@ def main() -> int:
                         and clean_signal_preserved
                         and cleanup_uncertainty_wins
                         and group_probe_fail_closed
-                        and close_failure_fail_closed,
+                        and close_failure_fail_closed
+                        and selector_failure_fail_closed,
                         "cleanup uncertainty fails closed before caller signals are restored",
                     )
                 )
 
                 taxonomy_outcomes = []
-                for status in (404, 403, 500):
+                for status in (404, 422, 403, 500):
                     status_responses = dict(fixture_responses)
                     status_responses[next(iter(fixture_responses))] = (
                         status,
@@ -1653,13 +1967,16 @@ def main() -> int:
                         taxonomy_outcomes
                         == [
                             (404, "reject"),
+                            (422, "infra"),
                             (403, "infra"),
                             (500, "infra"),
                             (200, "infra"),
                             ("tree-404", "infra"),
                             ("blob-422", "infra"),
-                        ],
-                        "stable absence is rejection while provider uncertainty is infrastructure",
+                        ]
+                        and direct_status_framing_ok
+                        and stable_not_found_route_closed,
+                        "only a strictly framed commit 404 is stable absence",
                     )
                 )
 
