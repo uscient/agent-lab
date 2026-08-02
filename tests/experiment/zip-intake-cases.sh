@@ -23,7 +23,7 @@ mkdir -p "$work/home" "$work/tmp"
 
 if ! python3 -I -B "$repo_root/tests/experiment/zip-fixtures.py" \
   "$fixture/experiment.cue" "$work"; then
-  printf 'SUMMARY assertions=0 expected=29 failures=0 infra=1\n'
+  printf 'SUMMARY assertions=0 expected=31 failures=0 infra=1\n'
   exit 125
 fi
 
@@ -48,7 +48,7 @@ init_home() {
   capture "$label" "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed\n' >&2
-    printf 'SUMMARY assertions=%s expected=29 failures=%s infra=1\n' \
+    printf 'SUMMARY assertions=%s expected=31 failures=%s infra=1\n' \
       "$(wc -l < "$observed")" "$failures"
     exit 125
   fi
@@ -126,12 +126,27 @@ else
   fail ZIP-001 "public zip check normalizes stored and deflated sources"
 fi
 
+capture utf8-ascii "$agent_lab" experiment check --zip "$work/utf8-ascii.zip"
+utf8_ascii_rc="$CAPTURE_RC"
+capture creator-version "$agent_lab" experiment check --zip "$work/creator-version-45.zip"
+creator_version_rc="$CAPTURE_RC"
+if [ "$utf8_ascii_rc" -eq 0 ] && [ "$creator_version_rc" -eq 0 ] &&
+   [ ! -s "$work/utf8-ascii.err" ] && [ ! -s "$work/creator-version.err" ] &&
+   [ "$(jq -r '.source.digest' "$work/utf8-ascii.out")" = \
+     "$(jq -r '.source.digest' "$work/directory.out")" ] &&
+   [ "$(jq -r '.source.digest' "$work/creator-version.out")" = \
+     "$(jq -r '.source.digest' "$work/directory.out")" ]; then
+  pass ZIP-COMPAT-001 "benign UTF-8 and creator-version metadata remain compatible"
+else
+  fail ZIP-COMPAT-001 "benign UTF-8 and creator-version metadata remain compatible"
+fi
+
 expect_all_reject ZIP-PATH-001 ZIP-PATH "only the exact ASCII root member name is accepted" \
   wrong-case.zip wrapper.zip dotdot.zip backslash.zip absolute.zip drive.zip unc.zip \
   nul-name.zip control-name.zip nonascii.zip
 
 expect_all_reject ZIP-COUNT-001 ZIP-COUNT "the archive has exactly one member" \
-  zero-count.zip extra-entry.zip duplicate.zip
+  zero-count.zip eocd-count-mismatch.zip extra-entry.zip duplicate.zip
 
 expect_all_reject ZIP-TYPE-001 ZIP-TYPE "the sole member is a regular file" \
   directory-type.zip symlink-type.zip fifo-type.zip
@@ -149,12 +164,16 @@ expect_all_reject ZIP-ZIP64-001 ZIP-ZIP64 "ZIP64 and multidisk records are refus
   zip64-version.zip zip64-sentinel.zip multidisk.zip
 
 expect_all_reject ZIP-HEADER-001 ZIP-HEADER "central and local headers agree exactly" \
-  central-signature.zip central-name-mismatch.zip central-flags-mismatch.zip
+  central-signature.zip central-name-mismatch.zip central-flags-mismatch.zip \
+  local-method-mismatch.zip local-crc-mismatch.zip local-size-mismatch.zip \
+  eocd-offset-mismatch.zip eocd-size-mismatch.zip prefixed.zip duplicate-eocd.zip \
+  concatenated.zip
 
-expect_all_reject ZIP-CRC-001 ZIP-CRC "member CRC is verified" bad-crc.zip
+expect_all_reject ZIP-CRC-001 ZIP-CRC "member CRC is verified" \
+  bad-crc.zip corrupt-payload.zip
 
 expect_all_reject ZIP-LENGTH-001 ZIP-LENGTH "declared and decoded lengths agree" \
-  bad-length.zip
+  bad-length.zip payload-gap.zip
 
 expect_all_reject ZIP-SIZE-001 ZIP-SIZE "archive and expanded source bounds apply before planning" \
   archive-over.zip expanded-over.zip deflate-bomb.zip
@@ -165,7 +184,8 @@ expect_all_reject ZIP-BOMB-001 ZIP-BOMB "declared-small deflate expansion stops 
 expect_all_reject ZIP-TRUNC-001 ZIP-TRUNC "truncated records and deflate streams are refused" \
   missing-central.zip truncated-deflate.zip
 
-expect_all_reject ZIP-TRAIL-001 ZIP-TRAIL "bytes after the canonical archive end are refused" trailing.zip
+expect_all_reject ZIP-TRAIL-001 ZIP-TRAIL "bytes after the canonical archive end are refused" \
+  trailing.zip deflate-unused-input.zip
 
 capture expanded-limit "$agent_lab" experiment check --zip "$work/expanded-limit.zip"
 limit_digest="$(python3 -I -B - "$work/expanded-limit.cue" <<'PY'
@@ -269,6 +289,33 @@ then
   pass ZIP-DECODE-001 "unexpected decoder exceptions are infrastructure uncertainty"
 else
   fail ZIP-DECODE-001 "unexpected decoder exceptions are infrastructure uncertainty"
+fi
+
+if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/deflated.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+
+spec = spec_from_file_location("zip_clock_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def uncertain_clock():
+    raise RuntimeError("injected monotonic-clock uncertainty")
+
+module.time.monotonic = uncertain_clock
+try:
+    module.read_zip_snapshot(sys.argv[2])
+except module.InfrastructureError as error:
+    assert "ZIP-DECODE" in str(error)
+else:
+    raise AssertionError("initial decoder clock failure was accepted")
+PY
+then
+  pass ZIP-DECODE-002 "initial decoder clock failure is infrastructure uncertainty"
+else
+  fail ZIP-DECODE-002 "initial decoder clock failure is infrastructure uncertainty"
 fi
 
 if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/deflated.zip" <<'PY'
@@ -604,10 +651,10 @@ fi
 
 expected="$work/expected"
 printf '%s\n' \
-  ZIP-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
+  ZIP-001 ZIP-COMPAT-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
   ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001 \
   ZIP-LENGTH-001 ZIP-SIZE-001 ZIP-BOMB-001 ZIP-TRUNC-001 ZIP-TRAIL-001 \
-  ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-TIMEOUT-001 \
+  ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-DECODE-002 ZIP-TIMEOUT-001 \
   ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 \
   ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
@@ -619,7 +666,7 @@ if ! cleanup_work; then
   cleanup_infrastructure=1
 fi
 trap - EXIT
-printf 'SUMMARY assertions=29 expected=29 failures=%s infra=%s\n' \
+printf 'SUMMARY assertions=31 expected=31 failures=%s infra=%s\n' \
   "$failures" "$cleanup_infrastructure"
 [ "$cleanup_infrastructure" -eq 0 ] || exit 125
 [ "$failures" -eq 0 ]
