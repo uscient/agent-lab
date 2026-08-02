@@ -51,5 +51,10 @@ agent-lab image remove vendor.image --expect sha256:<entry digest>
 
 Add records a mapping only. Same-subject add is idempotent; a different subject never overwrites.
 Remove uses the active entry digest as a compare-and-swap token, creates a generation-two tombstone,
-and makes the name non-reusable in v0. A name is resolved to an immutable subject before authorization. Catalog membership
-is naming only, not image presence, admission, safety, or runnable status.
+and makes the name non-reusable in v0. A local name is resolved from one held, verified catalog
+snapshot. The plan binds only the selected entry digest, generation, and immutable subject; checked
+evidence separately records the held snapshot revision and digest. An unrelated catalog change
+therefore changes catalog evidence without changing the selected plan identity.
+
+Catalog membership is naming only, not image presence, admission, safety, or runnable status. See
+[`images.md`](images.md) for the exact namespace, mutation, persistence, and failure contract.
