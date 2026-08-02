@@ -1,104 +1,74 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 work="$(mktemp -d)"
 trap 'find "$work" -type f -delete 2>/dev/null || true; find "$work" -type l -delete 2>/dev/null || true; find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || true' EXIT
-home="$work/home"
-agent_lab="$repo_root/scripts/agent-lab"
-"$agent_lab" --home "$home" init >/dev/null
-subject="registry.example/operator/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-other="registry.example/operator/other@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-failures=0
-capture() { RC=0; "$@" > "$work/out" 2> "$work/err" || RC=$?; }
-pass() { printf 'PASS %s %s\n' "$1" "$2"; }
-fail() { printf 'FAIL %s %s\n' "$1" "$2"; failures=$((failures + 1)); }
 
-capture "$agent_lab" --home "$home" image add vendor.worker "$subject"
-if [ "$RC" -eq 0 ] && jq -e '.changed == true and .generation == 1 and (.entryDigest | startswith("sha256:"))' "$work/out" >/dev/null 2>&1; then
-  pass CAT-001 "first add publishes a generation-one digest binding"
-  entry="$(jq -r '.entryDigest' "$work/out")"
-else
-  fail CAT-001 "first add publishes a generation-one digest binding"
-  entry="sha256:$(printf '0%.0s' {1..64})"
+subcases=(
+  "$repo_root/tests/image/catalog-cases.sh"
+  "$repo_root/tests/image/catalog-state-cases.py"
+  "$repo_root/tests/experiment/catalog-resolution-cases.sh"
+)
+expected="$work/expected"
+observed="$work/observed"
+: > "$observed"
+printf '%s\n' \
+  CAT-NAME-001 CAT-NAME-002 CAT-OCI-001 CAT-OCI-002 \
+  CAT-ADD-001 CAT-ADD-002 CAT-ADD-003 CAT-ADD-004 CAT-NS-001 \
+  CAT-CAS-001 CAT-CAS-002 CAT-CAS-003 CAT-CAS-004 \
+  CAT-READ-001 CAT-READ-002 CAT-NOEF-001 CAT-CONC-001 CAT-CONC-002 \
+  CAT-STATE-001 CAT-STATE-002 CAT-STATE-003 CAT-STATE-004 \
+  CAT-STATE-005 CAT-STATE-006 CAT-STATE-007 CAT-STATE-008 \
+  CAT-STATE-009 CAT-STATE-010 CAT-STATE-011 CAT-STATE-012 \
+  CAT-BOUND-001 CAT-BOUND-002 CAT-CRASH-001 CAT-CRASH-002 \
+  CAT-CRASH-003 CAT-PLAT-001 \
+  RES-ENTRY-001 RES-SNAP-001 RES-SNAP-002 RES-ENTRY-002 RES-ENTRY-003 \
+  RES-ISOLATE-001 RES-STATE-001 RES-STATE-002 RES-STATE-003 RES-INPUT-001 \
+  RES-SNAP-003 RES-AUTH-001 RES-NOEF-001 > "$expected"
+expected_count="$(wc -l < "$expected")"
+infrastructure=0
+
+for index in "${!subcases[@]}"; do
+  subcase="${subcases[$index]}"
+  output="$work/subcase-$index.out"
+  if [ ! -f "$subcase" ]; then
+    printf 'INFRA required catalog subcase is missing: %s\n' "$subcase" >&2
+    infrastructure=1
+    continue
+  fi
+  case "$subcase" in
+    *.py)
+      python3 -I "$subcase" > "$output" 2>&1
+      rc=$?
+      ;;
+    *)
+      bash "$subcase" > "$output" 2>&1
+      rc=$?
+      ;;
+  esac
+  cat "$output"
+  awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+    printf 'INFRA catalog subcase returned %s: %s\n' "$rc" "$subcase" >&2
+    infrastructure=1
+  fi
+done
+
+assertions="$(wc -l < "$observed")"
+failures="$(awk '/^FAIL [A-Z0-9-]+ / {count++} END {print count + 0}' "$work"/subcase-*.out 2>/dev/null)"
+if ! cmp -s "$expected" "$observed"; then
+  printf 'INFRA catalog aggregate assertion identity drift\n' >&2
+  diff -u "$expected" "$observed" >&2 || true
+  infrastructure=1
 fi
 
-capture "$agent_lab" --home "$home" image add vendor.worker "$subject"
-if [ "$RC" -eq 0 ] && jq -e --arg entry "$entry" '.changed == false and .entryDigest == $entry' "$work/out" >/dev/null 2>&1; then
-  pass CAT-002 "same-subject add is idempotent"
-else
-  fail CAT-002 "same-subject add is idempotent"
+printf 'SUMMARY assertions=%s expected=%s failures=%s infra=%s\n' \
+  "$assertions" "$expected_count" "$failures" "$infrastructure"
+if [ "$infrastructure" -ne 0 ]; then
+  exit 125
 fi
-
-capture "$agent_lab" --home "$home" image add vendor.worker "$other"
-if [ "$RC" -eq 1 ] && [ ! -s "$work/out" ]; then
-  pass CAT-003 "different-subject add never overwrites"
-else
-  fail CAT-003 "different-subject add never overwrites"
+if [ "$failures" -ne 0 ]; then
+  exit 1
 fi
-
-cp -a "$repo_root/.cache/dev/tools/cue/." "$home/cache/tools/cue/"
-artifact="$work/catalog-artifact"
-mkdir "$artifact"
-sed 's#image: digestRef: "[^"]*"#image: catalogName: "vendor.worker"#' \
-  "$repo_root/tests/experiment/fixtures/directories/minimal/experiment.cue" > "$artifact/experiment.cue"
-capture "$agent_lab" --home "$home" experiment check "$artifact"
-if [ "$RC" -eq 0 ] && jq -e --arg entry "$entry" --arg subject "$subject" '
-  .plan.spec.members[0].resolvedImage == {
-    entryDigest: $entry,
-    generation: 1,
-    origin: "local",
-    subject: $subject
-  }
-' "$work/out" >/dev/null 2>&1; then
-  pass RES-001 "Experiment resolution binds the active local entry and subject"
-else
-  fail RES-001 "Experiment resolution binds the active local entry and subject"
-  printf 'RES-001 rc=%s stderr=%s\n' "$RC" "$(tr '\n' ' ' < "$work/err" 2>/dev/null || true)"
-fi
-
-capture "$agent_lab" --home "$home" image remove vendor.worker --expect "$entry"
-if [ "$RC" -eq 0 ] && jq -e '.changed == true and .generation == 2 and .state == "removed"' "$work/out" >/dev/null 2>&1; then
-  pass CAT-004 "exact CAS removal publishes a generation-two tombstone"
-else
-  fail CAT-004 "exact CAS removal publishes a generation-two tombstone"
-fi
-
-capture "$agent_lab" --home "$home" image remove vendor.worker --expect "$entry"
-if [ "$RC" -eq 0 ] && jq -e '.changed == false and .generation == 2' "$work/out" >/dev/null 2>&1; then
-  pass CAT-007 "lost-response removal retry is idempotent with the original token"
-else
-  fail CAT-007 "lost-response removal retry is idempotent with the original token"
-fi
-
-capture "$agent_lab" --home "$home" image add vendor.worker "$subject"
-if [ "$RC" -eq 1 ] && [ ! -s "$work/out" ]; then
-  pass CAT-008 "a tombstoned v0 name cannot be reused"
-else
-  fail CAT-008 "a tombstoned v0 name cannot be reused"
-fi
-
-capture "$agent_lab" --home "$home" image add agent-lab.worker "$subject"
-if [ "$RC" -eq 1 ] && [ ! -s "$work/out" ]; then
-  pass CAT-005 "release-owned names cannot be claimed locally"
-else
-  fail CAT-005 "release-owned names cannot be claimed locally"
-fi
-
-capture "$agent_lab" --home "$home" image list --all
-if [ "$RC" -eq 0 ] && jq -e '.[0].name == "vendor.worker" and .[0].state == "removed"' "$work/out" >/dev/null 2>&1; then
-  pass CAT-006 "list all reports the immutable tombstone"
-else
-  fail CAT-006 "list all reports the immutable tombstone"
-fi
-
-printf '{"snapshotDigest":"sha256:%064d"}\n' 0 > "$home/images/catalog/current.json"
-capture "$agent_lab" --home "$home" image list
-if [ "$RC" -eq 125 ] && [ ! -s "$work/out" ]; then
-  pass CAT-009 "corrupt catalog authority is infrastructure uncertainty, never empty"
-else
-  fail CAT-009 "corrupt catalog authority is infrastructure uncertainty, never empty"
-fi
-
-printf 'SUMMARY assertions=10 expected=10 failures=%s infra=0\n' "$failures"
-[ "$failures" -eq 0 ]
+printf 'EXPERIMENT LOCAL IMAGE CATALOG PASS\n'
