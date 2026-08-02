@@ -24,12 +24,8 @@ contractDigest: string & =~"^sha256:[0-9a-f]{64}$" @tag(contractDigest)
 		}) {
 			name:              member.name
 			requestedSelector: member.image
-			resolvedImage: close({
-				origin:  "direct"
-				subject: member.image.digestRef
-			})
-			command:       member.command
-			resourceClass: member.resourceClass
+			command:           member.command
+			resourceClass:     member.resourceClass
 		}]
 	})
 })
