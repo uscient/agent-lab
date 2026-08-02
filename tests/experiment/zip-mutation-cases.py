@@ -222,7 +222,7 @@ def main() -> int:
         cases = (
             (
                 "M-ZIP-COUNT-001",
-                "extra-entry.zip",
+                "zero-count.zip",
                 "ZIP-COUNT",
                 "    if disk_entries != 1 or total_entries != 1:\n",
                 (
@@ -271,7 +271,7 @@ def main() -> int:
             ),
             (
                 "M-ZIP-METHOD-001",
-                "unsupported-method.zip",
+                "unsupported-deflate-method.zip",
                 "ZIP-METHOD",
                 "    if method not in (0, 8):\n",
                 (
