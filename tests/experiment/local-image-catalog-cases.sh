@@ -54,6 +54,7 @@ if [ "$RC" -eq 0 ] && jq -e --arg entry "$entry" --arg subject "$subject" '
   pass RES-001 "Experiment resolution binds the active local entry and subject"
 else
   fail RES-001 "Experiment resolution binds the active local entry and subject"
+  printf 'RES-001 rc=%s stderr=%s\n' "$RC" "$(tr '\n' ' ' < "$work/err" 2>/dev/null || true)"
 fi
 
 capture "$agent_lab" --home "$home" image remove vendor.worker --expect "$entry"
