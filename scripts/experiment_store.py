@@ -869,6 +869,9 @@ def _closed_git_transport(transport: object) -> dict[str, object] | None:
         return None
     acquisition = transport.get("acquisition")
     requested = transport.get("requestedCommit")
+    tree = transport.get("tree")
+    blob = transport.get("blob")
+    url = transport.get("url")
     if (
         not isinstance(acquisition, dict)
         or set(acquisition)
@@ -880,21 +883,26 @@ def _closed_git_transport(transport: object) -> dict[str, object] | None:
             "temporaryBytes",
             "temporaryFiles",
         }
-        or not isinstance(acquisition.get("acquiredBytes"), int)
-        or isinstance(acquisition.get("acquiredBytes"), bool)
+        or type(acquisition.get("acquiredBytes")) is not int
         or not 1 <= int(acquisition["acquiredBytes"]) <= MAX_ARCHIVE_BYTES
+        or type(acquisition.get("limitBytes")) is not int
         or acquisition.get("limitBytes") != MAX_ARCHIVE_BYTES
         or acquisition.get("method") != "github-git-data-v3"
+        or type(acquisition.get("requestCount")) is not int
         or acquisition.get("requestCount") != 3
+        or type(acquisition.get("temporaryBytes")) is not int
         or acquisition.get("temporaryBytes") != 0
+        or type(acquisition.get("temporaryFiles")) is not int
         or acquisition.get("temporaryFiles") != 0
         or not isinstance(requested, str)
         or GIT_COMMIT.fullmatch(requested) is None
         or transport.get("commit") != f"sha1:{requested}"
-        or GIT_SHA1.fullmatch(str(transport.get("tree"))) is None
-        or GIT_SHA1.fullmatch(str(transport.get("blob"))) is None
-        or not isinstance(transport.get("url"), str)
-        or GIT_URL.fullmatch(str(transport["url"])) is None
+        or not isinstance(tree, str)
+        or GIT_SHA1.fullmatch(tree) is None
+        or not isinstance(blob, str)
+        or GIT_SHA1.fullmatch(blob) is None
+        or not isinstance(url, str)
+        or GIT_URL.fullmatch(url) is None
     ):
         return None
     return {

@@ -541,17 +541,29 @@ def _git_worker_group_alive(pid: int) -> bool:
         os.killpg(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
+    except OSError as error:
+        raise InfrastructureError(
+            "git provider GIT-WORKER process-group state is uncertain"
+        ) from error
     return True
 
 
 def _git_worker_terminate(pid: int, *, reaped: bool) -> bool:
+    uncertain = False
     for signum in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(pid, signum)
         except ProcessLookupError:
             pass
+        except OSError:
+            uncertain = True
+            if not reaped:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    uncertain = True
         deadline = time.monotonic() + GIT_WORKER_GRACE_SECONDS
         while time.monotonic() < deadline:
             if not reaped:
@@ -559,20 +571,33 @@ def _git_worker_terminate(pid: int, *, reaped: bool) -> bool:
                     waited, _ = os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
                     reaped = True
+                except OSError:
+                    uncertain = True
                 else:
                     reaped = waited == pid
-            if reaped and not _git_worker_group_alive(pid):
-                return True
+            try:
+                group_alive = _git_worker_group_alive(pid)
+            except (InfrastructureError, OSError):
+                group_alive = True
+                uncertain = True
+            if reaped and not group_alive:
+                return not uncertain
             time.sleep(0.01)
     if not reaped:
         try:
-            os.waitpid(pid, 0)
-            reaped = True
+            waited, _ = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             reaped = True
         except OSError:
-            pass
-    return reaped and not _git_worker_group_alive(pid)
+            uncertain = True
+        else:
+            reaped = waited == pid
+    try:
+        group_alive = _git_worker_group_alive(pid)
+    except (InfrastructureError, OSError):
+        group_alive = True
+        uncertain = True
+    return reaped and not group_alive and not uncertain
 
 
 def _git_worker_write(descriptor: int, data: bytes) -> None:
@@ -599,10 +624,7 @@ def _git_worker_child(
         os.setsid()
         for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
             signal.signal(signum, signal.SIG_DFL)
-        try:
-            signal.pthread_sigmask(signal.SIG_SETMASK, set())
-        except (AttributeError, OSError, ValueError):
-            pass
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
         null_descriptor = os.open("/dev/null", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
         os.dup2(null_descriptor, 0)
         os.dup2(stdout_write, 1)
@@ -914,7 +936,12 @@ def _github_worker_request(
         raise InfrastructureError("git provider GIT-WORKER could not establish a result") from error
     finally:
         cleanup_error: InfrastructureError | None = None
-        selector.close()
+        try:
+            selector.close()
+        except (OSError, ValueError) as error:
+            cleanup_error = InfrastructureError(
+                "git provider GIT-WORKER selector cleanup is uncertain"
+            )
         for descriptor in (
             control_read,
             control_write,
@@ -926,13 +953,31 @@ def _github_worker_request(
             if descriptor >= 0:
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
-        if pid > 0 and (not reaped or _git_worker_group_alive(pid)):
-            if not _git_worker_terminate(pid, reaped=reaped):
-                cleanup_error = InfrastructureError(
-                    "git provider GIT-WORKER cleanup is uncertain"
-                )
+                except OSError as error:
+                    if cleanup_error is None:
+                        cleanup_error = InfrastructureError(
+                            "git provider GIT-WORKER descriptor cleanup is uncertain"
+                        )
+        if pid > 0:
+            needs_termination = not reaped
+            if not needs_termination:
+                try:
+                    needs_termination = _git_worker_group_alive(pid)
+                except (InfrastructureError, OSError):
+                    needs_termination = True
+                    if cleanup_error is None:
+                        cleanup_error = InfrastructureError(
+                            "git provider GIT-WORKER process-group cleanup is uncertain"
+                        )
+            if needs_termination:
+                try:
+                    terminated = _git_worker_terminate(pid, reaped=reaped)
+                except (InfrastructureError, OSError, ValueError):
+                    terminated = False
+                if not terminated and cleanup_error is None:
+                    cleanup_error = InfrastructureError(
+                        "git provider GIT-WORKER cleanup is uncertain"
+                    )
         cleanup_mask: set[signal.Signals] | None = None
         try:
             cleanup_mask = change_mask(signal.SIG_BLOCK, managed_signals)
@@ -960,10 +1005,10 @@ def _github_worker_request(
                 except InfrastructureError as error:
                     if cleanup_error is None:
                         cleanup_error = error
-        if interrupted is not None:
-            raise SystemExit(128 + interrupted)
         if cleanup_error is not None:
             raise cleanup_error
+        if interrupted is not None:
+            raise SystemExit(128 + interrupted)
 
 
 def _read_git_snapshot_with_requester(
