@@ -3,6 +3,8 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
+local_onboarding="$repo_root/tests/experiment/local-onboarding-cases.sh"
+install_lifecycle="$repo_root/tests/experiment/install-lifecycle-cases.sh"
 source_adapters="$repo_root/tests/experiment/source-adapter-cases.sh"
 expected_count=23
 work=""
@@ -25,6 +27,8 @@ fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 replica="$work/repo"
 replica_lifecycle="$replica/tests/experiment/local-lifecycle-cases.sh"
+replica_local_onboarding="$replica/tests/experiment/local-onboarding-cases.sh"
+replica_install_lifecycle="$replica/tests/experiment/install-lifecycle-cases.sh"
 replica_source_adapters="$replica/tests/experiment/source-adapter-cases.sh"
 mkdir -p "$replica/tests/experiment" "$replica/tests/install"
 cp "$lifecycle" "$replica_lifecycle"
@@ -293,6 +297,25 @@ run_source_replica() {
   run_selected "$output" "$replica_source_adapters" "$@"
 }
 
+route_output_valid() {
+  local output="$1"
+  local expected_file="$2"
+  local expected_assertions="$3"
+  local marker="$4"
+  local rc="$5"
+
+  [ "$rc" -eq 0 ] &&
+    cmp -s "$expected_file" <(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output") &&
+    [ "$(grep -Fxc \
+      "SUMMARY assertions=$expected_assertions expected=$expected_assertions failures=0 infra=0" \
+      "$output" || true)" -eq 1 ] &&
+    [ "$(awk 'END {print}' "$output")" = "$marker" ] &&
+    awk -v summary="SUMMARY assertions=$expected_assertions expected=$expected_assertions failures=0 infra=0" \
+      -v marker="$marker" \
+      '/^(PASS|FAIL) [A-Z0-9-]+ / {next} $0 == summary {next} $0 == marker {next} {bad=1} END {exit bad}' \
+      "$output"
+}
+
 wait_for_path() {
   local path="$1"
   local attempts=0
@@ -387,6 +410,98 @@ run_replica "$work/overlap.out" env \
   AGENT_LAB_AGG_EXEC_LOG="$overlap_executions" \
   AGENT_LAB_AGG_BARRIER_DIR="$overlap_barrier" || overlap_rc=$?
 
+split_routing_contract=0
+split_output_contract=0
+split_mutation_contract=0
+if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
+  cp "$local_onboarding" "$replica_local_onboarding"
+  cp "$install_lifecycle" "$replica_install_lifecycle"
+  chmod +x "$replica_local_onboarding" "$replica_install_lifecycle"
+
+  expected_local_ids="$work/expected-local-ids"
+  expected_install_ids="$work/expected-install-ids"
+  expected_local_executions="$work/expected-local-executions"
+  expected_install_executions="$work/expected-install-executions"
+  printf '%s\n' "${expected_ids[@]:0:86}" > "$expected_local_ids"
+  printf '%s\n' "${expected_ids[@]:86:47}" > "$expected_install_ids"
+  printf '%s\n' \
+    local-install-cases.sh \
+    local-config-cases.sh \
+    local-image-catalog-cases.sh > "$expected_local_executions"
+  printf '%s\n' \
+    install-store-cases.sh \
+    install-state-cases.py \
+    install-integrity-cases.py \
+    install-mutation-cases.py > "$expected_install_executions"
+
+  reset_fixtures
+  split_barrier="$work/split-barrier"
+  local_executions="$work/local-executions"
+  install_executions="$work/install-executions"
+  mkdir "$split_barrier"
+  : > "$local_executions"
+  : > "$install_executions"
+  local_route_rc=0
+  install_route_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$local_executions" \
+    AGENT_LAB_AGG_BARRIER_DIR="$split_barrier" \
+    bash "$replica_local_onboarding" > "$work/local-route.out" 2>&1 &
+  local_route_pid=$!
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$install_executions" \
+    AGENT_LAB_AGG_BARRIER_DIR="$split_barrier" \
+    bash "$replica_install_lifecycle" > "$work/install-route.out" 2>&1 &
+  install_route_pid=$!
+  wait "$local_route_pid" || local_route_rc=$?
+  wait "$install_route_pid" || install_route_rc=$?
+
+  combined_executions="$work/combined-executions"
+  LC_ALL=C sort "$local_executions" "$install_executions" > "$combined_executions"
+  if cmp -s <(LC_ALL=C sort "$expected_local_executions") \
+       <(LC_ALL=C sort "$local_executions") &&
+     cmp -s <(LC_ALL=C sort "$expected_install_executions") \
+       <(LC_ALL=C sort "$install_executions") &&
+     cmp -s <(LC_ALL=C sort "$expected_executions") "$combined_executions"; then
+    split_routing_contract=1
+  fi
+  if route_output_valid \
+       "$work/local-route.out" "$expected_local_ids" 86 \
+       'EXPERIMENT LOCAL LIFECYCLE PASS' "$local_route_rc" &&
+     route_output_valid \
+       "$work/install-route.out" "$expected_install_ids" 47 \
+       'EXPERIMENT INSTALL LIFECYCLE PASS' "$install_route_rc"; then
+    split_output_contract=1
+  fi
+
+  mutant_install_route="$replica/tests/experiment/install-lifecycle-wrong-route.sh"
+  mutation_write_rc=0
+  awk '
+    $0 == "exec bash \"$script_dir/local-lifecycle-cases.sh\" install" {
+      print "exec bash \"$script_dir/local-lifecycle-cases.sh\" local"
+      changes++
+      next
+    }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_install_lifecycle" > "$mutant_install_route" || mutation_write_rc=$?
+  chmod +x "$mutant_install_route"
+  mutant_install_executions="$work/mutant-install-executions"
+  : > "$mutant_install_executions"
+  mutant_install_rc=0
+  env AGENT_LAB_AGG_EXEC_LOG="$mutant_install_executions" \
+    bash "$mutant_install_route" > "$work/mutant-install-route.out" 2>&1 || \
+    mutant_install_rc=$?
+  if [ "$mutation_write_rc" -eq 0 ] && [ "$mutant_install_rc" -eq 0 ] &&
+     ! route_output_valid \
+       "$work/mutant-install-route.out" "$expected_install_ids" 47 \
+       'EXPERIMENT INSTALL LIFECYCLE PASS' "$mutant_install_rc" &&
+     ! cmp -s <(LC_ALL=C sort "$expected_install_executions") \
+       <(LC_ALL=C sort "$mutant_install_executions"); then
+    split_mutation_contract=1
+  fi
+fi
+
 if [ "$baseline_rc" -eq 0 ] &&
    cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$baseline_executions") &&
    [ "$mutation_count" -eq 1 ] &&
@@ -398,10 +513,12 @@ if [ "$baseline_rc" -eq 0 ] &&
    cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$overlap_executions") &&
    [ -f "$overlap_barrier/local-install-cases.sh.ready" ] &&
    [ -f "$overlap_barrier/local-image-catalog-cases.sh.ready" ] &&
-   [ -f "$overlap_barrier/install-state-cases.py.ready" ]; then
-  pass AGG-001 "execution ledger and overlap barrier prove exact-once concurrent routing"
+   [ -f "$overlap_barrier/install-state-cases.py.ready" ] &&
+   [ "$split_routing_contract" -eq 1 ] &&
+   [ "$split_mutation_contract" -eq 1 ]; then
+  pass AGG-001 "execution ledgers prove exact split routing and reject a wrong-route mutant"
 else
-  fail AGG-001 "execution ledger and overlap barrier prove exact-once concurrent routing"
+  fail AGG-001 "execution ledgers prove exact split routing and reject a wrong-route mutant"
 fi
 
 reset_fixtures
@@ -412,10 +529,11 @@ if [ "$success_rc" -eq 0 ] &&
    [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 133 ] &&
    [ "$(grep -Fxc 'SUMMARY assertions=133 expected=133 failures=0 infra=0' "$success_output")" -eq 1 ] &&
    [ "$(tail -n 1 "$success_output")" = 'EXPERIMENT LOCAL LIFECYCLE PASS' ] &&
-   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=133 expected=133 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
-  pass AGG-002 "success forwards only assertions then one summary and marker"
+   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=133 expected=133 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output" &&
+   [ "$split_output_contract" -eq 1 ]; then
+  pass AGG-002 "compatibility and split routes emit exact summaries and markers"
 else
-  fail AGG-002 "success forwards only assertions then one summary and marker"
+  fail AGG-002 "compatibility and split routes emit exact summaries and markers"
 fi
 
 missing_records=()
@@ -537,16 +655,24 @@ else
   fail AGG-009 "missing subcase summary maps to one hundred twenty-five"
 fi
 
-lane_assignment_count="$(grep -Ec '^[[:space:]]*(readonly[[:space:]]+)?lane_count=' \
+lane_assignment_count="$(grep -Ec '^[[:space:]]+lane_count=[0-9]+$' \
   "$replica_lifecycle" || true)"
-if [ "$lane_assignment_count" -eq 1 ] &&
-   [ "$(grep -Fxc 'readonly lane_count=3' "$replica_lifecycle")" -eq 1 ] &&
+if [ "$lane_assignment_count" -eq 3 ] &&
+   [ "$(grep -Fxc '    lane_count=3' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_count=1' "$replica_lifecycle")" -eq 2 ] &&
+   [ "$(grep -Fxc 'readonly lane_count' "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc 'for ((lane = 0; lane < lane_count; lane++)); do' \
      "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '  run_lane "$lane" &' "$replica_lifecycle")" -eq 1 ]; then
-  pass AGG-010 "lifecycle declares one immutable three-lane bound"
+   [ "$(grep -Fxc '  run_lane "$lane" &' "$replica_lifecycle")" -eq 1 ] &&
+   [ -f "$replica_local_onboarding" ] &&
+   [ -f "$replica_install_lifecycle" ] &&
+   [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" local' \
+     "$replica_local_onboarding" || true)" -eq 1 ] &&
+   [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" install' \
+     "$replica_install_lifecycle" || true)" -eq 1 ]; then
+  pass AGG-010 "split routes share one scheduler and cap lifecycle concurrency at two lanes"
 else
-  fail AGG-010 "lifecycle declares one immutable three-lane bound"
+  fail AGG-010 "split routes share one scheduler and cap lifecycle concurrency at two lanes"
 fi
 
 hold_ids=(
