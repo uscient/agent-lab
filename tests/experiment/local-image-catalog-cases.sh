@@ -4,6 +4,9 @@ set -u -o pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 expected_count=76
 work=""
+declare -a lane_pids=()
+declare -a signal_descendants=()
+current_lane_pid=""
 
 cleanup_work() {
   local failed=0
@@ -16,11 +19,56 @@ cleanup_work() {
   return "$failed"
 }
 
+collect_descendants() {
+  local parent_pid="$1"
+  local children=""
+  local child
+  if [ -r "/proc/$parent_pid/task/$parent_pid/children" ]; then
+    IFS= read -r children < "/proc/$parent_pid/task/$parent_pid/children" || true
+  fi
+  for child in $children; do
+    if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    signal_descendants[${#signal_descendants[@]}]="$child"
+    collect_descendants "$child"
+  done
+}
+
+catalog_signal() {
+  local signal_name="$1"
+  local signal_number="$2"
+  local lane_pid
+  local index
+  trap '' HUP INT QUIT TERM
+  trap - EXIT
+  signal_descendants=()
+  if [[ "$current_lane_pid" =~ ^[0-9]+$ ]]; then
+    signal_descendants[${#signal_descendants[@]}]="$current_lane_pid"
+    collect_descendants "$current_lane_pid"
+  fi
+  for lane_pid in "${lane_pids[@]}"; do
+    if [[ ! "$lane_pid" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    signal_descendants[${#signal_descendants[@]}]="$lane_pid"
+    collect_descendants "$lane_pid"
+  done
+  for ((index = ${#signal_descendants[@]} - 1; index >= 0; index--)); do
+    kill "-$signal_name" -- "${signal_descendants[index]}" 2>/dev/null || true
+  done
+  exit $((128 + signal_number))
+}
+
 if ! work="$(mktemp -d)"; then
   printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
+trap 'catalog_signal HUP 1' HUP
+trap 'catalog_signal INT 2' INT
+trap 'catalog_signal QUIT 3' QUIT
+trap 'catalog_signal TERM 15' TERM
 
 subcases=(
   "$repo_root/tests/image/catalog-cases.sh"
@@ -56,7 +104,6 @@ if [ "$declared_count" -ne "$expected_count" ]; then
 fi
 infrastructure=0
 readonly lane_count=2
-declare -a lane_pids=()
 
 run_subcase() {
   local index="$1"
@@ -108,7 +155,10 @@ for ((lane = 0; lane < lane_count; lane++)); do
 done
 for lane in "${!lane_pids[@]}"; do
   lane_rc=0
-  wait "${lane_pids[lane]}" || lane_rc=$?
+  current_lane_pid="${lane_pids[lane]}"
+  lane_pids[lane]=""
+  wait "$current_lane_pid" || lane_rc=$?
+  current_lane_pid=""
   if [ "$lane_rc" -ne 0 ]; then
     infrastructure=1
   fi
@@ -126,10 +176,20 @@ for index in "${!subcases[@]}"; do
     continue
   fi
   if [ ! -f "$status" ] || [ "$(wc -l < "$status")" -ne 1 ] ||
-     ! IFS= read -r rc < "$status" || [[ ! "$rc" =~ ^[0-9]+$ ]]; then
+     ! IFS= read -r rc < "$status"; then
     printf 'INFRA catalog subcase status is missing or invalid: %s\n' "$subcase" >&2
     rc=125
     infrastructure=1
+  else
+    case "$rc" in
+      0 | 1 | 125)
+        ;;
+      *)
+        printf 'INFRA catalog subcase status is missing or invalid: %s\n' "$subcase" >&2
+        rc=125
+        infrastructure=1
+        ;;
+    esac
   fi
   awk '/^(PASS|FAIL) [A-Z0-9-]+ /' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
