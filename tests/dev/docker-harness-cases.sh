@@ -41,7 +41,7 @@ dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
 runtime-inspect-differential tests/docker/runtime-inspect-differential.sh SUMMARY failures=0
 runtime-hardening tests/docker/runtime-hardening.sh SUMMARY failures=0
 secret-nondisclosure tests/docker/secret-nondisclosure.sh SUMMARY failures=0
-serena-runtime tests/docker/serena-runtime.sh SUMMARY failures=0
+serena-runtime tests/docker/serena-runtime.sh SERENA RUNTIME SUMMARY failures=0
 EOF
 actual_suites="$work/actual-docker-suites"
 awk '$1 == "suite" { $1 = ""; sub(/^ /, ""); print }' "$docker_manifest" > "$actual_suites"
@@ -50,6 +50,14 @@ if cmp -s "$expected_suites" "$actual_suites"; then
 else
   fail "versioned Docker gate has the exact required suite contract"
   diff -u "$expected_suites" "$actual_suites" || true
+fi
+
+serena_runtime="$repo_root/tests/docker/serena-runtime.sh"
+if [ "$(grep -Fxc "printf 'SERENA RUNTIME SUMMARY failures=%s\\n' \"\$failures\"" "$serena_runtime")" -eq 1 ] &&
+   ! grep -Fq "printf 'SUMMARY failures=%s\\n' \"\$failures\"" "$serena_runtime"; then
+  pass "Serena runtime owns one suite-specific completion marker"
+else
+  fail "Serena runtime owns one suite-specific completion marker"
 fi
 if grep -Fxq 'tool python3' "$fast_manifest" &&
    ! grep -Fxq 'tool timeout' "$fast_manifest" &&
