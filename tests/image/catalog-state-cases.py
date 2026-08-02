@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -74,7 +75,7 @@ def check(assertion: str, condition: bool, message: str, detail: str = "") -> No
         print(f"FAIL {assertion} {message}{suffix}")
 
 
-def cli(home: Path, *arguments: str, timeout: float = 20.0) -> subprocess.CompletedProcess[bytes]:
+def cli(home: Path, *arguments: str, timeout: float = 5.0) -> subprocess.CompletedProcess[bytes]:
     environment = {
         "PATH": "/usr/bin:/bin",
         "LANG": "C",
@@ -184,8 +185,15 @@ def hard_exit_add(home: Path, name: str, subject: str, point: str) -> int:
         except BaseException:
             os._exit(98)
         os._exit(97)
-    _, status = os.waitpid(pid, 0)
-    return os.waitstatus_to_exitcode(status)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return 124
 
 
 class BrokenOutput(io.StringIO):
@@ -664,6 +672,176 @@ def main() -> int:
             ),
         )
 
+        bootstrap_points = (
+            "catalog intent.before_fsync",
+            "catalog intent.after_fsync",
+            "catalog intent wrapper.before_fsync",
+            "catalog intent wrapper.after_fsync",
+            "catalog intent publication.before_fsync",
+            "catalog intent publication.after_fsync",
+            "catalog staged entry.before_fsync",
+            "catalog staged entry.after_fsync",
+            "catalog staged snapshot.before_fsync",
+            "catalog staged snapshot.after_fsync",
+            "catalog staged pointer.before_fsync",
+            "catalog staged pointer.after_fsync",
+            "catalog staged pointer.before_replace",
+            "catalog staged pointer.after_replace",
+            "catalog staged entries.before_fsync",
+            "catalog staged entries.after_fsync",
+            "catalog staged snapshots.before_fsync",
+            "catalog staged snapshots.after_fsync",
+            "catalog staged root.before_fsync",
+            "catalog staged root.after_fsync",
+            "catalog staged payload.before_fsync",
+            "catalog staged payload.after_fsync",
+            "catalog staged wrapper.before_fsync",
+            "catalog staged wrapper.after_fsync",
+            "catalog staged operation.before_fsync",
+            "catalog staged operation.after_fsync",
+            "catalog marker.before_write",
+            "catalog marker.after_write",
+            "catalog marker.before_fsync",
+            "catalog marker.after_fsync",
+            "bootstrap.before_rename",
+            "bootstrap.after_rename",
+            "catalog bootstrap parent.before_fsync",
+            "catalog bootstrap parent.after_fsync",
+        )
+        later_points = (
+            "catalog intent.before_fsync",
+            "catalog intent.after_fsync",
+            "catalog intent wrapper.before_fsync",
+            "catalog intent wrapper.after_fsync",
+            "catalog intent publication.before_fsync",
+            "catalog intent publication.after_fsync",
+            "catalog staged entry.before_fsync",
+            "catalog staged entry.after_fsync",
+            "catalog staged snapshot.before_fsync",
+            "catalog staged snapshot.after_fsync",
+            "catalog staged pointer.before_fsync",
+            "catalog staged pointer.after_fsync",
+            "catalog staged pointer.before_replace",
+            "catalog staged pointer.after_replace",
+            "catalog staged payload.before_fsync",
+            "catalog staged payload.after_fsync",
+            "catalog staged wrapper.before_fsync",
+            "catalog staged wrapper.after_fsync",
+            "catalog staged operation.before_fsync",
+            "catalog staged operation.after_fsync",
+            "catalog immutable entry.before_noreplace",
+            "catalog immutable entry.after_noreplace",
+            "catalog immutable entry history.before_fsync",
+            "catalog immutable entry history.after_fsync",
+            "catalog immutable snapshot.before_noreplace",
+            "catalog immutable snapshot.after_noreplace",
+            "catalog immutable snapshot history.before_fsync",
+            "catalog immutable snapshot history.after_fsync",
+            "pointer.before_replace",
+            "pointer.after_replace",
+            "catalog current pointer.before_fsync",
+            "catalog current pointer.after_fsync",
+        )
+        matrix_failures: list[str] = []
+        for index, point in enumerate(bootstrap_points):
+            home = new_home(root, f"bootstrap-crash-{index:02d}")
+            child_rc = hard_exit_add(home, "vendor.worker", SUBJECT, point)
+            before_retry = cli(home, "image", "list")
+            retry = cli(home, "image", "add", "vendor.worker", SUBJECT)
+            final = cli(home, "image", "list")
+            try:
+                before_records = json.loads(before_retry.stdout) if before_retry.returncode == 0 else None
+                retry_value = json.loads(retry.stdout) if retry.returncode == 0 else None
+                final_records = json.loads(final.stdout) if final.returncode == 0 else None
+            except json.JSONDecodeError:
+                before_records = retry_value = final_records = None
+            if not (
+                child_rc == 99
+                and before_retry.returncode == 0
+                and isinstance(before_records, list)
+                and len(before_records) in (0, 1)
+                and retry.returncode == 0
+                and isinstance(retry_value, dict)
+                and retry_value.get("changed") in (True, False)
+                and final.returncode == 0
+                and isinstance(final_records, list)
+                and [record.get("name") for record in final_records] == ["vendor.worker"]
+                and not tuple((home / "images" / ".staging").iterdir())
+            ):
+                matrix_failures.append(
+                    f"bootstrap:{point}:child={child_rc}:before={before_retry.returncode}:"
+                    f"retry={retry.returncode}:final={final.returncode}"
+                )
+        for index, point in enumerate(later_points):
+            home = new_home(root, f"later-crash-{index:02d}")
+            add(home)
+            child_rc = hard_exit_add(home, "vendor.second", OTHER_SUBJECT, point)
+            before_retry = cli(home, "image", "list")
+            retry = cli(home, "image", "add", "vendor.second", OTHER_SUBJECT)
+            final = cli(home, "image", "list")
+            try:
+                before_records = json.loads(before_retry.stdout) if before_retry.returncode == 0 else None
+                retry_value = json.loads(retry.stdout) if retry.returncode == 0 else None
+                final_records = json.loads(final.stdout) if final.returncode == 0 else None
+            except json.JSONDecodeError:
+                before_records = retry_value = final_records = None
+            before_names = (
+                [record.get("name") for record in before_records]
+                if isinstance(before_records, list)
+                else None
+            )
+            if not (
+                child_rc == 99
+                and before_retry.returncode == 0
+                and before_names in (["vendor.worker"], ["vendor.second", "vendor.worker"])
+                and retry.returncode == 0
+                and isinstance(retry_value, dict)
+                and retry_value.get("changed") in (True, False)
+                and final.returncode == 0
+                and isinstance(final_records, list)
+                and [record.get("name") for record in final_records]
+                == ["vendor.second", "vendor.worker"]
+                and not tuple((home / "images" / ".staging").iterdir())
+            ):
+                matrix_failures.append(
+                    f"later:{point}:child={child_rc}:before={before_retry.returncode}:"
+                    f"retry={retry.returncode}:final={final.returncode}"
+                )
+        check(
+            "CAT-CRASH-006",
+            not matrix_failures,
+            "hard exits around every emitted stage, record, pointer, marker, and parent-fsync seam preserve old/new views and retry",
+            "; ".join(matrix_failures[:5]),
+        )
+
+        preintent_home = new_home(root, "preintent-crash-home")
+        add(preintent_home)
+        child_rc = hard_exit_add(
+            preintent_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "catalog wrapper.after_create",
+        )
+        before_retry = cli(preintent_home, "image", "list")
+        stage_before = fingerprint(preintent_home / "images" / ".staging")
+        retry = cli(preintent_home, "image", "add", "vendor.second", OTHER_SUBJECT)
+        stage_after = fingerprint(preintent_home / "images" / ".staging")
+        before_value = json.loads(before_retry.stdout) if before_retry.returncode == 0 else []
+        check(
+            "CAT-CRASH-007",
+            child_rc == 99
+            and before_retry.returncode == 0
+            and [record.get("name") for record in before_value] == ["vendor.worker"]
+            and retry.returncode == 125
+            and retry.stdout == b""
+            and stage_before == stage_after,
+            "a pre-intent hard exit preserves the committed view and returns uncertainty without deleting residue",
+            (
+                f"child_rc={child_rc} list_rc={before_retry.returncode} "
+                f"retry_rc={retry.returncode} changed={stage_before != stage_after}"
+            ),
+        )
+
         platform_home = new_home(root, "platform-home")
         before = fingerprint(platform_home)
         original_platform = MODULE.sys.platform
@@ -708,12 +886,14 @@ def main() -> int:
         "CAT-CRASH-003",
         "CAT-CRASH-004",
         "CAT-CRASH-005",
+        "CAT-CRASH-006",
+        "CAT-CRASH-007",
         "CAT-PLAT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=25 expected=25 failures={FAILURES} infra=0")
+    print(f"SUMMARY assertions=27 expected=27 failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
