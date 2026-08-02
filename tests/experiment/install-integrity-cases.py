@@ -496,9 +496,60 @@ def probe_snapshot_race(root: Path, runtime: Path, names: tuple[str, ...]) -> Re
         error = caught
     finally:
         experiment.os.read = original_read
+
+    atomic_source = support().write_source(
+        root,
+        "snapshot-replacement-source",
+        original,
+    )
+    atomic_path = atomic_source / "experiment.cue"
+    replacement = root / "snapshot-replacement.cue"
+    replacement.write_bytes(changed)
+    os.chmod(replacement, 0o666)
+    original_read_once = experiment.read_manifest_once
+    replaced = False
+
+    def replace_before_read(target: str, *args, **kwargs) -> bytes:
+        nonlocal replaced
+        if target == str(atomic_path) and not replaced:
+            os.replace(replacement, atomic_path)
+            replaced = True
+        return original_read_once(target, *args, **kwargs)
+
+    experiment.read_manifest_once = replace_before_read
+    atomic_outcome: int | None = None
+    atomic_error: BaseException | None = None
+    try:
+        experiment.read_directory_snapshot(str(atomic_source))
+        atomic_outcome = 0
+    except experiment.InfrastructureError as caught:
+        atomic_outcome = 125
+        atomic_error = caught
+    except experiment.InvalidManifest as caught:
+        atomic_outcome = 1
+        atomic_error = caught
+    except BaseException as caught:
+        atomic_error = caught
+    finally:
+        experiment.read_manifest_once = original_read_once
+
     runtime_unchanged(runtime, names, runtime_before, "source snapshot race probe")
-    secure = reached and outcome == 125 and isinstance(error, experiment.InfrastructureError)
-    return Result(secure, f"reached={reached} outcome={outcome} error={error!r}")
+    secure = (
+        reached
+        and outcome == 125
+        and isinstance(error, experiment.InfrastructureError)
+        and replaced
+        and atomic_outcome == 125
+        and isinstance(atomic_error, experiment.InfrastructureError)
+    )
+    return Result(
+        secure,
+        (
+            f"write_reached={reached} write_outcome={outcome} write_error={error!r} "
+            f"replaced={replaced} replacement_outcome={atomic_outcome} "
+            f"replacement_error={atomic_error!r}"
+        ),
+    )
 
 
 def terminate(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
@@ -729,6 +780,53 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
         race_home / "experiments"
     )
 
+    store_home = support().initialized_home(runtime, root, "store-race-home")
+    store_path = store_home / "experiments"
+    parked_store = store_home / "experiments-parked"
+    store_before = support().tree_fingerprint(store_path)
+    store = load_private_module(
+        runtime / "scripts" / "experiment_store.py",
+        f"agent_lab_integrity_store_race_{os.getpid()}_{id(root)}",
+    )
+    store_replaced = False
+    replacement_before: tuple[tuple[object, ...], ...] | None = None
+
+    def replace_store_after_lock(point: str) -> None:
+        nonlocal store_replaced, replacement_before
+        if point == "experiment store lock.after_acquire" and not store_replaced:
+            store_path.rename(parked_store)
+            store_path.mkdir(mode=0o700)
+            staging = store_path / ".staging"
+            staging.mkdir(mode=0o700)
+            os.chmod(store_path, 0o700)
+            os.chmod(staging, 0o700)
+            replacement_before = support().tree_fingerprint(store_path)
+            store_replaced = True
+
+    with tool_environment():
+        store_rc, store_value, store_error = actual_install(
+            store,
+            store_home,
+            source,
+            fault=replace_store_after_lock,
+        )
+    original_store_preserved = (
+        store_replaced
+        and support().tree_fingerprint(parked_store) == store_before
+    )
+    replacement_store_preserved = (
+        replacement_before is not None
+        and support().tree_fingerprint(store_path) == replacement_before
+    )
+    store_race_secure = (
+        store_replaced
+        and store_rc == 125
+        and store_value is None
+        and isinstance(store_error, store.StoreInfrastructure)
+        and original_store_preserved
+        and replacement_store_preserved
+    )
+
     source_after = support().tree_fingerprint(source)
     runtime_unchanged(runtime, names, runtime_before, "public preflight probe")
     clean_results = all(
@@ -737,14 +835,24 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
         and not observation.stdout
         for observation in observations.values()
     )
-    secure = clean_results and all(state_checks.values()) and source_before == source_after
+    secure = (
+        clean_results
+        and all(state_checks.values())
+        and store_race_secure
+        and source_before == source_after
+    )
     rendered = {
         key: (value.returncode, value.timed_out, value.stderr.decode("utf-8", errors="replace").strip())
         for key, value in observations.items()
     }
     return Result(
         secure,
-        f"results={rendered!r} state={state_checks!r} source_changed={source_before != source_after}",
+        (
+            f"results={rendered!r} state={state_checks!r} "
+            f"store_race={store_replaced}/{store_rc}/{store_error!r}/"
+            f"{original_store_preserved}/{replacement_store_preserved} "
+            f"source_changed={source_before != source_after}"
+        ),
     )
 
 
@@ -822,12 +930,12 @@ ASSERTIONS: tuple[Assertion, ...] = (
     Assertion(
         "IIN-SNAPSHOT-001",
         probe_snapshot_race,
-        "same-size source drift with restored mtime is snapshot uncertainty",
+        "in-place and atomic source replacement races are snapshot uncertainty",
     ),
     Assertion(
         "IIN-PREFLIGHT-001",
         probe_public_preflight,
-        "public home preflight rejects unsafe and racing authority files within bounds",
+        "public preflight rejects unsafe and racing authority files and store roots",
     ),
     Assertion(
         "IIN-PLAN-001",
