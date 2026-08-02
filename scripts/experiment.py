@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 import json
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import NamedTuple, NoReturn
+from typing import Callable, NamedTuple, NoReturn
 import zlib
 
 
@@ -25,6 +26,21 @@ MAX_MANIFEST_BYTES = 262_144
 MAX_ARCHIVE_BYTES = 1_048_576
 MAX_SOURCE_BYTES = MAX_MANIFEST_BYTES
 ZIP_DECODE_TIMEOUT_SECONDS = 5
+GIT_ACQUISITION_TIMEOUT_SECONDS = 5
+GIT_PROVIDER_AUTHORITY = "api.github.com"
+GIT_PROVIDER_METHOD = "github-git-data-v3"
+GIT_PROVIDER_HEADERS = (
+    ("Accept", "application/vnd.github+json"),
+    ("User-Agent", "agent-lab/v0alpha1"),
+    ("X-GitHub-Api-Version", "2022-11-28"),
+)
+GIT_SHA1 = re.compile(r"[0-9a-f]{40}", re.ASCII)
+GITHUB_SOURCE_URL = re.compile(
+    r"https://github\.com/"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
+    r"([A-Za-z0-9_.-]{1,100})\.git",
+    re.ASCII,
+)
 SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
 PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
 BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
@@ -239,6 +255,216 @@ def source_digest(data: bytes) -> str:
     digest.update(len(data).to_bytes(8, "big"))
     digest.update(data)
     return f"sha256:{digest.hexdigest()}"
+
+
+GitRequester = Callable[
+    [str, str, tuple[tuple[str, str], ...], int, float],
+    tuple[int, tuple[tuple[str, str], ...], bytes],
+]
+
+
+def _git_reject(code: str, detail: str) -> NoReturn:
+    raise InvalidManifest(f"git source {code} {detail}")
+
+
+def _parse_git_source(url: str, commit: str) -> tuple[str, str, str, str]:
+    if not isinstance(url, str) or not url.isascii():
+        _git_reject("GIT-URL", "must be one normalized ASCII GitHub HTTPS URL")
+    matched = GITHUB_SOURCE_URL.fullmatch(url)
+    if matched is None:
+        _git_reject("GIT-URL", "must be one normalized unauthenticated GitHub HTTPS URL")
+    owner, repository = matched.groups()
+    if owner.endswith("-") or "--" in owner or repository in (".", ".."):
+        _git_reject("GIT-URL", "has an unsupported repository identity")
+    if not isinstance(commit, str) or GIT_SHA1.fullmatch(commit) is None:
+        _git_reject("GIT-OID", "commit must be one full lowercase SHA-1 object ID")
+    owner = owner.lower()
+    repository = repository.lower()
+    canonical = f"https://github.com/{owner}/{repository}.git"
+    return canonical, owner, repository, commit
+
+
+def _git_object_id(kind: str, payload: bytes) -> str:
+    framed = kind.encode("ascii") + b" " + str(len(payload)).encode("ascii") + b"\0"
+    return hashlib.sha1(framed + payload, usedforsecurity=False).hexdigest()
+
+
+def _git_provider_json(
+    requester: GitRequester,
+    path: str,
+    remaining: int,
+    deadline: float,
+) -> tuple[object, int]:
+    if remaining <= 0:
+        raise InfrastructureError("git provider GIT-ACQUIRE exhausted its response bound")
+    try:
+        status, raw_headers, body = requester(
+            GIT_PROVIDER_AUTHORITY,
+            path,
+            GIT_PROVIDER_HEADERS,
+            remaining,
+            deadline,
+        )
+    except (InvalidManifest, InfrastructureError):
+        raise
+    except Exception as error:
+        raise InfrastructureError("git provider GIT-TRANSPORT request failed") from error
+    if time.monotonic() > deadline:
+        raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+    if not isinstance(status, int) or isinstance(status, bool):
+        raise InfrastructureError("git provider GIT-STATUS response is malformed")
+    if status in (404, 422):
+        _git_reject("GIT-NOTFOUND", "does not expose the requested public object")
+    if 300 <= status <= 399:
+        _git_reject("GIT-REDIRECT", "redirects are not accepted")
+    if status != 200:
+        raise InfrastructureError("git provider GIT-STATUS did not establish a result")
+    if not isinstance(raw_headers, tuple):
+        raise InfrastructureError("git provider GIT-HEADER response is malformed")
+    headers: dict[str, str] = {}
+    for item in raw_headers:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not all(isinstance(value, str) for value in item)
+        ):
+            raise InfrastructureError("git provider GIT-HEADER response is malformed")
+        name, value = item
+        lowered = name.lower()
+        if lowered in headers:
+            raise InfrastructureError("git provider GIT-HEADER response is ambiguous")
+        headers[lowered] = value
+    if headers.get("content-type") != "application/json; charset=utf-8":
+        raise InfrastructureError("git provider GIT-HEADER content type is uncertain")
+    try:
+        declared_length = int(headers.get("content-length", ""))
+    except ValueError as error:
+        raise InfrastructureError("git provider GIT-HEADER content length is invalid") from error
+    if (
+        not isinstance(body, bytes)
+        or len(body) > remaining
+        or declared_length != len(body)
+    ):
+        raise InfrastructureError("git provider GIT-OUTPUT response exceeded its bound")
+    try:
+        value = strict_json(body, source="git provider response")
+    except InvalidManifest as error:
+        raise InfrastructureError("git provider GIT-JSON response is malformed") from error
+    return value, len(body)
+
+
+def read_git_snapshot(
+    url: str,
+    commit: str,
+    *,
+    requester: GitRequester | None = None,
+) -> SourceSnapshot:
+    """Acquire one exact public GitHub commit through the bounded Git Data API."""
+
+    if sys.platform != "linux":
+        raise InfrastructureError("git source GIT-PLATFORM requires Linux")
+    canonical, owner, repository, requested_commit = _parse_git_source(url, commit)
+    if requester is None:
+        raise InfrastructureError("git provider GIT-TRANSPORT runner is unavailable")
+    deadline = time.monotonic() + GIT_ACQUISITION_TIMEOUT_SECONDS
+    acquired = 0
+
+    commit_path = f"/repos/{owner}/{repository}/git/commits/{requested_commit}"
+    commit_value, used = _git_provider_json(
+        requester, commit_path, MAX_ARCHIVE_BYTES - acquired, deadline
+    )
+    acquired += used
+    if not isinstance(commit_value, dict) or commit_value.get("sha") != requested_commit:
+        raise InfrastructureError("git provider GIT-COMMIT returned a different object")
+    commit_tree = commit_value.get("tree")
+    if not isinstance(commit_tree, dict):
+        raise InfrastructureError("git provider GIT-COMMIT tree binding is malformed")
+    tree_id = commit_tree.get("sha")
+    if not isinstance(tree_id, str) or GIT_SHA1.fullmatch(tree_id) is None:
+        raise InfrastructureError("git provider GIT-COMMIT tree identity is malformed")
+
+    tree_path = f"/repos/{owner}/{repository}/git/trees/{tree_id}"
+    tree_value, used = _git_provider_json(
+        requester, tree_path, MAX_ARCHIVE_BYTES - acquired, deadline
+    )
+    acquired += used
+    if (
+        not isinstance(tree_value, dict)
+        or tree_value.get("sha") != tree_id
+        or tree_value.get("truncated") is not False
+    ):
+        raise InfrastructureError("git provider GIT-TREE response is inconsistent")
+    entries = tree_value.get("tree")
+    if not isinstance(entries, list) or len(entries) != 1:
+        _git_reject("GIT-ROOT", "root tree must contain exactly experiment.cue")
+    entry = entries[0]
+    if not isinstance(entry, dict):
+        raise InfrastructureError("git provider GIT-TREE entry is malformed")
+    if (
+        entry.get("path") != "experiment.cue"
+        or entry.get("mode") != "100644"
+        or entry.get("type") != "blob"
+    ):
+        _git_reject("GIT-TYPE", "experiment.cue must be one regular non-executable blob")
+    blob_id = entry.get("sha")
+    blob_size = entry.get("size")
+    if not isinstance(blob_id, str) or GIT_SHA1.fullmatch(blob_id) is None:
+        raise InfrastructureError("git provider GIT-TREE blob identity is malformed")
+    if (
+        not isinstance(blob_size, int)
+        or isinstance(blob_size, bool)
+        or not 0 <= blob_size <= MAX_SOURCE_BYTES
+    ):
+        _git_reject("GIT-SIZE", "experiment.cue exceeds the source limit")
+
+    tree_payload = b"100644 experiment.cue\0" + bytes.fromhex(blob_id)
+    if _git_object_id("tree", tree_payload) != tree_id:
+        raise InfrastructureError("git provider GIT-TREE object identity is inconsistent")
+
+    blob_path = f"/repos/{owner}/{repository}/git/blobs/{blob_id}"
+    blob_value, used = _git_provider_json(
+        requester, blob_path, MAX_ARCHIVE_BYTES - acquired, deadline
+    )
+    acquired += used
+    if (
+        not isinstance(blob_value, dict)
+        or blob_value.get("sha") != blob_id
+        or blob_value.get("size") != blob_size
+        or blob_value.get("encoding") != "base64"
+        or not isinstance(blob_value.get("content"), str)
+    ):
+        raise InfrastructureError("git provider GIT-BLOB response is inconsistent")
+    encoded = blob_value["content"]
+    assert isinstance(encoded, str)
+    if not encoded.isascii() or len(encoded) > ((MAX_SOURCE_BYTES + 2) // 3) * 4:
+        raise InfrastructureError("git provider GIT-BLOB encoding exceeded its bound")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise InfrastructureError("git provider GIT-BLOB encoding is malformed") from error
+    if len(data) != blob_size or _git_object_id("blob", data) != blob_id:
+        raise InfrastructureError("git provider GIT-BLOB object identity is inconsistent")
+
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={
+            "acquisition": {
+                "acquiredBytes": acquired,
+                "limitBytes": MAX_ARCHIVE_BYTES,
+                "method": GIT_PROVIDER_METHOD,
+                "requestCount": 3,
+                "temporaryBytes": 0,
+                "temporaryFiles": 0,
+            },
+            "blob": f"sha1:{blob_id}",
+            "commit": f"sha1:{requested_commit}",
+            "kind": "git",
+            "requestedCommit": requested_commit,
+            "tree": f"sha1:{tree_id}",
+            "url": canonical,
+        },
+    )
 
 
 def _zip_reject(code: str, detail: str) -> NoReturn:
