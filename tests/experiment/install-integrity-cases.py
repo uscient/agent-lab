@@ -230,11 +230,67 @@ def probe_cleanup_parent_swap(root: Path, runtime: Path, names: tuple[str, ...])
     finally:
         store._directory_names = original_names
     outside_after = support().tree_fingerprint(outside)
+
+    mode_cleanup = root / "mode-cleanup"
+    mode_payload = mode_cleanup / "payload"
+    mode_artifact = mode_payload / "artifact"
+    mode_artifact.mkdir(mode=0o700, parents=True)
+    os.chmod(mode_cleanup, 0o700)
+    os.chmod(mode_payload, 0o700)
+    mode_canary = mode_artifact / "experiment.cue"
+    mode_canary.write_bytes(b"mode-race-canary\n")
+    os.chmod(mode_canary, 0o400)
+    payload_identity = mode_payload.stat()
+    original_open = store.os.open
+    mode_changed = False
+
+    def change_mode_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal mode_changed
+        if path == "artifact" and dir_fd is not None and not mode_changed:
+            parent = os.fstat(dir_fd)
+            if (parent.st_dev, parent.st_ino) == (
+                payload_identity.st_dev,
+                payload_identity.st_ino,
+            ):
+                os.chmod(mode_artifact, 0o777)
+                mode_changed = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    store.os.open = change_mode_before_open
+    mode_outcome: int | None = None
+    mode_error: BaseException | None = None
+    try:
+        store._remove_tree(mode_cleanup, mode_cleanup)
+        mode_outcome = 0
+    except store.StoreInfrastructure as caught:
+        mode_outcome = 125
+        mode_error = caught
+    except BaseException as caught:
+        mode_error = caught
+    finally:
+        store.os.open = original_open
+
     runtime_unchanged(runtime, names, runtime_before, "cleanup parent-swap probe")
-    secure = swapped and outcome == 125 and outside_before == outside_after
+    mode_canary_preserved = (
+        mode_canary.is_file()
+        and mode_canary.read_bytes() == b"mode-race-canary\n"
+    )
+    secure = (
+        swapped
+        and outcome == 125
+        and outside_before == outside_after
+        and mode_changed
+        and mode_outcome == 125
+        and mode_canary_preserved
+    )
     return Result(
         secure,
-        f"swapped={swapped} outcome={outcome} error={error!r} outside_changed={outside_before != outside_after}",
+        (
+            f"swapped={swapped} outcome={outcome} error={error!r} "
+            f"outside_changed={outside_before != outside_after} mode_changed={mode_changed} "
+            f"mode_outcome={mode_outcome} mode_error={mode_error!r} "
+            f"mode_canary_preserved={mode_canary_preserved}"
+        ),
     )
 
 
@@ -746,7 +802,7 @@ ASSERTIONS: tuple[Assertion, ...] = (
     Assertion(
         "IIN-CLEAN-001",
         probe_cleanup_parent_swap,
-        "cleanup preserves an external tree across a parent-swap symlink race",
+        "cleanup preserves data across parent-swap and directory-metadata races",
     ),
     Assertion(
         "IIN-CONTRACT-001",
