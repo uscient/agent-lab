@@ -1711,6 +1711,17 @@ def write_decision(decision: object) -> None:
         raise InfrastructureError("authorization decision could not be written") from error
 
 
+def write_checked_source(checked: object) -> None:
+    output = canonical_json(checked) + b"\n"
+    try:
+        written = sys.stdout.buffer.write(output)
+        if written != len(output):
+            raise OSError("partial checked-source output")
+        sys.stdout.buffer.flush()
+    except (BrokenPipeError, OSError) as error:
+        raise InfrastructureError("checked source output could not be written") from error
+
+
 def main(argv: list[str]) -> int:
     directory_checking = len(argv) == 3 and argv[1] == "check-directory"
     directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
@@ -1737,7 +1748,7 @@ def main(argv: list[str]) -> int:
                 )
                 if catalog is not None:
                     checked["catalog"] = catalog
-                sys.stdout.buffer.write(canonical_json(checked) + b"\n")
+                write_checked_source(checked)
                 return 0
             decision, result = authorize_plan(plan, snapshot.digest)
             write_decision(decision)
