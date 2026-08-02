@@ -111,9 +111,9 @@ def bomb_mutation(
     os.environ["AGENT_LAB_ZIP_MUTATION_MARK"] = str(marker)
     produced_sizes: list[int] = []
     rejected = False
+    original_decompressobj = baseline_module.zlib.decompressobj
     try:
         mutant = load_module(private_source, "zip_mutant_bomb")
-        original_decompressobj = mutant.zlib.decompressobj
 
         class RecordingDecoder:
             def __init__(self):
@@ -145,11 +145,13 @@ def bomb_mutation(
         except mutant.InvalidManifest as error:
             rejected = "ZIP-BOMB" in str(error)
     finally:
+        baseline_module.zlib.decompressobj = original_decompressobj
         os.environ.pop("AGENT_LAB_ZIP_MUTATION_MARK", None)
     return (
         marker.is_file()
         and rejected
         and max(produced_sizes, default=0) > baseline_module.MAX_SOURCE_BYTES
+        and baseline_module.zlib.decompressobj is original_decompressobj
         and sha256(production.read_bytes()).hexdigest()
         == sha256(original.encode("utf-8")).hexdigest()
     )
