@@ -29,6 +29,7 @@ case "$route" in
     expected_start=1
     expected_count=133
     lane_count=3
+    lane_map=(0 1 2 0 1 2 0)
     final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
     ;;
   local)
@@ -36,7 +37,8 @@ case "$route" in
     selected_count=3
     expected_start=1
     expected_count=86
-    lane_count=1
+    lane_count=2
+    lane_map=(0 0 1)
     final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
     ;;
   install)
@@ -45,6 +47,7 @@ case "$route" in
     expected_start=87
     expected_count=47
     lane_count=1
+    lane_map=(0 0 0 0)
     final_marker='EXPERIMENT INSTALL LIFECYCLE PASS'
     ;;
   *)
@@ -54,9 +57,41 @@ case "$route" in
 esac
 readonly route selected_start selected_count expected_start expected_count
 readonly lane_count
+readonly lane_map
 readonly final_marker
 subcases=("${all_subcases[@]:$selected_start:$selected_count}")
 readonly subcases
+
+infrastructure_exit() {
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+}
+
+if [ "${#all_subcases[@]}" -ne 7 ] ||
+   [ "${#subcases[@]}" -ne "$selected_count" ] ||
+   [ "${#lane_map[@]}" -ne "$selected_count" ]; then
+  infrastructure_exit
+fi
+
+for mapped_lane in "${lane_map[@]}"; do
+  case "$mapped_lane" in
+    '' | *[!0-9]*) infrastructure_exit ;;
+  esac
+  if ((10#$mapped_lane >= lane_count)); then
+    infrastructure_exit
+  fi
+done
+for ((required_lane = 0; required_lane < lane_count; required_lane++)); do
+  lane_present=0
+  for mapped_lane in "${lane_map[@]}"; do
+    if ((10#$mapped_lane == required_lane)); then
+      lane_present=1
+      break
+    fi
+  done
+  [ "$lane_present" -eq 1 ] || infrastructure_exit
+done
+
 work=""
 lane_pids=()
 lifecycle_pid="$$"
@@ -159,10 +194,17 @@ printf '%s\n' \
   M-STORE-DUR-001 M-STORE-LAYOUT-001 M-STORE-KEY-001 M-STORE-VERIFY-001 \
   M-STORE-LIVE-001 M-STORE-UNCERT-001 M-STORE-STAGE-001 > "$expected"
 mv "$expected" "$expected_all"
+expected_all_count="$(wc -l < "$expected_all" 2>/dev/null || true)"
+if [ "$expected_all_count" != 133 ]; then
+  infrastructure_exit
+fi
 if ! awk -v start="$expected_start" -v count="$expected_count" \
   'NR >= start && NR < start + count {print}' "$expected_all" > "$expected"; then
-  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
-  exit 125
+  infrastructure_exit
+fi
+expected_selected_count="$(wc -l < "$expected" 2>/dev/null || true)"
+if [ "$expected_selected_count" != "$expected_count" ]; then
+  infrastructure_exit
 fi
 : > "$observed"
 
@@ -206,7 +248,7 @@ run_lane() {
   local lane_infrastructure=0
 
   for index in "${!subcases[@]}"; do
-    [ $((index % lane_count)) -eq "$lane" ] || continue
+    [ "${lane_map[$index]}" -eq "$lane" ] || continue
     run_subcase "$index" || lane_infrastructure=1
   done
   [ "$lane_infrastructure" -eq 0 ]
