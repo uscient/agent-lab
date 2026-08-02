@@ -254,6 +254,7 @@ fi
 if AGENT_LAB_CUE_TOOL_DIR="${AGENT_LAB_CUE_TOOL_DIR:-$repo_root/.cache/dev/tools/cue}" \
   python3 -I -B - "$repo_root/scripts/experiment.py" "$work/stored.zip" <<'PY'
 from importlib.util import module_from_spec, spec_from_file_location
+import io
 import sys
 
 spec = spec_from_file_location("zip_output_probe", sys.argv[1])
@@ -276,11 +277,14 @@ class ShortOutput:
         return None
 
 module.sys.stdout = ShortOutput()
+errors = io.StringIO()
+module.sys.stderr = errors
 try:
     result = module.main(["experiment.py", "check-zip", sys.argv[2]])
 except SystemExit as error:
     result = error.code
-raise SystemExit(0 if result == 125 else 1)
+expected = "INFRA Experiment checked source output could not be written\n"
+raise SystemExit(0 if result == 125 and errors.getvalue() == expected else 1)
 PY
 then
   pass ZIP-OUTPUT-001 "partial checked output is infrastructure uncertainty"
