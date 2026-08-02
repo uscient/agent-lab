@@ -195,15 +195,19 @@ def run_command(
         status_line = status.read_text(encoding="ascii")
         captured_stdout = stdout.read_bytes()
         captured_stderr = stderr.read_bytes()
-    except OSError:
-        status_line = ""
-        captured_stdout = b""
-        captured_stderr = b""
+    except OSError as error:
+        raise RuntimeError("bounded command result is unavailable") from error
     expected_status = f"child:{bounded.returncode}\n"
-    returncode = bounded.returncode
-    if bounded.stdout or bounded.stderr or status_line != expected_status:
-        returncode = 125
-    return subprocess.CompletedProcess(command, returncode, captured_stdout, captured_stderr)
+    if (
+        bounded.stdout
+        or bounded.stderr
+        or status_line != expected_status
+        or bounded.returncode == 125
+    ):
+        raise RuntimeError("bounded command infrastructure failure")
+    return subprocess.CompletedProcess(
+        command, bounded.returncode, captured_stdout, captured_stderr
+    )
 
 
 def authorization_mutation(repo: Path, root: Path, archive: Path, marker: Path) -> bool:
