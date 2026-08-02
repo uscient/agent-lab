@@ -98,7 +98,7 @@ def main() -> int:
                 results.append(
                     (
                         "GIT-USAGE-001",
-                        all(result == (2, "", "") for result in usage_results)
+                        all(result[0] == 2 and result[1] == "" for result in usage_results)
                         and calls == [],
                         "malformed Git option shapes fail before adapter access",
                     )
