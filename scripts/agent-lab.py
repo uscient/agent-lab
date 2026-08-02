@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+MAX_HOME_AUTHORITY_BYTES = 65_536
 LOCK_SPECS = {
     "imageCatalog": (
         "image-catalog.lock",
@@ -52,6 +53,101 @@ def write_all(descriptor: int, data: bytes) -> None:
         if written <= 0:
             raise OSError("write made no progress")
         view = view[written:]
+
+
+def home_authority_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def home_authority_metadata_safe(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size <= MAX_HOME_AUTHORITY_BYTES
+    )
+
+
+def read_home_authority(
+    path: Path,
+    lexical: os.stat_result,
+    purpose: str,
+) -> bytes:
+    """Read one bounded home authority file through a stable no-follow descriptor."""
+
+    if not home_authority_metadata_safe(lexical):
+        raise RuntimeError("home authority files are unsafe")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not home_authority_metadata_safe(opened)
+            or home_authority_identity(opened) != home_authority_identity(lexical)
+        ):
+            raise RuntimeError(f"{purpose} authority changed before it was read")
+        chunks: list[bytes] = []
+        remaining = MAX_HOME_AUTHORITY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        final = os.fstat(descriptor)
+    except RuntimeError:
+        raise
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be read safely") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise RuntimeError(f"{purpose} authority descriptor cannot be closed") from error
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be reverified") from error
+    expected_identity = home_authority_identity(lexical)
+    if (
+        len(data) > MAX_HOME_AUTHORITY_BYTES
+        or len(data) != final.st_size
+        or not home_authority_metadata_safe(final)
+        or not home_authority_metadata_safe(current)
+        or home_authority_identity(opened) != expected_identity
+        or home_authority_identity(final) != expected_identity
+        or home_authority_identity(current) != expected_identity
+    ):
+        raise RuntimeError(f"{purpose} authority changed while it was read")
+    return data
+
+
+def reverify_home_authority(path: Path, expected: os.stat_result, purpose: str) -> None:
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{purpose} authority cannot be reverified") from error
+    if (
+        not home_authority_metadata_safe(current)
+        or home_authority_identity(current) != home_authority_identity(expected)
+    ):
+        raise RuntimeError(f"{purpose} authority changed during preflight")
 
 
 def lock_record(path: Path, relative: str, schema: str) -> dict[str, object]:
@@ -249,20 +345,28 @@ def load_config_receipt(
     receipt_path = home / "home.json"
     try:
         config_metadata = config_path.lstat()
+    except FileNotFoundError:
+        config_metadata = None
+    except OSError as error:
+        raise RuntimeError("home configuration cannot be inspected") from error
+    try:
         receipt_metadata = receipt_path.lstat()
     except FileNotFoundError:
-        if not config_path.exists() and not receipt_path.exists():
-            return None
+        receipt_metadata = None
+    except OSError as error:
+        raise RuntimeError("home receipt cannot be inspected") from error
+    if config_metadata is None and receipt_metadata is None:
+        return None
+    if config_metadata is None or receipt_metadata is None:
         raise RuntimeError("home receipt and configuration are incomplete")
-    for metadata in (config_metadata, receipt_metadata):
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise RuntimeError("home authority files are unsafe")
+    raw = read_home_authority(config_path, config_metadata, "configuration")
+    receipt_raw = read_home_authority(receipt_path, receipt_metadata, "home receipt")
+    reverify_home_authority(config_path, config_metadata, "configuration")
+    reverify_home_authority(receipt_path, receipt_metadata, "home receipt")
     try:
-        raw = config_path.read_bytes()
-        receipt_raw = receipt_path.read_bytes()
         value = json.loads(raw.decode("utf-8"))
         receipt = json.loads(receipt_raw.decode("utf-8"))
-    except (OSError, RecursionError, UnicodeError, ValueError):
+    except (RecursionError, UnicodeError, ValueError):
         raise RuntimeError("configuration is malformed")
     if not isinstance(value, dict) or set(value) != {"apiVersion", "paths"} or value["apiVersion"] != "agent-lab.config/v0alpha1":
         raise RuntimeError("configuration is not closed")
