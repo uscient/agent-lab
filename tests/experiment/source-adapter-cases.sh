@@ -4,8 +4,9 @@ set -u -o pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 subcases=(
   "$repo_root/tests/experiment/zip-intake-cases.sh"
+  "$repo_root/tests/experiment/zip-mutation-cases.py"
 )
-expected_count=25
+expected_count=40
 work=""
 
 cleanup_work() {
@@ -32,7 +33,11 @@ printf '%s\n' \
   ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001 \
   ZIP-LENGTH-001 ZIP-SIZE-001 ZIP-BOMB-001 ZIP-TRUNC-001 ZIP-TRAIL-001 \
   ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-TIMEOUT-001 \
-  ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 > "$expected"
+  ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 \
+  ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 \
+  M-ZIP-COUNT-001 M-ZIP-NAME-001 M-ZIP-TYPE-001 M-ZIP-FLAG-001 \
+  M-ZIP-METHOD-001 M-ZIP-SIZE-001 M-ZIP-CRC-001 M-ZIP-HEADER-001 \
+  M-ZIP-EXTRACT-001 M-ZIP-IDENTITY-001 M-ZIP-AUTH-001 > "$expected"
 : > "$observed"
 
 infrastructure=0
@@ -44,11 +49,22 @@ for index in "${!subcases[@]}"; do
     infrastructure=1
     continue
   fi
-  if bash "$subcase" > "$output" 2>&1; then
-    rc=0
-  else
-    rc=$?
-  fi
+  case "$subcase" in
+    *.py)
+      if python3 -I -B "$subcase" > "$output" 2>&1; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+    *)
+      if bash "$subcase" > "$output" 2>&1; then
+        rc=0
+      else
+        rc=$?
+      fi
+      ;;
+  esac
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print}' "$output"
   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$output" >> "$observed"
   reported_assertions="$(awk '/^(PASS|FAIL) [A-Z0-9-]+ / {count++} END {print count + 0}' "$output")"

@@ -4,13 +4,26 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 agent_lab="$repo_root/scripts/agent-lab"
 fixture="$repo_root/tests/experiment/fixtures/directories/minimal"
+runtime_manifest="$repo_root/packaging/agent-lab-local.manifest"
 work="$(mktemp -d)"
-trap 'find "$work" -type f -delete 2>/dev/null || true; find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || true' EXIT
+cleanup_work() {
+  local failed=0
+  if [ -n "$work" ] && [ -e "$work" ]; then
+    find "$work" -type f -exec chmod u+rw {} + 2>/dev/null || failed=1
+    find "$work" -depth -type d -exec chmod u+rwx {} + 2>/dev/null || failed=1
+    find "$work" -type f -delete 2>/dev/null || failed=1
+    find "$work" -type l -delete 2>/dev/null || failed=1
+    find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || failed=1
+    [ ! -e "$work" ] || failed=1
+  fi
+  return "$failed"
+}
+trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 mkdir -p "$work/home" "$work/tmp"
 
 if ! python3 -I -B "$repo_root/tests/experiment/zip-fixtures.py" \
   "$fixture/experiment.cue" "$work"; then
-  printf 'SUMMARY assertions=0 expected=25 failures=0 infra=1\n'
+  printf 'SUMMARY assertions=0 expected=29 failures=0 infra=1\n'
   exit 125
 fi
 
@@ -18,7 +31,8 @@ capture() {
   local name="$1"
   shift
   CAPTURE_RC=0
-  env -i PATH=/usr/bin:/bin HOME="$work/home" TMPDIR="$work/tmp" LC_ALL=C \
+  env -i PATH="${CAPTURE_PATH:-/usr/bin:/bin}" HOME="$work/home" TMPDIR="$work/tmp" LC_ALL=C \
+    CANARY_DIR="${CANARY_DIR:-$work/no-canary}" \
     AGENT_LAB_CUE_TOOL_DIR="${AGENT_LAB_CUE_TOOL_DIR:-$repo_root/.cache/dev/tools/cue}" \
     AGENT_LAB_CEDAR_TOOL_DIR="${AGENT_LAB_CEDAR_TOOL_DIR:-$repo_root/.cache/dev/tools/cedar}" \
     "$@" > "$work/$name.out" 2> "$work/$name.err" || CAPTURE_RC=$?
@@ -34,10 +48,40 @@ init_home() {
   capture "$label" "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed\n' >&2
-    printf 'SUMMARY assertions=%s expected=25 failures=%s infra=1\n' \
+    printf 'SUMMARY assertions=%s expected=29 failures=%s infra=1\n' \
       "$(wc -l < "$observed")" "$failures"
     exit 125
   fi
+}
+tree_fingerprint() {
+  python3 -I -B - "$1" <<'PY'
+from hashlib import sha256
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+records = []
+if root.exists():
+    for path in sorted(root.rglob("*"), key=lambda item: os.fsencode(str(item.relative_to(root)))):
+        metadata = path.lstat()
+        relative = str(path.relative_to(root))
+        if stat.S_ISREG(metadata.st_mode):
+            content = sha256(path.read_bytes()).hexdigest()
+            kind = "file"
+        elif stat.S_ISDIR(metadata.st_mode):
+            content = ""
+            kind = "directory"
+        elif stat.S_ISLNK(metadata.st_mode):
+            content = os.readlink(path)
+            kind = "symlink"
+        else:
+            content = ""
+            kind = "other"
+        records.append((relative, kind, stat.S_IMODE(metadata.st_mode), content))
+print(sha256(repr(records).encode("utf-8")).hexdigest())
+PY
 }
 expect_all_reject() {
   local id="$1" code="$2" detail="$3"
@@ -386,16 +430,196 @@ else
   fail ZIP-RETRY-001 "equivalent zip retry preserves the directory installation receipt"
 fi
 
+deny_home="$work/deny-home"
+init_home deny-home-init "$deny_home"
+deny_runtime="$work/deny-runtime"
+deny_runtime_ok=1
+while IFS= read -r runtime_name; do
+  if [ -z "$runtime_name" ] || [ ! -f "$repo_root/$runtime_name" ]; then
+    deny_runtime_ok=0
+    continue
+  fi
+  mkdir -p "$deny_runtime/$(dirname -- "$runtime_name")"
+  cp "$repo_root/$runtime_name" "$deny_runtime/$runtime_name" || deny_runtime_ok=0
+done < "$runtime_manifest"
+if [ "$deny_runtime_ok" -eq 1 ]; then
+  sed 's/^permit (/forbid (/' \
+    "$repo_root/authorization/experiment/v0alpha1/operator.cedar" \
+    > "$deny_runtime/authorization/experiment/v0alpha1/operator.cedar"
+fi
+capture deny-preview "$deny_runtime/scripts/agent-lab" --home "$deny_home" \
+  experiment authorize install --zip "$work/stored.zip"
+deny_preview_rc="$CAPTURE_RC"
+deny_before="$(tree_fingerprint "$deny_home")"
+capture deny-install "$deny_runtime/scripts/agent-lab" --home "$deny_home" \
+  experiment install --zip "$work/stored.zip"
+deny_install_rc="$CAPTURE_RC"
+deny_after="$(tree_fingerprint "$deny_home")"
+if [ "$deny_runtime_ok" -eq 1 ] && [ "$deny_preview_rc" -eq 1 ] &&
+   [ "$deny_install_rc" -eq 1 ] && [ ! -s "$work/deny-preview.err" ] &&
+   [ ! -s "$work/deny-install.out" ] &&
+   jq -e '.verdict == "deny"' "$work/deny-preview.out" >/dev/null 2>&1 &&
+   [ "$deny_before" = "$deny_after" ]; then
+  pass ZIP-DENY-001 "fresh zip denial leaves the initialized home unchanged"
+else
+  fail ZIP-DENY-001 "fresh zip denial leaves the initialized home unchanged"
+fi
+
+if python3 -I -B - "$repo_root/scripts/agent-lab.py" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import io
+from pathlib import Path
+import sys
+
+spec = spec_from_file_location("zip_platform_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+reached = []
+
+def forbidden(*_args, **_kwargs):
+    reached.append(True)
+    raise AssertionError("pre-acquisition platform guard was bypassed")
+
+module.sys.platform = "darwin"
+module.load_config_receipt = forbidden
+module.experiment_store_module = forbidden
+errors = io.StringIO()
+module.sys.stderr = errors
+result = module.experiment_command(
+    Path("/unavailable-home"), ["install", "--zip", "/unavailable-archive"]
+)
+assert result == 125
+assert not reached
+assert errors.getvalue() == "INFRA Agent Lab Experiment installation requires Linux\n"
+PY
+then
+  pass ZIP-PLAT-001 "non-Linux zip install stops before home and archive acquisition"
+else
+  fail ZIP-PLAT-001 "non-Linux zip install stops before home and archive acquisition"
+fi
+
+canary_bin="$work/canary-bin"
+canary_marks="$work/canary-marks"
+mkdir "$canary_bin" "$canary_marks"
+for command in docker git curl wget zip unzip; do
+  printf '%s\n' '#!/bin/sh' 'set -eu' ': > "$CANARY_DIR/${0##*/}"' 'exit 97' \
+    > "$canary_bin/$command"
+  chmod 700 "$canary_bin/$command"
+  CANARY_DIR="$canary_marks" "$canary_bin/$command" >/dev/null 2>&1 || true
+done
+canaries_calibrated="$(find "$canary_marks" -type f -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')"
+find "$canary_marks" -type f -delete
+noeffect_home="$work/noeffect-home"
+init_home noeffect-home-init "$noeffect_home"
+archive_before="$(sha256sum "$work/deflated.zip")"
+CAPTURE_PATH="$canary_bin:/usr/bin:/bin"
+CANARY_DIR="$canary_marks"
+capture noeffect-check "$agent_lab" experiment check --zip "$work/deflated.zip"
+noeffect_check_rc="$CAPTURE_RC"
+capture noeffect-authorize "$agent_lab" experiment authorize install --zip "$work/deflated.zip"
+noeffect_authorize_rc="$CAPTURE_RC"
+capture noeffect-install "$agent_lab" --home "$noeffect_home" experiment install --zip "$work/deflated.zip"
+noeffect_install_rc="$CAPTURE_RC"
+unset CAPTURE_PATH CANARY_DIR
+archive_after="$(sha256sum "$work/deflated.zip")"
+if [ "$canaries_calibrated" = "curl docker git unzip wget zip " ] &&
+   [ "$noeffect_check_rc" -eq 0 ] && [ "$noeffect_authorize_rc" -eq 0 ] &&
+   [ "$noeffect_install_rc" -eq 0 ] && [ ! -s "$work/noeffect-check.err" ] &&
+   [ ! -s "$work/noeffect-authorize.err" ] && [ ! -s "$work/noeffect-install.err" ] &&
+   [ -z "$(find "$canary_marks" -type f -print -quit)" ] &&
+   [ "$archive_before" = "$archive_after" ]; then
+  pass ZIP-NOEF-002 "zip intake invokes no archive tool, Git, downloader, or Docker command"
+else
+  fail ZIP-NOEF-002 "zip intake invokes no archive tool, Git, downloader, or Docker command"
+fi
+
+installed_source="$work/installed-source"
+installed_unavailable="$work/installed-source-unavailable"
+installed_prefix="$work/installed-prefix"
+installed_home="$work/installed-home"
+installed_unrelated="$work/installed-unrelated"
+installed_tools="$work/installed-tools"
+installed_ok=1
+mkdir -p "$installed_source/packaging" "$installed_source/scripts" \
+  "$installed_unrelated" "$installed_tools/cue" "$installed_tools/cedar" || installed_ok=0
+while IFS= read -r runtime_name; do
+  if [ -z "$runtime_name" ] || [ ! -f "$repo_root/$runtime_name" ]; then
+    installed_ok=0
+    continue
+  fi
+  mkdir -p "$installed_source/$(dirname -- "$runtime_name")" || installed_ok=0
+  cp "$repo_root/$runtime_name" "$installed_source/$runtime_name" || installed_ok=0
+done < "$runtime_manifest"
+cp "$runtime_manifest" "$installed_source/packaging/agent-lab-local.manifest" || installed_ok=0
+cp "$repo_root/scripts/install-local" "$repo_root/scripts/install-local.py" \
+  "$installed_source/scripts/" || installed_ok=0
+cp -a "$repo_root/.cache/dev/tools/cue/." "$installed_tools/cue/" || installed_ok=0
+cp -a "$repo_root/.cache/dev/tools/cedar/." "$installed_tools/cedar/" || installed_ok=0
+chmod +x "$installed_source/scripts/install-local" "$installed_source/scripts/agent-lab" || installed_ok=0
+capture installed-bundle "$installed_source/scripts/install-local" --prefix "$installed_prefix"
+installed_bundle_rc="$CAPTURE_RC"
+if [ "$installed_bundle_rc" -eq 0 ]; then
+  mv "$installed_source" "$installed_unavailable" || installed_ok=0
+fi
+capture installed-init env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /bin/sh -c 'cd "$1" || exit 125; shift; exec "$@"' agent-lab-installed \
+  "$installed_unrelated" "$installed_prefix/bin/agent-lab" --home "$installed_home" init
+installed_init_rc="$CAPTURE_RC"
+if [ "$installed_init_rc" -eq 0 ]; then
+  cp -a "$installed_tools/cue/." "$installed_home/cache/tools/cue/" || installed_ok=0
+  cp -a "$installed_tools/cedar/." "$installed_home/cache/tools/cedar/" || installed_ok=0
+fi
+capture installed-check env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /bin/sh -c 'cd "$1" || exit 125; shift; exec "$@"' agent-lab-installed \
+  "$installed_unrelated" "$installed_prefix/bin/agent-lab" --home "$installed_home" \
+  experiment check --zip "$work/stored.zip"
+installed_check_rc="$CAPTURE_RC"
+capture installed-authorize env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /bin/sh -c 'cd "$1" || exit 125; shift; exec "$@"' agent-lab-installed \
+  "$installed_unrelated" "$installed_prefix/bin/agent-lab" --home "$installed_home" \
+  experiment authorize install --zip "$work/stored.zip"
+installed_authorize_rc="$CAPTURE_RC"
+capture installed-install env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  /bin/sh -c 'cd "$1" || exit 125; shift; exec "$@"' agent-lab-installed \
+  "$installed_unrelated" "$installed_prefix/bin/agent-lab" --home "$installed_home" \
+  experiment install --zip "$work/stored.zip"
+installed_install_rc="$CAPTURE_RC"
+if [ "$installed_ok" -eq 1 ] && [ "$installed_bundle_rc" -eq 0 ] &&
+   [ "$installed_init_rc" -eq 0 ] && [ "$installed_check_rc" -eq 0 ] &&
+   [ "$installed_authorize_rc" -eq 0 ] && [ "$installed_install_rc" -eq 0 ] &&
+   [ ! -s "$work/installed-bundle.err" ] && [ ! -s "$work/installed-check.err" ] &&
+   [ ! -s "$work/installed-authorize.err" ] && [ ! -s "$work/installed-install.err" ] &&
+   jq -e '.source.kind == "zip"' "$work/installed-check.out" >/dev/null 2>&1 &&
+   jq -e '.verdict == "permit"' "$work/installed-authorize.out" >/dev/null 2>&1 &&
+   jq -e '.changed == true and .name == "first-experiment"' \
+     "$work/installed-install.out" >/dev/null 2>&1 &&
+   [ ! -e "$installed_source" ] && [ -d "$installed_unavailable" ] &&
+   [ -z "$(find "$installed_prefix" -name __pycache__ -print -quit)" ]; then
+  pass ZIP-RUNTIME-001 "installed runtime handles zip intake without its source replica"
+else
+  fail ZIP-RUNTIME-001 "installed runtime handles zip intake without its source replica"
+fi
+
 expected="$work/expected"
 printf '%s\n' \
   ZIP-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
   ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001 \
   ZIP-LENGTH-001 ZIP-SIZE-001 ZIP-BOMB-001 ZIP-TRUNC-001 ZIP-TRAIL-001 \
   ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-TIMEOUT-001 \
-  ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 > "$expected"
+  ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 \
+  ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA assertion identity drift\n' >&2
   exit 125
 fi
-printf 'SUMMARY assertions=25 expected=25 failures=%s infra=0\n' "$failures"
+cleanup_infrastructure=0
+if ! cleanup_work; then
+  cleanup_infrastructure=1
+fi
+trap - EXIT
+printf 'SUMMARY assertions=29 expected=29 failures=%s infra=%s\n' \
+  "$failures" "$cleanup_infrastructure"
+[ "$cleanup_infrastructure" -eq 0 ] || exit 125
 [ "$failures" -eq 0 ]
