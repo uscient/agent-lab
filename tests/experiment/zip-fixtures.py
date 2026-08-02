@@ -175,6 +175,13 @@ def main() -> int:
             u16(data, central + 10, 99),
         ),
     )
+    fixtures["unsupported-deflate-method.zip"] = mutate(
+        deflated,
+        lambda data, local, central, _eocd: (
+            u16(data, local + 8, 99),
+            u16(data, central + 10, 99),
+        ),
+    )
     fixtures["utf8-ascii.zip"] = mutate(
         stored,
         lambda data, local, central, _eocd: (
