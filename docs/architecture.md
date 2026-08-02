@@ -69,19 +69,21 @@ See [Development](development.md) and [development-agent configuration](agent-co
 
 ## Experiment planning and installed evidence
 
-`scripts/agent-lab experiment check DIRECTORY` snapshots and validates the closed authored
-`agent-lab/v0alpha1` request with the
-repository-pinned CUE contract and emits one canonical, digest-bound `RequestedExperimentPlan`.
-`scripts/agent-lab experiment authorize install DIRECTORY` reads the snapshot once, derives that same plan
+`scripts/agent-lab experiment check` snapshots and validates one closed authored source from a sole
+local `experiment.cue`, a bounded sole-member ZIP, or an exact supported public GitHub commit. The
+repository-pinned CUE contract emits one canonical, digest-bound `RequestedExperimentPlan`.
+`scripts/agent-lab experiment authorize install` reads that snapshot once, derives the same plan
 in-process, and asks the repository-pinned Cedar policy whether the fixed local compatibility
 principal may submit the exact plan digest.
 
-Those two commands are no-effect preflights. `experiment install DIRECTORY` instead repeats the
-snapshot, planning, and Cedar evaluation, then stores the exact permitted evidence in the
-initialized home. No caller-supplied decision is accepted. For a local image name, install rechecks
-the selected entry under the shared catalog lock before taking the Experiment store lock
-exclusively; both remain held through durable no-replace publication. Direct and bundled selectors
-do not open local catalog state.
+The preview forms create no durable Agent Lab state; Git previews have only their bounded public
+acquisition effect. `experiment install` instead repeats snapshotting, planning, and Cedar
+evaluation, then stores the exact permitted evidence in the initialized home. Directory, ZIP, and
+Git sources carrying identical bytes converge on the same source, plan, authorization, installation,
+and artifact identities; only their closed transport provenance differs. No caller-supplied decision
+is accepted. For a local image name, install rechecks the selected entry under the shared catalog
+lock before taking the Experiment store lock exclusively; both remain held through durable
+no-replace publication. Direct and bundled selectors do not open local catalog state.
 
 The installed envelope contains the exact artifact plus closed plan, decision, provenance, and
 receipt records. Its installation key binds source, domain-separated plan, contract, authorization,

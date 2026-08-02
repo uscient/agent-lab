@@ -1,10 +1,11 @@
 # Experiments
 
-An Experiment is authored as data in a directory containing exactly one file, `experiment.cue`, or
-in a bounded ZIP archive containing that exact sole member. The file defines one concrete value named
-`experiment` in package `experiment`. Agent Lab snapshots the exact authored bytes privately before
-evaluating them; extra entries, links, special files, suspicious modes, changing sources, malformed
-CUE, and unknown schema fields are refused.
+An Experiment is authored as data in a directory containing exactly one file, `experiment.cue`, in a
+bounded ZIP archive containing that exact sole member, or at one exact commit of a supported public
+GitHub repository whose root tree contains that exact sole blob. The file defines one concrete value
+named `experiment` in package `experiment`. Agent Lab snapshots the exact authored bytes privately
+before evaluating them; extra entries, links, special files, suspicious modes, changing sources,
+malformed CUE, and unknown schema fields are refused.
 
 ```cue
 package experiment
@@ -28,11 +29,14 @@ Check the artifact or preview its install authorization from the repository:
 ./scripts/agent-lab experiment authorize install ./my-experiment
 ./scripts/agent-lab experiment check --zip ./my-experiment.zip
 ./scripts/agent-lab experiment authorize install --zip ./my-experiment.zip
+./scripts/agent-lab experiment check --git https://github.com/owner/repository.git --commit <40 lowercase hex>
+./scripts/agent-lab experiment authorize install --git https://github.com/owner/repository.git --commit <40 lowercase hex>
 ```
 
-These two commands are previews. They create no durable Agent Lab state and do not invoke Docker or
-run Experiment content. `authorize install` freshly checks the same held source and emits decision
-evidence bound to its source, plan, contract, and authorization identities. The decision is not an
+The check and authorization forms are previews. They create no durable Agent Lab state and do not
+invoke Docker or run Experiment content. Git previews do perform the bounded public acquisition
+described below. `authorize install` freshly checks the same held source and emits decision evidence
+bound to its source, plan, contract, and authorization identities. The decision is not an
 installation capability.
 
 Install a freshly checked and permitted artifact, then inspect its stored identity:
@@ -40,6 +44,7 @@ Install a freshly checked and permitted artifact, then inspect its stored identi
 ```bash
 agent-lab [--home /absolute/private/home] experiment install ./my-experiment
 agent-lab [--home /absolute/private/home] experiment install --zip ./my-experiment.zip
+agent-lab [--home /absolute/private/home] experiment install --git https://github.com/owner/repository.git --commit <40 lowercase hex>
 agent-lab [--home /absolute/private/home] experiment inspect example
 ```
 
@@ -61,6 +66,17 @@ authorization binding, installation key, or idempotent cross-transport retry.
 Regular-file attributes are interpreted only for Unix and DOS-compatible FAT, NTFS, and VFAT
 creator systems; other creator systems are rejected when their member type cannot be proven.
 
+Git intake is Linux-only in this version. It accepts only a normalized, unauthenticated
+`https://github.com/<owner>/<repository>.git` URL and one exact lowercase 40-hex SHA-1 commit object
+ID. A fixed credential-free GitHub Git Data API client reads that commit, its exact root tree, and
+the bound blob under one five-second deadline and a 1,048,576-byte aggregate response cap. It uses
+explicit system trust, identity encoding, fixed headers, a private process group, and zero temporary
+files. Redirects, credentials, mutable refs, alternate protocols or authorities, extra tree entries,
+and changed bound objects fail closed. Agent Lab never runs Git, creates a repository, checks out
+content, follows submodules, or executes repository data. Provenance records the canonical URL,
+requested and verified object IDs, bounded acquisition facts, and the independent framed SHA-256
+source digest. Git object identity does not replace source identity or change cross-transport retry.
+
 An exact retry freshly validates and authorizes again, verifies the complete installed envelope,
 and returns `changed:false` with the same `installationKey` and `receiptDigest`. The same requested
 name with a different installation identity conflicts without overwrite. `inspect` is read-only: it
@@ -68,9 +84,9 @@ verifies and reports one installed identity, but never reconciles staging or rep
 effectful install may recover only recognized, bounded staging left by an interrupted publication;
 unknown or ambiguous residue remains in place and returns infrastructure uncertainty.
 
-All four commands work from a local installation after `agent-lab init` and explicit
-`agent-lab tools provision`. Installed execution verifies and uses its release bundle and the
-effective home's pinned tool cache; it does not depend on a source checkout.
+These preview, install, and inspect commands work from a local installation after `agent-lab init`
+and explicit `agent-lab tools provision`. Installed execution verifies and uses its release bundle
+and the effective home's pinned tool cache; it does not depend on a source checkout.
 
 Each member selects either an exact digest-pinned OCI reference with `digestRef` or a shared name
 with `catalogName`. Shared names have exactly two bounded lowercase components, `<vendor>.<image>`.
