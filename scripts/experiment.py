@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import math
 import os
@@ -104,6 +105,11 @@ class PlanBinding(NamedTuple):
 class SourceSnapshot(NamedTuple):
     data: bytes
     digest: str
+
+
+class PlanResolution(NamedTuple):
+    plan: dict[str, object]
+    local_catalog: dict[str, object] | None
 
 
 def fail(message: str) -> NoReturn:
@@ -586,6 +592,20 @@ def digest_record(domain: bytes, value: object) -> str:
     return "sha256:" + hashlib.sha256(domain + canonical_json(value)).hexdigest()
 
 
+def image_catalog_module():
+    path = Path(__file__).resolve().with_name("image_catalog.py")
+    spec = spec_from_file_location("agent_lab_image_catalog", path)
+    if spec is None or spec.loader is None:
+        raise InfrastructureError("local image catalog support cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError) as error:
+        raise InfrastructureError("local image catalog support cannot be loaded") from error
+    return module
+
+
 def bundled_catalog(repo_root: Path) -> tuple[dict[str, object], str]:
     path = repo_root / "catalog/experiment-images/v0alpha1.json"
     data = stable_file_bytes(path, MAX_CONTRACT_FILE_BYTES, "bundled image catalog")
@@ -597,53 +617,15 @@ def bundled_catalog(repo_root: Path) -> tuple[dict[str, object], str]:
     return value, digest_record(BUNDLED_CATALOG_DOMAIN, value)
 
 
-def local_catalog_entry(home: Path, name: str) -> dict[str, object]:
-    try:
-        config = strict_json((home / "config.json").read_bytes(), source="local config")
-        assert isinstance(config, dict)
-        images = config["paths"]["images"]
-        root = home / images / "catalog"
-        pointer = strict_json((root / "current.json").read_bytes(), source="local catalog pointer")
-        assert isinstance(pointer, dict) and set(pointer) == {"snapshotDigest"}
-        snapshot_digest = pointer["snapshotDigest"]
-        assert isinstance(snapshot_digest, str) and is_sha256(snapshot_digest)
-        snapshot = strict_json(
-            (root / "snapshots" / f"{snapshot_digest[7:]}.json").read_bytes(),
-            source="local catalog snapshot",
-        )
-        if digest_record(b"agent-lab.local-image-snapshot.v1\0", snapshot) != snapshot_digest:
-            raise ValueError("snapshot digest")
-        assert isinstance(snapshot, dict)
-        record = snapshot["records"].get(name)
-        if record is None or record["state"] != "active":
-            raise InvalidManifest("references an unknown or removed local image name")
-        assert isinstance(record, dict)
-        return record
-    except InvalidManifest:
-        raise
-    except (AssertionError, KeyError, OSError, TypeError, ValueError) as error:
-        raise InfrastructureError("local image catalog cannot be verified") from error
-
-
-def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, object] | None = None) -> dict[str, object]:
-    by_name: dict[str, dict[str, object]] | None = None
-    if catalog is not None:
-        entries = catalog.get("entries")
-        if not isinstance(entries, list):
-            raise InfrastructureError("bundled image catalog entries are malformed")
-        by_name = {}
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
-                raise InfrastructureError("bundled image catalog entry is malformed")
-            name, subject = entry["name"], entry["subject"]
-            if not valid_catalog_name(name) or not isinstance(subject, str) or "@sha256:" not in subject:
-                raise InfrastructureError("bundled image catalog entry is invalid")
-            assert isinstance(name, str)
-            if not name.startswith("agent-lab.") or name in by_name:
-                raise InfrastructureError("bundled image catalog namespace is invalid")
-            by_name[name] = entry
+def resolve_plan_with_evidence(
+    plan: dict[str, object],
+    repo_root: Path,
+    catalog: dict[str, object] | None = None,
+) -> PlanResolution:
     resolved = json.loads(canonical_json(plan))
     members = resolved["spec"]["members"]
+    bundled_names: set[str] = set()
+    local_names: set[str] = set()
     for member in members:
         selector = member["requestedSelector"]
         if set(selector) == {"digestRef"}:
@@ -653,10 +635,98 @@ def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, ob
             raise InvalidManifest("contains an invalid image selector")
         name = selector["catalogName"]
         if name.startswith("agent-lab."):
-            if by_name is None:
-                loaded_catalog, _ = bundled_catalog(repo_root)
-                return resolve_plan(plan, repo_root, loaded_catalog)
-            entry = by_name.get(name)
+            bundled_names.add(name)
+        else:
+            local_names.add(name)
+
+    catalog_support = None
+    bundled_by_name: dict[str, dict[str, object]] = {}
+    if bundled_names:
+        catalog_support = image_catalog_module()
+        selected_catalog = catalog
+        if selected_catalog is None:
+            selected_catalog, _ = bundled_catalog(repo_root)
+        entries = selected_catalog.get("entries")
+        if not isinstance(entries, list):
+            raise InfrastructureError("bundled image catalog entries are malformed")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
+                raise InfrastructureError("bundled image catalog entry is malformed")
+            name, subject = entry["name"], entry["subject"]
+            if (
+                not valid_catalog_name(name)
+                or not isinstance(subject, str)
+                or not catalog_support.oci_subject(subject)
+            ):
+                raise InfrastructureError("bundled image catalog entry is invalid")
+            assert isinstance(name, str)
+            if not name.startswith("agent-lab.") or name in bundled_by_name:
+                raise InfrastructureError("bundled image catalog namespace is invalid")
+            bundled_by_name[name] = entry
+
+    local_records: dict[str, dict[str, object]] = {}
+    local_evidence: dict[str, object] | None = None
+    if local_names:
+        if catalog_support is None:
+            catalog_support = image_catalog_module()
+        raw_home = os.environ.get("AGENT_LAB_HOME")
+        if not raw_home:
+            raise InvalidManifest("local image name requires an initialized Agent Lab home")
+        try:
+            local_resolution = catalog_support.resolve_local_images(
+                Path(raw_home), tuple(sorted(local_names))
+            )
+        except catalog_support.CatalogReject as error:
+            raise InvalidManifest(str(error)) from error
+        except catalog_support.CatalogInfrastructure as error:
+            raise InfrastructureError(str(error)) from error
+        try:
+            if not isinstance(local_resolution, dict) or set(local_resolution) != {"catalog", "records"}:
+                raise ValueError("resolution envelope")
+            records = local_resolution["records"]
+            evidence = local_resolution["catalog"]
+            if not isinstance(records, dict) or set(records) != local_names:
+                raise ValueError("resolution records")
+            if not isinstance(evidence, dict) or set(evidence) != {"revision", "snapshotDigest"}:
+                raise ValueError("resolution evidence")
+            revision = evidence["revision"]
+            snapshot_digest = evidence["snapshotDigest"]
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 1
+                or not is_sha256(snapshot_digest)
+            ):
+                raise ValueError("resolution evidence values")
+            for name in local_names:
+                record = records[name]
+                if (
+                    not isinstance(record, dict)
+                    or record.get("name") != name
+                    or record.get("state") != "active"
+                    or type(record.get("generation")) is not int
+                    or record["generation"] != 1
+                    or record.get("previousEntryDigest") is not None
+                    or not is_sha256(record.get("entryDigest"))
+                    or not isinstance(record.get("subject"), str)
+                    or not catalog_support.oci_subject(record["subject"])
+                ):
+                    raise ValueError("selected local record")
+            local_records = records
+            local_evidence = {
+                "revision": revision,
+                "snapshotDigest": snapshot_digest,
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise InfrastructureError("local image catalog returned invalid resolution evidence") from error
+
+    for member in members:
+        selector = member["requestedSelector"]
+        if set(selector) == {"digestRef"}:
+            continue
+        name = selector["catalogName"]
+        if name.startswith("agent-lab."):
+            entry = bundled_by_name.get(name)
             if entry is None:
                 raise InvalidManifest("references an unknown bundled image name")
             member["resolvedImage"] = {
@@ -666,17 +736,22 @@ def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, ob
                 "subject": entry["subject"],
             }
         else:
-            raw_home = os.environ.get("AGENT_LAB_HOME")
-            if not raw_home:
-                raise InvalidManifest("local image name requires an initialized Agent Lab home")
-            record = local_catalog_entry(Path(raw_home), name)
+            record = local_records[name]
             member["resolvedImage"] = {
                 "entryDigest": record["entryDigest"],
                 "generation": record["generation"],
                 "origin": "local",
                 "subject": record["subject"],
             }
-    return resolved
+    return PlanResolution(resolved, local_evidence)
+
+
+def resolve_plan(
+    plan: dict[str, object],
+    repo_root: Path,
+    catalog: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return resolve_plan_with_evidence(plan, repo_root, catalog).plan
 
 
 def invoke_cue(
@@ -737,7 +812,7 @@ def parse_cue_plan(completed: subprocess.CompletedProcess[bytes]) -> dict[str, o
     return plan
 
 
-def cue_plan(manifest: object) -> object:
+def cue_plan_with_evidence(manifest: object) -> PlanResolution:
     repo_root = Path(__file__).resolve().parent.parent
     contract_root = repo_root / "contracts" / "experiment" / "v0alpha1"
     cue_helper = repo_root / "scripts" / "dev" / "cue-tool.py"
@@ -787,9 +862,13 @@ def cue_plan(manifest: object) -> object:
             plan = parse_cue_plan(completed)
             if plan != expected_plan(manifest, contract_digest):
                 raise InfrastructureError("pinned CUE plan violates its exact postcondition")
-            return resolve_plan(plan, repo_root)
+            return resolve_plan_with_evidence(plan, repo_root)
     except OSError as error:
         raise InfrastructureError("private validation snapshot could not be managed") from error
+
+
+def cue_plan(manifest: object) -> object:
+    return cue_plan_with_evidence(manifest).plan
 
 
 def is_sha256(value: object) -> bool:
@@ -1208,10 +1287,13 @@ def authorize_plan(plan: object, source_digest: str) -> tuple[dict[str, object],
     return decision, 0 if verdict == "permit" else 1
 
 
-def write_envelope(plan: object) -> None:
+def write_envelope(plan: object, local_catalog: dict[str, object] | None = None) -> None:
     plan_bytes = canonical_json(plan)
     digest = hashlib.sha256(plan_bytes).hexdigest()
-    envelope = canonical_json({"digest": f"sha256:{digest}", "plan": plan}) + b"\n"
+    value: dict[str, object] = {"digest": f"sha256:{digest}", "plan": plan}
+    if local_catalog is not None:
+        value["catalog"] = {"local": local_catalog}
+    envelope = canonical_json(value) + b"\n"
     try:
         written = sys.stdout.buffer.write(envelope)
         if written != len(envelope):
@@ -1239,14 +1321,17 @@ def main(argv: list[str]) -> int:
         try:
             snapshot = read_directory_snapshot(argv[2])
             manifest = authored_manifest(snapshot)
-            plan = cue_plan(manifest)
+            resolution = cue_plan_with_evidence(manifest)
+            plan = resolution.plan
             if directory_checking:
                 plan_bytes = canonical_json(plan)
-                checked = {
+                checked: dict[str, object] = {
                     "digest": f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}",
                     "plan": plan,
                     "source": {"digest": snapshot.digest, "kind": "directory"},
                 }
+                if resolution.local_catalog is not None:
+                    checked["catalog"] = {"local": resolution.local_catalog}
                 sys.stdout.buffer.write(canonical_json(checked) + b"\n")
                 return 0
             decision, result = authorize_plan(plan, snapshot.digest)
@@ -1272,9 +1357,10 @@ def main(argv: list[str]) -> int:
         manifest = strict_json(manifest_bytes, source="input")
         if not isinstance(manifest, dict):
             raise InvalidManifest("must be one JSON object")
-        plan = cue_plan(manifest)
+        resolution = cue_plan_with_evidence(manifest)
+        plan = resolution.plan
         if checking:
-            write_envelope(plan)
+            write_envelope(plan, resolution.local_catalog)
             return 0
         decision, result = authorize_plan(plan, "sha256:" + "0" * 64)
         write_decision(decision)

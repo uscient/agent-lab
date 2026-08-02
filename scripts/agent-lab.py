@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from importlib.util import module_from_spec, spec_from_file_location
-import fcntl
 import hashlib
 import json
 import os
@@ -14,25 +13,10 @@ import subprocess
 import sys
 
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
-IMAGE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
-OCI_SUBJECT = re.compile(r"^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$")
 
 
 def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
-
-
-def record_digest(domain: bytes, value: object) -> str:
-    return "sha256:" + hashlib.sha256(domain + canonical(value)).hexdigest()
-
-
-def image_name(value: str) -> bool:
-    parts = value.split(".")
-    return (
-        len(value.encode("utf-8")) <= 63
-        and len(parts) == 2
-        and all(part.isascii() and 1 <= len(part) <= 31 and IMAGE_COMPONENT.fullmatch(part) for part in parts)
-    )
 
 
 def effective_home(raw: str | None) -> Path:
@@ -79,12 +63,24 @@ def init_home(home: Path, argv: list[str]) -> int:
                 return 0
             print("FAIL Agent Lab home conflicts with requested configuration", file=sys.stderr)
             return 1
+        component_roots = {
+            key: home / component
+            for key, component in components.items()
+        }
+        for path in component_roots.values():
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            raise OSError("Agent Lab data component already exists")
+        for path in component_roots.values():
+            path.mkdir(mode=0o700)
         for key in ("experiments", "images"):
-            (home / components[key] / ".staging").mkdir(mode=0o700, parents=True)
-        (home / components["cache"] / "tools/cue").mkdir(mode=0o700, parents=True)
-        (home / components["cache"] / "tools/cedar").mkdir(mode=0o700, parents=True)
-        locks = home / components["state"] / "locks"
-        locks.mkdir(mode=0o700, parents=True)
+            (component_roots[key] / ".staging").mkdir(mode=0o700)
+        (component_roots["cache"] / "tools/cue").mkdir(mode=0o700, parents=True)
+        (component_roots["cache"] / "tools/cedar").mkdir(mode=0o700, parents=True)
+        locks = component_roots["state"] / "locks"
+        locks.mkdir(mode=0o700)
         for name in ("image-catalog.lock", "experiments.lock"):
             descriptor = os.open(locks / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
@@ -151,135 +147,72 @@ def experiment_module():
     return module
 
 
-def atomic_json(path: Path, value: object) -> None:
-    data = canonical(value) + b"\n"
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(descriptor, data)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
+def image_catalog_module():
+    path = Path(__file__).resolve().with_name("image_catalog.py")
+    spec = spec_from_file_location("agent_lab_image_catalog", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("image catalog module cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def catalog_paths(home: Path, loaded: tuple[dict[str, object], bytes]) -> tuple[Path, Path]:
-    paths = loaded[0]["paths"]
-    assert isinstance(paths, dict)
-    return home / str(paths["images"]) / "catalog", home / str(paths["state"]) / "locks/image-catalog.lock"
-
-
-def load_catalog(root: Path) -> dict[str, object]:
-    current = root / "current.json"
-    if not root.exists():
-        return {"revision": 0, "previous": None, "records": {}}
-    try:
-        pointer = json.loads(current.read_text(encoding="utf-8"))
-        digest = pointer["snapshotDigest"]
-        if not isinstance(digest, str) or not digest.startswith("sha256:"):
-            raise ValueError
-        snapshot_path = root / "snapshots" / f"{digest[7:]}.json"
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, KeyError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError("image catalog is malformed") from error
-    if record_digest(b"agent-lab.local-image-snapshot.v1\0", snapshot) != digest:
-        raise RuntimeError("image catalog snapshot digest mismatch")
-    if not isinstance(snapshot, dict) or set(snapshot) != {"revision", "previous", "records"} or not isinstance(snapshot["records"], dict):
-        raise RuntimeError("image catalog snapshot is not closed")
-    return snapshot
-
-
-def write_catalog(root: Path, snapshot: dict[str, object], entry: dict[str, object]) -> tuple[str, str]:
-    entries = root / "entries"
-    snapshots = root / "snapshots"
-    entries.mkdir(mode=0o700, parents=True, exist_ok=True)
-    snapshots.mkdir(mode=0o700, parents=True, exist_ok=True)
-    entry_digest = record_digest(b"agent-lab.local-image-entry.v1\0", entry)
-    entry_path = entries / f"{entry_digest[7:]}.json"
-    if not entry_path.exists():
-        atomic_json(entry_path, entry)
-    snapshot_digest = record_digest(b"agent-lab.local-image-snapshot.v1\0", snapshot)
-    snapshot_path = snapshots / f"{snapshot_digest[7:]}.json"
-    if not snapshot_path.exists():
-        atomic_json(snapshot_path, snapshot)
-    atomic_json(root / "current.json", {"snapshotDigest": snapshot_digest})
-    return entry_digest, snapshot_digest
+def write_json(value: object) -> None:
+    output = canonical(value).decode("ascii") + "\n"
+    written = sys.stdout.write(output)
+    if written != len(output):
+        raise OSError("partial command output")
+    sys.stdout.flush()
 
 
 def image_command(home: Path, argv: list[str]) -> int:
-    try:
-        loaded = load_config(home)
-    except RuntimeError as error:
-        print(f"INFRA Agent Lab {error}", file=sys.stderr)
-        return 125
-    if loaded is None:
-        print("FAIL Agent Lab home is not initialized", file=sys.stderr)
-        return 1
-    root, lock_path = catalog_paths(home, loaded)
-    try:
-        lock = open(lock_path, "r+b", buffering=0)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        snapshot = load_catalog(root)
-    except (OSError, RuntimeError) as error:
-        print(f"INFRA Agent Lab {error}", file=sys.stderr)
-        return 125
-    try:
-        records = snapshot["records"]
-        assert isinstance(records, dict)
-        if argv[:1] == ["add"] and len(argv) == 3:
-            name, subject = argv[1:]
-            if not image_name(name) or name.startswith("agent-lab.") or not OCI_SUBJECT.fullmatch(subject):
-                print("FAIL image mapping is invalid or reserved", file=sys.stderr)
-                return 1
-            prior = records.get(name)
-            if prior is not None:
-                if prior["state"] == "active" and prior["subject"] == subject:
-                    print(canonical({"changed": False, "entryDigest": prior["entryDigest"], "generation": 1}).decode())
-                    return 0
-                print("FAIL image name already exists or is tombstoned", file=sys.stderr)
-                return 1
-            entry = {"generation": 1, "name": name, "previousEntryDigest": None, "state": "active", "subject": subject}
-            entry_digest = record_digest(b"agent-lab.local-image-entry.v1\0", entry)
-            record = {**entry, "entryDigest": entry_digest}
-            new_records = {**records, name: record}
-            next_snapshot = {"previous": record_digest(b"agent-lab.local-image-snapshot.v1\0", snapshot) if snapshot["revision"] else None, "records": new_records, "revision": int(snapshot["revision"]) + 1}
-            write_catalog(root, next_snapshot, entry)
-            print(canonical({"changed": True, "entryDigest": entry_digest, "generation": 1}).decode())
-            return 0
-        if argv[:1] == ["remove"] and len(argv) == 4 and argv[2] == "--expect":
-            name, expected = argv[1], argv[3]
-            prior = records.get(name)
-            if prior is None:
-                print("FAIL image name is unknown", file=sys.stderr)
-                return 1
-            if prior["state"] == "removed" and prior["previousEntryDigest"] == expected:
-                print(canonical({"changed": False, "entryDigest": prior["entryDigest"], "generation": 2, "state": "removed"}).decode())
-                return 0
-            if prior["state"] != "active" or prior["entryDigest"] != expected:
-                print("FAIL image remove compare-and-swap conflict", file=sys.stderr)
-                return 1
-            entry = {"generation": 2, "name": name, "previousEntryDigest": expected, "state": "removed", "subject": prior["subject"]}
-            entry_digest = record_digest(b"agent-lab.local-image-entry.v1\0", entry)
-            record = {**entry, "entryDigest": entry_digest}
-            next_snapshot = {"previous": record_digest(b"agent-lab.local-image-snapshot.v1\0", snapshot), "records": {**records, name: record}, "revision": int(snapshot["revision"]) + 1}
-            write_catalog(root, next_snapshot, entry)
-            print(canonical({"changed": True, "entryDigest": entry_digest, "generation": 2, "state": "removed"}).decode())
-            return 0
-        if argv[:1] == ["list"] and (len(argv) == 1 or argv == ["list", "--all"]):
-            include_all = len(argv) == 2
-            values = [records[name] for name in sorted(records) if include_all or records[name]["state"] == "active"]
-            print(canonical(values).decode())
-            return 0
-        if argv[:1] == ["inspect"] and len(argv) == 2:
-            record = records.get(argv[1])
-            if record is None:
-                print("FAIL image name is unknown", file=sys.stderr)
-                return 1
-            print(canonical(record).decode())
-            return 0
+    if argv[:1] == ["add"] and len(argv) == 3:
+        operation = "add"
+    elif argv[:1] == ["remove"] and len(argv) == 4 and argv[2] == "--expect":
+        operation = "remove"
+    elif argv[:1] == ["list"] and (len(argv) == 1 or argv == ["list", "--all"]):
+        operation = "list"
+    elif argv[:1] == ["inspect"] and len(argv) == 2:
+        operation = "inspect"
+    else:
         return 2
-    finally:
-        lock.close()
+
+    if operation in {"add", "remove"} and sys.platform != "linux":
+        print("INFRA Agent Lab local image catalog mutations require Linux", file=sys.stderr)
+        return 125
+
+    try:
+        catalog = image_catalog_module()
+    except (ImportError, OSError) as error:
+        print(f"INFRA Agent Lab image catalog is unavailable: {error}", file=sys.stderr)
+        return 125
+
+    try:
+        if operation == "add":
+            result = catalog.add_image(home, argv[1], argv[2])
+        elif operation == "remove":
+            result = catalog.remove_image(home, argv[1], argv[3])
+        elif operation == "list":
+            result = catalog.list_images(home, include_removed=len(argv) == 2)
+        else:
+            result = catalog.inspect_image(home, argv[1])
+    except catalog.CatalogReject as error:
+        print(f"FAIL image {error}", file=sys.stderr)
+        return 1
+    except catalog.CatalogInfrastructure as error:
+        print(f"INFRA Agent Lab image catalog {error}", file=sys.stderr)
+        return 125
+    except (AttributeError, OSError) as error:
+        print(f"INFRA Agent Lab image catalog operation is unavailable: {error}", file=sys.stderr)
+        return 125
+
+    try:
+        write_json(result)
+    except OSError as error:
+        print(f"INFRA Agent Lab image catalog result is uncertain: {error}", file=sys.stderr)
+        return 125
+    return 0
 
 
 def main(argv: list[str]) -> int:
