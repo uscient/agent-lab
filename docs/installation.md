@@ -48,6 +48,8 @@ program bundle:
 
 ```bash
 agent-lab --home /absolute/private/home experiment install ./my-experiment
+agent-lab --home /absolute/private/home experiment install --zip ./my-experiment.zip
+agent-lab --home /absolute/private/home experiment install --git https://github.com/owner/repository.git --commit <40 lowercase hex>
 agent-lab --home /absolute/private/home experiment inspect NAME
 ```
 
@@ -74,7 +76,10 @@ identifies the closed receipt itself. Provenance records the source transport an
 evidence: `catalog` is `null` for direct digests, `catalog.bundled.snapshotDigest` identifies a
 release-owned bundled snapshot, and `catalog.local` contains the checked local snapshot's `revision`
 and `snapshotDigest`. Both nested entries are present when a plan uses both namespaces. Provenance
-is evidence, not authority for a later operation.
+also records one closed source transport: local directory, bounded ZIP byte count and digest, or
+canonical public GitHub URL, exact commit/tree/blob identities, and bounded acquisition facts.
+Transport provenance is evidence, not authority for a later operation and is excluded from the
+installation identity, so equivalent directory, ZIP, and Git sources retry idempotently.
 
 Every read reopens and verifies the closed layout, canonical bytes, digests, schemas, ownership,
 modes, and link counts. `experiment inspect` does this under the shared store lock and never writes
