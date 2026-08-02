@@ -831,16 +831,12 @@ def main() -> int:
         layout_rc: int | None = None
         layout_error: BaseException | None = None
         if STORE is not None and layout_install.returncode == 0:
-            original_listdir = STORE.os.listdir
+            original_directory_names = STORE._directory_names
 
-            def change_after_enumeration(path: object = "."):
+            def change_after_enumeration(path: Path):
                 nonlocal layout_changed
-                names = original_listdir(path)
-                try:
-                    rendered = Path(os.fsdecode(os.fspath(path)))
-                except TypeError:
-                    return names
-                if rendered == layout_target and not layout_changed:
+                names = original_directory_names(path)
+                if path == layout_target and not layout_changed:
                     layout_changed = True
                     layout_target.chmod(0o700)
                     foreign = layout_target / "foreign-after-enumeration"
@@ -849,14 +845,14 @@ def main() -> int:
                     layout_target.chmod(0o500)
                 return names
 
-            STORE.os.listdir = change_after_enumeration
+            STORE._directory_names = change_after_enumeration
             try:
                 layout_rc, _, layout_error = store_inspect(
                     layout_home,
                     "first-experiment",
                 )
             finally:
-                STORE.os.listdir = original_listdir
+                STORE._directory_names = original_directory_names
         check(
             "IST-STATE-003",
             installed.returncode == 0
