@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+helper="$script_dir/experiment.py"
+
+usage() {
+  printf '%s\n' \
+    'Usage: agent-lab experiment check DIRECTORY' \
+    'Usage: agent-lab experiment authorize install DIRECTORY' >&2
+}
+
+[ "${1:-}" = experiment ] || { usage; exit 2; }
+shift
+case "${1:-}" in
+  check)
+    [ "$#" -eq 2 ] || { usage; exit 2; }
+    exec python3 -I "$helper" check-directory "$2"
+    ;;
+  authorize)
+    [ "${2:-}" = install ] && [ "$#" -eq 3 ] || { usage; exit 2; }
+    exec python3 -I "$helper" authorize-directory "$3"
+    ;;
+  *) usage; exit 2 ;;
+esac
