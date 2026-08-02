@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 agent_lab="$repo_root/scripts/agent-lab"
+bounded_helper="$repo_root/tests/helpers/run-bounded.py"
 fixture="$repo_root/tests/experiment/fixtures/directories/minimal"
 runtime_manifest="$repo_root/packaging/agent-lab-local.manifest"
-work="$(mktemp -d)"
+expected_runtime="$repo_root/tests/install/fixtures/expected-runtime-files.txt"
+expected_count=33
+work=""
+failures=0
+infrastructure=0
 cleanup_work() {
   local failed=0
   if [ -n "$work" ] && [ -e "$work" ]; then
@@ -18,27 +23,62 @@ cleanup_work() {
   fi
   return "$failed"
 }
+
+if ! work="$(mktemp -d)"; then
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
-mkdir -p "$work/home" "$work/tmp"
+if ! mkdir -p "$work/home" "$work/tmp"; then
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+fi
+
+if [ ! -x "$agent_lab" ] || [ ! -f "$bounded_helper" ] || [ ! -d "$fixture" ] ||
+   [ ! -f "$runtime_manifest" ] || [ ! -f "$expected_runtime" ] ||
+   ! command -v jq >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  printf 'INFRA zip-intake prerequisites are unavailable\n' >&2
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+fi
+if ! python3 -I -B "$bounded_helper" --self-test \
+  > "$work/bounded-self-test.out" 2> "$work/bounded-self-test.err"; then
+  printf 'INFRA bounded command helper self-test failed\n' >&2
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+fi
 
 if ! python3 -I -B "$repo_root/tests/experiment/zip-fixtures.py" \
   "$fixture/experiment.cue" "$work"; then
-  printf 'SUMMARY assertions=0 expected=33 failures=0 infra=1\n'
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 fi
 
 capture() {
   local name="$1"
+  local status="$work/$name.status"
+  local status_line=""
   shift
   CAPTURE_RC=0
-  env -i PATH="${CAPTURE_PATH:-/usr/bin:/bin}" HOME="$work/home" TMPDIR="$work/tmp" LC_ALL=C \
-    CANARY_DIR="${CANARY_DIR:-$work/no-canary}" \
-    AGENT_LAB_CUE_TOOL_DIR="${AGENT_LAB_CUE_TOOL_DIR:-$repo_root/.cache/dev/tools/cue}" \
-    AGENT_LAB_CEDAR_TOOL_DIR="${AGENT_LAB_CEDAR_TOOL_DIR:-$repo_root/.cache/dev/tools/cedar}" \
-    "$@" > "$work/$name.out" 2> "$work/$name.err" || CAPTURE_RC=$?
+  find "$status" -delete 2>/dev/null || true
+  python3 -I -B "$bounded_helper" --timeout 5 --status "$status" \
+    --stdout "$work/$name.out" --stderr "$work/$name.err" -- \
+    env -i PATH="${CAPTURE_PATH:-/usr/bin:/bin}" HOME="$work/home" TMPDIR="$work/tmp" LC_ALL=C \
+      CANARY_DIR="${CANARY_DIR:-$work/no-canary}" \
+      AGENT_LAB_CUE_TOOL_DIR="${AGENT_LAB_CUE_TOOL_DIR:-$repo_root/.cache/dev/tools/cue}" \
+      AGENT_LAB_CEDAR_TOOL_DIR="${AGENT_LAB_CEDAR_TOOL_DIR:-$repo_root/.cache/dev/tools/cedar}" \
+      "$@" || CAPTURE_RC=$?
+  if [ -f "$status" ]; then
+    status_line="$(cat "$status")"
+  fi
+  if [ "$status_line" != "child:$CAPTURE_RC" ]; then
+    printf 'INFRA bounded command status is inconsistent: %s rc=%s status=%s\n' \
+      "$name" "$CAPTURE_RC" "$status_line" >&2
+    infrastructure=1
+    CAPTURE_RC=125
+  fi
 }
 
-failures=0
 observed="$work/observed"
 : > "$observed"
 pass() { printf 'PASS %s %s\n' "$1" "$2"; printf '%s\n' "$1" >> "$observed"; }
@@ -48,8 +88,8 @@ init_home() {
   capture "$label" "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed\n' >&2
-    printf 'SUMMARY assertions=%s expected=33 failures=%s infra=1\n' \
-      "$(wc -l < "$observed")" "$failures"
+    printf 'SUMMARY assertions=%s expected=%s failures=%s infra=1\n' \
+      "$(wc -l < "$observed")" "$expected_count" "$failures"
     exit 125
   fi
 }
@@ -132,15 +172,19 @@ capture creator-version "$agent_lab" experiment check --zip "$work/creator-versi
 creator_version_rc="$CAPTURE_RC"
 capture deflate-level-hint "$agent_lab" experiment check --zip "$work/deflate-level-hint.zip"
 deflate_level_hint_rc="$CAPTURE_RC"
+capture dos-archive-file "$agent_lab" experiment check --zip "$work/dos-archive-file.zip"
+dos_archive_file_rc="$CAPTURE_RC"
 if [ "$utf8_ascii_rc" -eq 0 ] && [ "$creator_version_rc" -eq 0 ] &&
-   [ "$deflate_level_hint_rc" -eq 0 ] &&
+   [ "$deflate_level_hint_rc" -eq 0 ] && [ "$dos_archive_file_rc" -eq 0 ] &&
    [ ! -s "$work/utf8-ascii.err" ] && [ ! -s "$work/creator-version.err" ] &&
-   [ ! -s "$work/deflate-level-hint.err" ] &&
+   [ ! -s "$work/deflate-level-hint.err" ] && [ ! -s "$work/dos-archive-file.err" ] &&
    [ "$(jq -r '.source.digest' "$work/utf8-ascii.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ] &&
    [ "$(jq -r '.source.digest' "$work/creator-version.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ] &&
    [ "$(jq -r '.source.digest' "$work/deflate-level-hint.out")" = \
+     "$(jq -r '.source.digest' "$work/directory.out")" ] &&
+   [ "$(jq -r '.source.digest' "$work/dos-archive-file.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ]; then
   pass ZIP-COMPAT-001 "benign ZIP creator and compression metadata remain compatible"
 else
@@ -176,7 +220,7 @@ expect_all_reject ZIP-META-001 ZIP-META "member and archive metadata are closed"
   extra-field.zip file-comment.zip archive-comment.zip
 
 expect_all_reject ZIP-FLAG-001 ZIP-FLAG "encrypted and descriptor-based members are refused" \
-  encrypted.zip strong-encrypted.zip data-descriptor.zip
+  encrypted.zip strong-encrypted.zip data-descriptor.zip stored-option-flag.zip
 
 expect_all_reject ZIP-METHOD-001 ZIP-METHOD "only stored and raw deflate members are accepted" \
   unsupported-method.zip
@@ -550,7 +594,10 @@ fi
 deny_home="$work/deny-home"
 init_home deny-home-init "$deny_home"
 deny_runtime="$work/deny-runtime"
-deny_runtime_ok=1
+deny_runtime_ok=0
+if cmp -s "$expected_runtime" "$runtime_manifest"; then
+  deny_runtime_ok=1
+fi
 while IFS= read -r runtime_name; do
   if [ -z "$runtime_name" ] || [ ! -f "$repo_root/$runtime_name" ]; then
     deny_runtime_ok=0
@@ -558,25 +605,30 @@ while IFS= read -r runtime_name; do
   fi
   mkdir -p "$deny_runtime/$(dirname -- "$runtime_name")"
   cp "$repo_root/$runtime_name" "$deny_runtime/$runtime_name" || deny_runtime_ok=0
-done < "$runtime_manifest"
+done < "$expected_runtime"
 if [ "$deny_runtime_ok" -eq 1 ]; then
   sed 's/^permit (/forbid (/' \
     "$repo_root/authorization/experiment/v0alpha1/operator.cedar" \
     > "$deny_runtime/authorization/experiment/v0alpha1/operator.cedar"
 fi
+deny_before="$(tree_fingerprint "$deny_home")"
 capture deny-preview "$deny_runtime/scripts/agent-lab" --home "$deny_home" \
   experiment authorize install --zip "$work/stored.zip"
 deny_preview_rc="$CAPTURE_RC"
-deny_before="$(tree_fingerprint "$deny_home")"
+deny_after_preview="$(tree_fingerprint "$deny_home")"
 capture deny-install "$deny_runtime/scripts/agent-lab" --home "$deny_home" \
   experiment install --zip "$work/stored.zip"
 deny_install_rc="$CAPTURE_RC"
-deny_after="$(tree_fingerprint "$deny_home")"
+deny_after_install="$(tree_fingerprint "$deny_home")"
 if [ "$deny_runtime_ok" -eq 1 ] && [ "$deny_preview_rc" -eq 1 ] &&
    [ "$deny_install_rc" -eq 1 ] && [ ! -s "$work/deny-preview.err" ] &&
    [ ! -s "$work/deny-install.out" ] &&
+   [ "$(wc -l < "$work/deny-install.err")" -eq 1 ] &&
+   grep -Fxq 'FAIL Experiment fresh Experiment installation authorization denied' \
+     "$work/deny-install.err" &&
    jq -e '.verdict == "deny"' "$work/deny-preview.out" >/dev/null 2>&1 &&
-   [ "$deny_before" = "$deny_after" ]; then
+   [ "$deny_before" = "$deny_after_preview" ] &&
+   [ "$deny_before" = "$deny_after_install" ]; then
   pass ZIP-DENY-001 "fresh zip denial leaves the initialized home unchanged"
 else
   fail ZIP-DENY-001 "fresh zip denial leaves the initialized home unchanged"
@@ -658,7 +710,10 @@ installed_prefix="$work/installed-prefix"
 installed_home="$work/installed-home"
 installed_unrelated="$work/installed-unrelated"
 installed_tools="$work/installed-tools"
-installed_ok=1
+installed_ok=0
+if cmp -s "$expected_runtime" "$runtime_manifest"; then
+  installed_ok=1
+fi
 mkdir -p "$installed_source/packaging" "$installed_source/scripts" \
   "$installed_unrelated" "$installed_tools/cue" "$installed_tools/cedar" || installed_ok=0
 while IFS= read -r runtime_name; do
@@ -668,7 +723,7 @@ while IFS= read -r runtime_name; do
   fi
   mkdir -p "$installed_source/$(dirname -- "$runtime_name")" || installed_ok=0
   cp "$repo_root/$runtime_name" "$installed_source/$runtime_name" || installed_ok=0
-done < "$runtime_manifest"
+done < "$expected_runtime"
 cp "$runtime_manifest" "$installed_source/packaging/agent-lab-local.manifest" || installed_ok=0
 cp "$repo_root/scripts/install-local" "$repo_root/scripts/install-local.py" \
   "$installed_source/scripts/" || installed_ok=0
@@ -729,14 +784,13 @@ printf '%s\n' \
   ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA assertion identity drift\n' >&2
-  exit 125
+  infrastructure=1
 fi
-cleanup_infrastructure=0
 if ! cleanup_work; then
-  cleanup_infrastructure=1
+  infrastructure=1
 fi
 trap - EXIT
-printf 'SUMMARY assertions=33 expected=33 failures=%s infra=%s\n' \
-  "$failures" "$cleanup_infrastructure"
-[ "$cleanup_infrastructure" -eq 0 ] || exit 125
+printf 'SUMMARY assertions=%s expected=%s failures=%s infra=%s\n' \
+  "$expected_count" "$expected_count" "$failures" "$infrastructure"
+[ "$infrastructure" -eq 0 ] || exit 125
 [ "$failures" -eq 0 ]

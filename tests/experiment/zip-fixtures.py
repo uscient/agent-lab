@@ -214,6 +214,13 @@ def main() -> int:
             u16(data, central + 8, struct.unpack_from("<H", data, central + 8)[0] | 0x4),
         ),
     )
+    fixtures["stored-option-flag.zip"] = mutate(
+        stored,
+        lambda data, local, central, _eocd: (
+            u16(data, local + 6, struct.unpack_from("<H", data, local + 6)[0] | 0x4),
+            u16(data, central + 8, struct.unpack_from("<H", data, central + 8)[0] | 0x4),
+        ),
+    )
     fixtures["utf8-ascii.zip"] = mutate(
         stored,
         lambda data, local, central, _eocd: (
@@ -309,6 +316,17 @@ def main() -> int:
                 struct.unpack_from("<H", data, central + 4)[0] & 0x00FF,
             ),
             u32(data, central + 38, 0x08),
+        ),
+    )
+    fixtures["dos-archive-file.zip"] = mutate(
+        stored,
+        lambda data, _local, central, _eocd: (
+            u16(
+                data,
+                central + 4,
+                struct.unpack_from("<H", data, central + 4)[0] & 0x00FF,
+            ),
+            u32(data, central + 38, 0x20),
         ),
     )
     fixtures["eocd-count-mismatch.zip"] = mutate(
