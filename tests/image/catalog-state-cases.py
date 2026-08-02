@@ -445,6 +445,50 @@ def main() -> int:
             f"first_rc={first_rc} error={first_error!r} retry_rc={retry.returncode} retry={retry_value!r}",
         )
 
+        forged_home = new_home(root, "forged-stage-home")
+        victim = add(forged_home)
+        _, _, base_digest = current_snapshot(forged_home)
+        victim_digest = victim.get("entryDigest")
+        if not isinstance(victim_digest, str):
+            raise RuntimeError("catalog setup add omitted the active entry digest")
+        wrapper = forged_home / "images" / ".staging" / "image-catalog-operation"
+        wrapper.mkdir(mode=0o700)
+        forged_intent = {
+            "apiVersion": "agent-lab.local-image-intent/v0alpha1",
+            "baseSnapshotDigest": base_digest,
+            "bootstrap": False,
+            "candidateEntryDigest": victim_digest,
+            "candidateSnapshotDigest": "sha256:" + "f" * 64,
+            "entryPreexisting": False,
+            "expectedEntryDigest": None,
+            "kind": "add",
+            "name": "vendor.second",
+            "snapshotPreexisting": True,
+            "subject": OTHER_SUBJECT,
+        }
+        intent_path = wrapper / "intent.json"
+        intent_path.write_bytes(canonical(forged_intent) + b"\n")
+        intent_path.chmod(0o600)
+        before = fingerprint(forged_home / "images")
+        completed = cli(forged_home, "image", "add", "vendor.third", OTHER_SUBJECT)
+        after = fingerprint(forged_home / "images")
+        observed = cli(forged_home, "image", "list")
+        observed_value = json.loads(observed.stdout) if observed.returncode == 0 else []
+        check(
+            "CAT-CRASH-004",
+            completed.returncode == 125
+            and completed.stdout == b""
+            and before == after
+            and observed.returncode == 0
+            and len(observed_value) == 1
+            and observed_value[0].get("entryDigest") == victim_digest,
+            "unproven staged intent cannot delete committed immutable history or its own evidence",
+            (
+                f"rc={completed.returncode} changed={before != after} "
+                f"list_rc={observed.returncode} list={observed_value!r}"
+            ),
+        )
+
         platform_home = new_home(root, "platform-home")
         before = fingerprint(platform_home)
         original_platform = MODULE.sys.platform
@@ -482,12 +526,13 @@ def main() -> int:
         "CAT-CRASH-001",
         "CAT-CRASH-002",
         "CAT-CRASH-003",
+        "CAT-CRASH-004",
         "CAT-PLAT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=18 expected=18 failures={FAILURES} infra=0")
+    print(f"SUMMARY assertions=19 expected=19 failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
