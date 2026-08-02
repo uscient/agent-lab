@@ -70,5 +70,15 @@ else
   printf 'PKG-004 rc=%s stderr=%s\n' "$check_rc" "$(tr '\n' ' ' < "$work/check.err" 2>/dev/null || true)"
 fi
 
-printf 'SUMMARY assertions=4 expected=4 failures=%s infra=0\n' "$failures"
+mkdir "$work/symlink-target"
+ln -s "$work/symlink-target" "$work/symlink-prefix"
+symlink_rc=0
+"$installer" --prefix "$work/symlink-prefix" > "$work/symlink.out" 2> "$work/symlink.err" || symlink_rc=$?
+if [ "$symlink_rc" -eq 125 ] && [ -z "$(find "$work/symlink-target" -mindepth 1 -print -quit)" ]; then
+  pass PKG-005 "installer refuses a symlinked prefix before writes"
+else
+  fail PKG-005 "installer refuses a symlinked prefix before writes"
+fi
+
+printf 'SUMMARY assertions=5 expected=5 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
