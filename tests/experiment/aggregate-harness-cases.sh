@@ -97,16 +97,17 @@ write_fixture() {
         printf 'fi\n'
         ;;
     esac
+    printf 'if [ -n "${AGENT_LAB_AGG_HOLD_DIR:-}" ] &&\n'
+    printf "   [ \"\${AGENT_LAB_AGG_HOLD_ID:-}\" = '%s' ]; then\n" "$execution_id"
+    printf '  : > "$AGENT_LAB_AGG_HOLD_DIR/ready" || exit 125\n'
+    printf '  attempts=0\n'
+    printf '  while [ ! -f "$AGENT_LAB_AGG_HOLD_DIR/release" ]; do\n'
+    printf '    attempts=$((attempts + 1))\n'
+    printf '    [ "$attempts" -lt 500 ] || exit 125\n'
+    printf '    sleep 0.01\n'
+    printf '  done\n'
+    printf 'fi\n'
     if [ "$execution_id" = "local-image-catalog-cases.sh" ]; then
-      printf 'if [ -n "${AGENT_LAB_AGG_HOLD_DIR:-}" ]; then\n'
-      printf '  : > "$AGENT_LAB_AGG_HOLD_DIR/ready" || exit 125\n'
-      printf '  attempts=0\n'
-      printf '  while [ ! -f "$AGENT_LAB_AGG_HOLD_DIR/release" ]; do\n'
-      printf '    attempts=$((attempts + 1))\n'
-      printf '    [ "$attempts" -lt 500 ] || exit 125\n'
-      printf '    sleep 0.01\n'
-      printf '  done\n'
-      printf 'fi\n'
       printf 'if [ -n "${AGENT_LAB_AGG_SIGNAL_DIR:-}" ]; then\n'
       printf '  sleep 30 &\n'
       printf '  descendant_pid=$!\n'
@@ -156,6 +157,15 @@ write_python_fixture() {
     printf 'if log:\n'
     printf '    with open(log, "a", encoding="ascii") as stream:\n'
     printf "        stream.write('%s\\\\n')\n" "$execution_id"
+    printf "hold_dir = os.environ.get('AGENT_LAB_AGG_HOLD_DIR')\n"
+    printf "hold_id = os.environ.get('AGENT_LAB_AGG_HOLD_ID')\n"
+    printf "if hold_dir and hold_id == '%s':\n" "$execution_id"
+    printf "    Path(hold_dir, 'ready').touch()\n"
+    printf '    deadline = time.monotonic() + 5.0\n'
+    printf "    while not Path(hold_dir, 'release').is_file():\n"
+    printf '        if time.monotonic() >= deadline:\n'
+    printf '            raise SystemExit(125)\n'
+    printf '        time.sleep(0.01)\n'
     if [ "$execution_id" = "install-state-cases.py" ]; then
       printf 'barrier = os.environ.get("AGENT_LAB_AGG_BARRIER_DIR")\n'
       printf 'if barrier:\n'
@@ -245,6 +255,28 @@ wait_for_process_exit() {
     [ "$attempts" -lt 100 ] || return 1
     sleep 0.01
   done
+}
+
+wait_for_child_wait() {
+  local pid="$1"
+  local expected_children="$2"
+  local attempts=0
+  local wchan child_list
+  local children=()
+
+  while [ "$attempts" -lt 100 ]; do
+    wchan="$(cat "/proc/$pid/wchan" 2>/dev/null || true)"
+    child_list="$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)"
+    children=()
+    read -r -a children <<< "$child_list"
+    if [ "$wchan" = "do_wait" ] &&
+       [ "${#children[@]}" -eq "$expected_children" ]; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.01
+  done
+  return 1
 }
 
 reset_fixtures
@@ -449,38 +481,72 @@ else
   fail AGG-009 "missing subcase summary maps to one hundred twenty-five"
 fi
 
-if [ "$(grep -Fxc 'lane_count=3' "$replica_lifecycle")" -eq 1 ]; then
-  pass AGG-010 "lifecycle execution is hard-bounded to three lanes"
+lane_assignment_count="$(grep -Ec '^[[:space:]]*(readonly[[:space:]]+)?lane_count=' \
+  "$replica_lifecycle" || true)"
+if [ "$lane_assignment_count" -eq 1 ] &&
+   [ "$(grep -Fxc 'readonly lane_count=3' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc 'for ((lane = 0; lane < lane_count; lane++)); do' \
+     "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '  run_lane "$lane" &' "$replica_lifecycle")" -eq 1 ]; then
+  pass AGG-010 "lifecycle declares one immutable three-lane bound"
 else
-  fail AGG-010 "lifecycle execution is hard-bounded to three lanes"
+  fail AGG-010 "lifecycle declares one immutable three-lane bound"
 fi
 
-reset_fixtures
-hold_dir="$work/lane-hold"
-done_dir="$work/lane-done"
-wait_executions="$work/wait-executions"
-mkdir "$hold_dir" "$done_dir"
-: > "$wait_executions"
-wait_rc=0
-run_replica "$work/wait.out" env \
-  AGENT_LAB_AGG_EXEC_LOG="$wait_executions" \
-  AGENT_LAB_AGG_HOLD_DIR="$hold_dir" \
-  AGENT_LAB_AGG_DONE_DIR="$done_dir" &
-wait_pid=$!
-wait_contract=0
-if wait_for_path "$hold_dir/ready" &&
-   wait_for_path "$done_dir/install-mutation-cases.py.done" &&
-   wait_for_path "$done_dir/install-state-cases.py.done"; then
-  sleep 0.5
-  if kill -0 "$wait_pid" 2>/dev/null; then
-    wait_contract=1
+hold_ids=(
+  local-install-cases.sh
+  local-config-cases.sh
+  local-image-catalog-cases.sh
+)
+peer_done_one=(
+  install-state-cases.py.done
+  install-mutation-cases.py.done
+  install-mutation-cases.py.done
+)
+peer_done_two=(
+  install-integrity-cases.py.done
+  install-integrity-cases.py.done
+  install-state-cases.py.done
+)
+target_done=(
+  install-mutation-cases.py.done
+  install-state-cases.py.done
+  install-integrity-cases.py.done
+)
+expected_wait_children=(1 1 1)
+wait_contract=1
+for hold_index in "${!hold_ids[@]}"; do
+  reset_fixtures
+  hold_dir="$work/lane-hold-$hold_index"
+  done_dir="$work/lane-done-$hold_index"
+  wait_executions="$work/wait-executions-$hold_index"
+  mkdir "$hold_dir" "$done_dir"
+  : > "$wait_executions"
+  wait_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$wait_executions" \
+    AGENT_LAB_AGG_HOLD_DIR="$hold_dir" \
+    AGENT_LAB_AGG_HOLD_ID="${hold_ids[$hold_index]}" \
+    AGENT_LAB_AGG_DONE_DIR="$done_dir" \
+    bash "$replica_lifecycle" > "$work/wait-$hold_index.out" 2>&1 &
+  wait_pid=$!
+  wait_case_contract=0
+  if wait_for_path "$hold_dir/ready" &&
+     wait_for_path "$done_dir/${peer_done_one[$hold_index]}" &&
+     wait_for_path "$done_dir/${peer_done_two[$hold_index]}" &&
+     wait_for_child_wait "$wait_pid" "${expected_wait_children[$hold_index]}"; then
+    wait_case_contract=1
   fi
-fi
-: > "$hold_dir/release"
-wait "$wait_pid" || wait_rc=$?
-if [ "$wait_contract" -eq 1 ] && [ "$wait_rc" -eq 0 ] &&
-   wait_for_path "$done_dir/install-integrity-cases.py.done" &&
-   cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$wait_executions"); then
+  : > "$hold_dir/release"
+  wait "$wait_pid" || wait_rc=$?
+  if [ "$wait_case_contract" -ne 1 ] || [ "$wait_rc" -ne 0 ] ||
+     ! wait_for_path "$done_dir/${target_done[$hold_index]}" ||
+     ! cmp -s <(LC_ALL=C sort "$expected_executions") \
+       <(LC_ALL=C sort "$wait_executions"); then
+    wait_contract=0
+  fi
+done
+if [ "$wait_contract" -eq 1 ]; then
   pass AGG-011 "parent waits every lane through controlled completion"
 else
   fail AGG-011 "parent waits every lane through controlled completion"
@@ -523,9 +589,9 @@ if [ "$descendant_gone" -ne 1 ]; then
 fi
 if [ "$signal_rc" -eq 0 ] && [ "$observed_signal_rc" -eq 143 ] &&
    [ "$descendant_gone" -eq 1 ]; then
-  pass AGG-012 "termination reaps active descendants before lifecycle exit"
+  pass AGG-012 "owned-session termination reaches cooperative descendants"
 else
-  fail AGG-012 "termination reaps active descendants before lifecycle exit"
+  fail AGG-012 "owned-session termination reaches cooperative descendants"
 fi
 
 reset_fixtures
