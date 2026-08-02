@@ -574,8 +574,12 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
   mv "$saved_lifecycle" "$replica_lifecycle"
   if infrastructure_output_valid \
        "$work/missing-local-core.out" 86 "$missing_local_core_rc" &&
+     grep -Fxq 'INFRA shared lifecycle core unavailable' \
+       "$work/missing-local-core.out" &&
      infrastructure_output_valid \
-       "$work/missing-install-core.out" 47 "$missing_install_core_rc"; then
+       "$work/missing-install-core.out" 47 "$missing_install_core_rc" &&
+     grep -Fxq 'INFRA shared lifecycle core unavailable' \
+       "$work/missing-install-core.out"; then
     wrapper_infrastructure_contract=1
   fi
 fi
