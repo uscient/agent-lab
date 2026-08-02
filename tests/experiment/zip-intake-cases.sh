@@ -23,7 +23,7 @@ mkdir -p "$work/home" "$work/tmp"
 
 if ! python3 -I -B "$repo_root/tests/experiment/zip-fixtures.py" \
   "$fixture/experiment.cue" "$work"; then
-  printf 'SUMMARY assertions=0 expected=31 failures=0 infra=1\n'
+  printf 'SUMMARY assertions=0 expected=33 failures=0 infra=1\n'
   exit 125
 fi
 
@@ -48,7 +48,7 @@ init_home() {
   capture "$label" "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed\n' >&2
-    printf 'SUMMARY assertions=%s expected=31 failures=%s infra=1\n' \
+    printf 'SUMMARY assertions=%s expected=33 failures=%s infra=1\n' \
       "$(wc -l < "$observed")" "$failures"
     exit 125
   fi
@@ -130,15 +130,35 @@ capture utf8-ascii "$agent_lab" experiment check --zip "$work/utf8-ascii.zip"
 utf8_ascii_rc="$CAPTURE_RC"
 capture creator-version "$agent_lab" experiment check --zip "$work/creator-version-45.zip"
 creator_version_rc="$CAPTURE_RC"
+capture deflate-level-hint "$agent_lab" experiment check --zip "$work/deflate-level-hint.zip"
+deflate_level_hint_rc="$CAPTURE_RC"
 if [ "$utf8_ascii_rc" -eq 0 ] && [ "$creator_version_rc" -eq 0 ] &&
+   [ "$deflate_level_hint_rc" -eq 0 ] &&
    [ ! -s "$work/utf8-ascii.err" ] && [ ! -s "$work/creator-version.err" ] &&
+   [ ! -s "$work/deflate-level-hint.err" ] &&
    [ "$(jq -r '.source.digest' "$work/utf8-ascii.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ] &&
    [ "$(jq -r '.source.digest' "$work/creator-version.out")" = \
+     "$(jq -r '.source.digest' "$work/directory.out")" ] &&
+   [ "$(jq -r '.source.digest' "$work/deflate-level-hint.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ]; then
-  pass ZIP-COMPAT-001 "benign UTF-8 and creator-version metadata remain compatible"
+  pass ZIP-COMPAT-001 "benign ZIP creator and compression metadata remain compatible"
 else
-  fail ZIP-COMPAT-001 "benign UTF-8 and creator-version metadata remain compatible"
+  fail ZIP-COMPAT-001 "benign ZIP creator and compression metadata remain compatible"
+fi
+
+capture usage-check "$agent_lab" experiment check --zip
+usage_check_rc="$CAPTURE_RC"
+capture usage-authorize "$agent_lab" experiment authorize install --zip
+usage_authorize_rc="$CAPTURE_RC"
+capture usage-install "$agent_lab" experiment install --zip
+usage_install_rc="$CAPTURE_RC"
+if [ "$usage_check_rc" -eq 2 ] && [ "$usage_authorize_rc" -eq 2 ] &&
+   [ "$usage_install_rc" -eq 2 ] && [ ! -s "$work/usage-check.out" ] &&
+   [ ! -s "$work/usage-authorize.out" ] && [ ! -s "$work/usage-install.out" ]; then
+  pass ZIP-USAGE-001 "incomplete zip options are usage errors before source or home access"
+else
+  fail ZIP-USAGE-001 "incomplete zip options are usage errors before source or home access"
 fi
 
 expect_all_reject ZIP-PATH-001 ZIP-PATH "only the exact ASCII root member name is accepted" \
@@ -146,10 +166,11 @@ expect_all_reject ZIP-PATH-001 ZIP-PATH "only the exact ASCII root member name i
   nul-name.zip control-name.zip nonascii.zip
 
 expect_all_reject ZIP-COUNT-001 ZIP-COUNT "the archive has exactly one member" \
-  zero-count.zip eocd-count-mismatch.zip extra-entry.zip duplicate.zip
+  zero-count.zip eocd-count-mismatch.zip extra-entry.zip duplicate.zip \
+  duplicate-encoding.zip normalized-collision.zip slash-backslash-collision.zip
 
 expect_all_reject ZIP-TYPE-001 ZIP-TYPE "the sole member is a regular file" \
-  directory-type.zip symlink-type.zip fifo-type.zip
+  directory-type.zip symlink-type.zip fifo-type.zip dos-volume-label.zip
 
 expect_all_reject ZIP-META-001 ZIP-META "member and archive metadata are closed" \
   extra-field.zip file-comment.zip archive-comment.zip
@@ -167,7 +188,7 @@ expect_all_reject ZIP-HEADER-001 ZIP-HEADER "central and local headers agree exa
   central-signature.zip central-name-mismatch.zip central-flags-mismatch.zip \
   local-method-mismatch.zip local-crc-mismatch.zip local-size-mismatch.zip \
   eocd-offset-mismatch.zip eocd-size-mismatch.zip prefixed.zip duplicate-eocd.zip \
-  concatenated.zip
+  concatenated.zip deflate-version-too-low.zip
 
 expect_all_reject ZIP-CRC-001 ZIP-CRC "member CRC is verified" \
   bad-crc.zip corrupt-payload.zip
@@ -226,7 +247,8 @@ else
   fail ZIP-READ-001 "unavailable or unsafe archive paths are infrastructure failures"
 fi
 
-if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/expanded-limit.zip" <<'PY'
+if python3 -I -B - "$repo_root/scripts/experiment.py" \
+  "$work/expanded-limit.zip" "$work/archive-limit.zip" <<'PY'
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
@@ -236,27 +258,28 @@ assert spec is not None and spec.loader is not None
 module = module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-archive = Path(sys.argv[2])
 original_read = module.os.read
-changed = False
+for archive_name in sys.argv[2:]:
+    archive = Path(archive_name)
+    changed = False
 
-def mutating_read(descriptor, size):
-    global changed
-    data = original_read(descriptor, size)
-    if data and not changed:
-        changed = True
-        with archive.open("ab") as stream:
-            stream.write(b"x")
-    return data
+    def mutating_read(descriptor, size):
+        global changed
+        data = original_read(descriptor, size)
+        if data and not changed:
+            changed = True
+            with archive.open("ab") as stream:
+                stream.write(b"xx")
+        return data
 
-module.os.read = mutating_read
-try:
-    module.read_zip_snapshot(str(archive))
-except module.InfrastructureError as error:
-    assert "ZIP-READ" in str(error)
-else:
-    raise AssertionError("mid-read archive mutation was accepted")
-assert changed
+    module.os.read = mutating_read
+    try:
+        module.read_zip_snapshot(str(archive))
+    except module.InfrastructureError as error:
+        assert "ZIP-READ" in str(error)
+    else:
+        raise AssertionError("mid-read archive mutation was accepted")
+    assert changed
 PY
 then
   pass ZIP-READ-002 "mid-read archive mutation is infrastructure uncertainty"
@@ -289,6 +312,53 @@ then
   pass ZIP-DECODE-001 "unexpected decoder exceptions are infrastructure uncertainty"
 else
   fail ZIP-DECODE-001 "unexpected decoder exceptions are infrastructure uncertainty"
+fi
+
+if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/deflated.zip" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+import sys
+
+spec = spec_from_file_location("zip_late_decode_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+original_decompressobj = module.zlib.decompressobj
+
+class LateFaultDecoder:
+    def __init__(self):
+        self.delegate = original_decompressobj(-15)
+
+    @property
+    def eof(self):
+        raise RuntimeError("injected late decoder uncertainty")
+
+    @property
+    def unconsumed_tail(self):
+        return self.delegate.unconsumed_tail
+
+    @property
+    def unused_data(self):
+        return self.delegate.unused_data
+
+    def decompress(self, data, size):
+        return self.delegate.decompress(data, size)
+
+    def flush(self, size):
+        return self.delegate.flush(size)
+
+module.zlib.decompressobj = lambda _window: LateFaultDecoder()
+try:
+    module.read_zip_snapshot(sys.argv[2])
+except module.InfrastructureError as error:
+    assert "ZIP-DECODE" in str(error)
+else:
+    raise AssertionError("late decoder exception was accepted")
+PY
+then
+  pass ZIP-DECODE-003 "late decoder exceptions are infrastructure uncertainty"
+else
+  fail ZIP-DECODE-003 "late decoder exceptions are infrastructure uncertainty"
 fi
 
 if python3 -I -B - "$repo_root/scripts/experiment.py" "$work/deflated.zip" <<'PY'
@@ -651,10 +721,10 @@ fi
 
 expected="$work/expected"
 printf '%s\n' \
-  ZIP-001 ZIP-COMPAT-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
+  ZIP-001 ZIP-COMPAT-001 ZIP-USAGE-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001 ZIP-META-001 \
   ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001 \
   ZIP-LENGTH-001 ZIP-SIZE-001 ZIP-BOMB-001 ZIP-TRUNC-001 ZIP-TRAIL-001 \
-  ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-DECODE-002 ZIP-TIMEOUT-001 \
+  ZIP-SIZE-002 ZIP-READ-001 ZIP-READ-002 ZIP-DECODE-001 ZIP-DECODE-003 ZIP-DECODE-002 ZIP-TIMEOUT-001 \
   ZIP-OUTPUT-001 ZIP-NOEF-001 ZIP-AUTH-001 ZIP-INSTALL-001 ZIP-RETRY-001 \
   ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
@@ -666,7 +736,7 @@ if ! cleanup_work; then
   cleanup_infrastructure=1
 fi
 trap - EXIT
-printf 'SUMMARY assertions=31 expected=31 failures=%s infra=%s\n' \
+printf 'SUMMARY assertions=33 expected=33 failures=%s infra=%s\n' \
   "$failures" "$cleanup_infrastructure"
 [ "$cleanup_infrastructure" -eq 0 ] || exit 125
 [ "$failures" -eq 0 ]
