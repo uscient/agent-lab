@@ -1393,10 +1393,8 @@ def main() -> int:
                     "GIT-WORKER" in malformed_frame
                     and "GIT-OUTPUT" in oversized_frame
                     and "trailing" in trailing_frame
-                    and (
-                        "diagnostic" in stderr_frame
-                        or "GIT-WORKER" in stderr_frame
-                    )
+                    and stderr_frame
+                    == "git provider GIT-WORKER emitted unexpected diagnostics"
                     and "caller-private-diagnostic" not in stderr_frame
                     and acknowledged_stderr_reached == b"AW"
                     and acknowledged_stderr_frame
