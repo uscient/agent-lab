@@ -5,7 +5,8 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && 
 lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
 failures=0
 if [ "$(grep -Fxc '"$repo_root/tests/install/local-install-cases.sh"' "$lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '"$repo_root/tests/experiment/local-config-cases.sh"' "$lifecycle")" -eq 1 ]; then
+   [ "$(grep -Fxc '"$repo_root/tests/experiment/local-config-cases.sh"' "$lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '"$repo_root/tests/experiment/local-image-catalog-cases.sh"' "$lifecycle")" -eq 1 ]; then
   printf 'PASS AGG-001 lifecycle subcases are routed exactly once in order\n'
 else
   printf 'FAIL AGG-001 lifecycle subcases are routed exactly once in order\n'
