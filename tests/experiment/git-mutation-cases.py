@@ -540,10 +540,26 @@ def main() -> int:
             ),
             (
                 "M-GIT-BOUND-001",
-                "                    terminated = _git_worker_terminate(pid, reaped=reaped)\n",
                 (
-                    f"                    Path(os.environ[\"{MARKER_ENV}\"]).touch()\n"
-                    "                    terminated = True\n"
+                    "                terminated = _git_worker_terminate(\n"
+                    "                    pid,\n"
+                    "                    reaped=reaped,\n"
+                    "                    deadline=cleanup_deadline,\n"
+                    "                )\n"
+                ),
+                (
+                    f"                Path(os.environ[\"{MARKER_ENV}\"]).touch()\n"
+                    "                mutant_observed = _git_worker_observe(pid)\n"
+                    "                mutant_waited, mutant_status = os.waitpid(\n"
+                    "                    pid, os.WNOHANG\n"
+                    "                )\n"
+                    "                terminated = (\n"
+                    "                    mutant_observed is not None\n"
+                    "                    and mutant_waited == pid\n"
+                    "                    and _git_worker_status_matches(\n"
+                    "                        mutant_observed, mutant_status\n"
+                    "                    )\n"
+                    "                )\n"
                 ),
                 lambda module, marker: bound_probe(module, marker, responses),
                 "removed process-group cleanup leaves a live provider descendant",
