@@ -23,5 +23,34 @@ else
   fail PKG-002 "local installer entrypoint exists"
 fi
 
-printf 'SUMMARY assertions=2 expected=2 failures=%s infra=0\n' "$failures"
+prefix="$work/prefix"
+home="$work/agent-home"
+install_rc=125
+version_rc=125
+if [ -f "$repo_root/scripts/install-local.py" ]; then
+  replica="$work/source-replica"
+  mkdir -p "$replica/packaging" "$replica/scripts"
+  while IFS= read -r name; do
+    mkdir -p "$replica/$(dirname -- "$name")"
+    cp "$repo_root/$name" "$replica/$name"
+  done < "$expected"
+  cp "$manifest" "$replica/packaging/agent-lab-local.manifest"
+  cp "$repo_root/scripts/install-local" "$repo_root/scripts/install-local.py" "$replica/scripts/"
+  chmod +x "$replica/scripts/install-local" "$replica/scripts/agent-lab"
+  install_rc=0
+  "$replica/scripts/install-local" --prefix "$prefix" > "$work/install.out" 2> "$work/install.err" || install_rc=$?
+  mv "$replica" "$work/source-unavailable"
+  mkdir "$work/unrelated"
+  version_rc=0
+  (cd "$work/unrelated" && env -i PATH=/usr/bin:/bin "$prefix/bin/agent-lab" --home "$home" version) \
+    > "$work/version.out" 2> "$work/version.err" || version_rc=$?
+fi
+if [ "$install_rc" -eq 0 ] && [ "$version_rc" -eq 0 ] &&
+   grep -Fxq 'agent-lab v0alpha1' "$work/version.out" && [ ! -s "$work/version.err" ]; then
+  pass PKG-003 "installed CLI runs after its isolated source replica is unavailable"
+else
+  fail PKG-003 "installed CLI runs after its isolated source replica is unavailable"
+fi
+
+printf 'SUMMARY assertions=3 expected=3 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
