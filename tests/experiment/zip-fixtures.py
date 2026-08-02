@@ -99,6 +99,19 @@ def append_to_deflate_payload(base: bytes, suffix: bytes) -> bytes:
     return bytes(data)
 
 
+def truncate_deflate_payload(base: bytes) -> bytes:
+    data = bytearray(base)
+    local, central, eocd = offsets(data)
+    compressed_size = struct.unpack_from("<I", data, local + 18)[0]
+    del data[central - 1]
+    central -= 1
+    eocd -= 1
+    u32(data, local + 18, compressed_size - 1)
+    u32(data, central + 20, compressed_size - 1)
+    u32(data, eocd + 16, central)
+    return bytes(data)
+
+
 def replace_names(base: bytes, replacement: bytes, *, local: bool = True, central: bool = True) -> bytes:
     if len(replacement) != len(b"experiment.cue"):
         raise ValueError("replacement name must preserve record lengths")
@@ -144,6 +157,18 @@ def main() -> int:
                 ("experiment.cue", source, zipfile.ZIP_STORED, regular, b"", b""),
             ]
         ),
+        "normalized-collision.zip": zip_bytes(
+            [
+                ("experiment.cue", source, zipfile.ZIP_STORED, regular, b"", b""),
+                ("./experiment.cue", source, zipfile.ZIP_STORED, regular, b"", b""),
+            ]
+        ),
+        "slash-backslash-collision.zip": zip_bytes(
+            [
+                ("experiment.cue", source, zipfile.ZIP_STORED, regular, b"", b""),
+                (".\\experiment.cue", source, zipfile.ZIP_STORED, regular, b"", b""),
+            ]
+        ),
         "directory-type.zip": one("experiment.cue", source, mode=stat.S_IFDIR | 0o700),
         "symlink-type.zip": one("experiment.cue", source, mode=stat.S_IFLNK | 0o777),
         "fifo-type.zip": one("experiment.cue", source, mode=stat.S_IFIFO | 0o600),
@@ -180,6 +205,13 @@ def main() -> int:
         lambda data, local, central, _eocd: (
             u16(data, local + 8, 99),
             u16(data, central + 10, 99),
+        ),
+    )
+    fixtures["deflate-level-hint.zip"] = mutate(
+        deflated,
+        lambda data, local, central, _eocd: (
+            u16(data, local + 6, struct.unpack_from("<H", data, local + 6)[0] | 0x4),
+            u16(data, central + 8, struct.unpack_from("<H", data, central + 8)[0] | 0x4),
         ),
     )
     fixtures["utf8-ascii.zip"] = mutate(
@@ -222,6 +254,13 @@ def main() -> int:
             u16(data, eocd + 6, 1),
         ),
     )
+    fixtures["deflate-version-too-low.zip"] = mutate(
+        deflated,
+        lambda data, local, central, _eocd: (
+            u16(data, local + 4, 10),
+            u16(data, central + 6, 10),
+        ),
+    )
     fixtures["data-descriptor.zip"] = mutate(
         stored,
         lambda data, local, central, _eocd: (
@@ -261,6 +300,17 @@ def main() -> int:
         stored,
         lambda data, local, _central, _eocd: u32(data, local + 22, len(source) - 1),
     )
+    fixtures["dos-volume-label.zip"] = mutate(
+        stored,
+        lambda data, _local, central, _eocd: (
+            u16(
+                data,
+                central + 4,
+                struct.unpack_from("<H", data, central + 4)[0] & 0x00FF,
+            ),
+            u32(data, central + 38, 0x08),
+        ),
+    )
     fixtures["eocd-count-mismatch.zip"] = mutate(
         stored,
         lambda data, _local, _central, eocd: u16(data, eocd + 10, 2),
@@ -297,10 +347,25 @@ def main() -> int:
             44, data[44] ^ 1
         ),
     )
+    duplicate_encoding = bytearray(fixtures["duplicate.zip"])
+    second_local = duplicate_encoding.find(LOCAL, 4)
+    second_central = duplicate_encoding.rfind(CENTRAL)
+    if second_local < 0 or second_central < 0:
+        raise AssertionError("duplicate-encoding fixture has incomplete records")
+    u16(
+        duplicate_encoding,
+        second_local + 6,
+        struct.unpack_from("<H", duplicate_encoding, second_local + 6)[0] | 0x800,
+    )
+    u16(
+        duplicate_encoding,
+        second_central + 8,
+        struct.unpack_from("<H", duplicate_encoding, second_central + 8)[0] | 0x800,
+    )
+    fixtures["duplicate-encoding.zip"] = bytes(duplicate_encoding)
     central_offset = offsets(stored)[1]
     fixtures["missing-central.zip"] = stored[:central_offset]
-    deflated_central = offsets(deflated)[1]
-    fixtures["truncated-deflate.zip"] = deflated[: deflated_central - 1]
+    fixtures["truncated-deflate.zip"] = truncate_deflate_payload(deflated)
     fixtures["trailing.zip"] = stored + b"trailing ambiguity"
     fixtures["prefixed.zip"] = b"prefix" + stored
     fixtures["payload-gap.zip"] = insert_gap(stored, b"gap")
@@ -329,6 +394,9 @@ def main() -> int:
     fixtures["declared-small-large.zip"] = bytes(declared_small)
     fixtures["archive-over.zip"] = stored + (
         b"x" * (1_048_577 - len(stored))
+    )
+    fixtures["archive-limit.zip"] = stored + (
+        b"x" * (1_048_576 - len(stored))
     )
 
     for name, data in fixtures.items():
