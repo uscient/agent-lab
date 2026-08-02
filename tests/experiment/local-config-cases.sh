@@ -53,5 +53,18 @@ else
   failures=$((failures + 1))
 fi
 
-printf 'SUMMARY assertions=4 expected=4 failures=%s infra=0\n' "$failures"
+tool_home="$work/tool-home"
+"$repo_root/scripts/agent-lab" --home "$tool_home" init >/dev/null
+cp -a "$repo_root/.cache/dev/tools/cue/." "$tool_home/cache/tools/cue/"
+cp -a "$repo_root/.cache/dev/tools/cedar/." "$tool_home/cache/tools/cedar/"
+tools_rc=0
+"$repo_root/scripts/agent-lab" --home "$tool_home" tools provision > "$work/tools.out" 2> "$work/tools.err" || tools_rc=$?
+if [ "$tools_rc" -eq 0 ] && grep -Fxq 'tools:ready' "$work/tools.out"; then
+  printf 'PASS TOOL-001 explicit provisioning verifies the pinned user tools\n'
+else
+  printf 'FAIL TOOL-001 explicit provisioning verifies the pinned user tools\n'
+  failures=$((failures + 1))
+fi
+
+printf 'SUMMARY assertions=5 expected=5 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
