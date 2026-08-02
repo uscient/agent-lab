@@ -23,7 +23,6 @@ MAX_MANIFEST_BYTES = 262_144
 SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
 BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
 BUNDLED_ENTRY_DOMAIN = b"agent-lab.experiment-image-entry.v1\0"
-CATALOG_NAME_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 MAX_CUE_OUTPUT_BYTES = 1_048_576
 MAX_CONTRACT_FILE_BYTES = 1_048_576
 MAX_HELPER_BYTES = 1_048_576
@@ -577,15 +576,21 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
     }
 
 
-def valid_catalog_name(value: object) -> bool:
-    if not isinstance(value, str) or len(value.encode("utf-8")) > 63:
-        return False
-    parts = value.split(".")
-    return (
-        len(parts) == 2
-        and all(1 <= len(part.encode("ascii", "ignore")) <= 31 for part in parts)
-        and all(part.isascii() and CATALOG_NAME_COMPONENT.fullmatch(part) for part in parts)
-    )
+def image_reference_module():
+    path = Path(__file__).resolve().with_name("image_reference.py")
+    spec = spec_from_file_location("agent_lab_image_reference", path)
+    if spec is None or spec.loader is None:
+        raise InfrastructureError("shared image-reference grammar cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError) as error:
+        raise InfrastructureError("shared image-reference grammar cannot be loaded") from error
+    return module
+
+
+valid_catalog_name = image_reference_module().valid_image_name
 
 
 def digest_record(domain: bytes, value: object) -> str:
