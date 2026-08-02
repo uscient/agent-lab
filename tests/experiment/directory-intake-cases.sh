@@ -19,6 +19,16 @@ capture() {
     AGENT_LAB_CUE_TOOL_DIR="${AGENT_LAB_CUE_TOOL_DIR:-$repo_root/.cache/dev/tools/cue}" \
     "$@" > "$work/stdout" 2> "$work/stderr" || CAPTURE_RC=$?
 }
+expect_invalid() {
+  local id="$1" directory="$2" detail="$3"
+  capture "$agent_lab" experiment check "$directory"
+  if [ "$CAPTURE_RC" -eq 1 ] && [ ! -s "$work/stdout" ] &&
+     grep -Fq 'FAIL Experiment manifest' "$work/stderr"; then
+    pass "$id" "$detail"
+  else
+    fail "$id" "$detail"
+  fi
+}
 
 if [ -x "$agent_lab" ]; then
   pass FMT-001 "repository agent-lab entrypoint exists"
@@ -97,11 +107,62 @@ else
   fail FMT-003 "repeated directory checks are byte-identical"
 fi
 
+symlinked="$work/symlinked"
+mkdir "$symlinked"
+ln -s "$fixture/experiment.cue" "$symlinked/experiment.cue"
+expect_invalid FMT-008 "$symlinked" "an authored symlink is refused"
+
+mutable="$work/mutable"
+mkdir "$mutable"
+sed 's/@sha256:[a-f0-9]\{64\}/:latest/' "$fixture/experiment.cue" > "$mutable/experiment.cue"
+expect_invalid SEL-001 "$mutable" "a mutable OCI reference is refused"
+
+unknown="$work/unknown"
+mkdir "$unknown"
+sed '/kind:/a\\\tunexpected: true' "$fixture/experiment.cue" > "$unknown/experiment.cue"
+expect_invalid CUE-001 "$unknown" "an unknown authored field is refused"
+
+commented="$work/commented"
+mkdir "$commented"
+{ printf '// distinct source bytes\n'; cat "$fixture/experiment.cue"; } > "$commented/experiment.cue"
+capture "$agent_lab" experiment check "$fixture"
+cp "$work/stdout" "$work/base-candidate"
+capture "$agent_lab" experiment check "$commented"
+if [ "$CAPTURE_RC" -eq 0 ] &&
+   [ "$(jq -cS '.plan' "$work/base-candidate")" = "$(jq -cS '.plan' "$work/stdout")" ] &&
+   [ "$(jq -r '.source.digest' "$work/base-candidate")" != "$(jq -r '.source.digest' "$work/stdout")" ]; then
+  pass FMT-009 "non-semantic CUE comments change source but not plan identity"
+else
+  fail FMT-009 "non-semantic CUE comments change source but not plan identity"
+fi
+
+if python3 -I - "$repo_root/scripts/experiment.py" "$fixture" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+import sys
+spec = spec_from_file_location("experiment_mutant", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+original = module.read_directory_snapshot(sys.argv[2]).digest
+module.SOURCE_DIGEST_DOMAIN = b"agent-lab.insecure-unframed\0"
+mutated = module.read_directory_snapshot(sys.argv[2]).digest
+assert original != mutated
+PY
+then
+  pass M-FMT-001 "source-domain mutation changes the independent identity"
+else
+  fail M-FMT-001 "source-domain mutation changes the independent identity"
+fi
+
 expected="$work/expected"
-printf '%s\n' FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 > "$expected"
+printf '%s\n' \
+  FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 \
+  FMT-008 SEL-001 CUE-001 FMT-009 M-FMT-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA assertion identity drift\n' >&2
   exit 125
 fi
-printf 'SUMMARY assertions=7 expected=7 failures=%s infra=0\n' "$failures"
+printf 'SUMMARY assertions=12 expected=12 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
