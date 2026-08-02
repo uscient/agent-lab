@@ -31,6 +31,7 @@ git merge
 git rebase
 git push
 gh pr
+gh run
 
 # --- standard read/inspect tools ---
 cat

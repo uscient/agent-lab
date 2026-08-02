@@ -217,6 +217,7 @@ lint scripts/dev/lint-scripts
 cue-tool-contract tests/dev/cue-tool-cases.sh
 cedar-tool-contract tests/dev/cedar-tool-cases.sh
 gate-contract tests/dev/security-gate-cases.sh
+workstream-contract tests/dev/workstream-cases.sh
 gate-concurrency tests/dev/security-gate-concurrency-cases.sh
 ci-workflow-contract tests/dev/ci-workflow-cases.sh
 required-gates-contract tests/dev/required-gates-cases.sh

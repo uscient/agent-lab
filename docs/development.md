@@ -121,6 +121,10 @@ The three local gate entry points corresponding to the required-gates workers ar
 ./scripts/dev/docker-gate
 ```
 
+For agent-managed single- or multi-slice delivery, use the workstream workflow in
+[`docs/workstreams.md`](workstreams.md). It preserves per-slice PR and commit evidence while keeping
+the final merge into `dev` human-owned.
+
 | Gate | What it establishes | Important prerequisites |
 |---|---|---|
 | fast | pinned CUE and Cedar provisioning, changed-file guard, shell lint, unit/security contracts, adapter consistency | Network access on first CUE or Cedar provision, Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |

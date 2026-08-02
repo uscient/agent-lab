@@ -86,6 +86,11 @@ if [ -x tools/bin/git ]; then
   out="$(PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh pr create --base dev --title x --body-file /tmp/body 2>&1 || true)"
   printf '%s' "$out" | grep -q '^REAL-GH pr create --base dev' \
     && pass "gh shim allows PR creation to dev" || fail "gh shim blocked scoped PR creation"
+  out="$(PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh run view 123 --log 2>&1 || true)"
+  printf '%s' "$out" | grep -q '^REAL-GH run view 123 --log$' \
+    && pass "gh shim allows read-only Actions logs" || fail "gh shim blocked Actions logs"
+  rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh run rerun 123 --failed >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "gh shim blocks Actions mutation" || fail "gh shim allowed Actions mutation"
   rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh -R uscient/agent-lab pr merge 1 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks PR mutation after global options" || fail "gh shim missed PR mutation after global options"
   rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh auth status >/dev/null 2>&1 || rc=$?

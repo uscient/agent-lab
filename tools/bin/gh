@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# PATH shim for `gh` — allows read-only PR work and PR creation to dev while blocking authentication,
-# integration, release mutation, and other remote writes. Defense-in-depth; AGENTS.md is authoritative.
+# PATH shim for `gh` — allows read-only PR and Actions diagnosis plus PR creation to dev while
+# blocking authentication, integration, release mutation, and other remote writes. Slice integration
+# is available only through scripts/dev/workstream. Defense-in-depth; AGENTS.md is authoritative.
 set -uo pipefail
 
 self="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -69,8 +70,21 @@ case "$sub" in
         ;;
       *) block "PR mutation is forbidden; only reads and create --base dev are allowed" ;;
     esac ;;
+  run)
+    [ "$i" -eq 0 ] || block "GitHub Actions commands must target the current repository directly"
+    case "${args[$((i + 1))]:-}" in
+      list | view | watch) ;;
+      *) block "GitHub Actions access is read-only" ;;
+    esac
+    for a in "${args[@]:$((i + 2))}"; do
+      case "$a" in
+        -R | -R?* | --repo | --repo=* | --hostname | --hostname=*)
+          block "GitHub Actions commands must target the current repository directly" ;;
+      esac
+    done
+    ;;
   "" | help | version) ;;
-  *) block "GitHub access is limited to the scoped PR workflow" ;;
+  *) block "GitHub access is limited to the scoped PR and read-only Actions workflow" ;;
 esac
 
 exec "$real" "$@"
