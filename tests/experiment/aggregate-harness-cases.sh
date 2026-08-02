@@ -82,7 +82,7 @@ source_zip_ids=(
   ZIP-RETRY-001 ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001
 )
 source_mutation_ids=(
-  M-ZIP-COUNT-001 M-ZIP-NAME-001 M-ZIP-TYPE-001 M-ZIP-FLAG-001
+  M-ZIP-WATCHDOG-001 M-ZIP-COUNT-001 M-ZIP-NAME-001 M-ZIP-TYPE-001 M-ZIP-FLAG-001
   M-ZIP-METHOD-001 M-ZIP-SIZE-001 M-ZIP-BOMB-001 M-ZIP-CRC-001
   M-ZIP-HEADER-001 M-ZIP-EXTRACT-001 M-ZIP-IDENTITY-001 M-ZIP-AUTH-001
 )
@@ -748,7 +748,7 @@ source_success_expected="$work/source-success-expected"
   for id in "${source_expected_ids[@]}"; do
     printf 'PASS %s fixture assertion\n' "$id"
   done
-  printf 'SUMMARY assertions=82 expected=82 failures=0 infra=0\n'
+  printf 'SUMMARY assertions=83 expected=83 failures=0 infra=0\n'
   printf 'EXPERIMENT SOURCE ADAPTERS PASS\n'
 } > "$source_success_expected"
 if [ "$source_baseline_rc" -eq 0 ] &&
@@ -767,7 +767,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 \
 source_missing_rc=0
 run_source_replica "$work/source-missing.out" env || source_missing_rc=$?
 if [ "$source_missing_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=81 expected=82 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=82 expected=83 failures=1 infra=0' \
      "$work/source-missing.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-missing.out"; then
   pass AGG-023 "source-adapter missing assertion identity maps to one"
@@ -784,7 +784,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 \
 source_duplicate_rc=0
 run_source_replica "$work/source-duplicate.out" env || source_duplicate_rc=$?
 if [ "$source_duplicate_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=83 expected=82 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=84 expected=83 failures=1 infra=0' \
      "$work/source-duplicate.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-duplicate.out"; then
   pass AGG-024 "source-adapter duplicate assertion identity maps to one"
@@ -801,7 +801,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 0 \
 source_substituted_rc=0
 run_source_replica "$work/source-substituted.out" env || source_substituted_rc=$?
 if [ "$source_substituted_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=83 expected=83 failures=1 infra=0' \
      "$work/source-substituted.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-substituted.out"; then
   pass AGG-025 "source-adapter substituted assertion identity maps to one"
@@ -818,7 +818,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 1 \
 source_assertion_rc=0
 run_source_replica "$work/source-assertion.out" env || source_assertion_rc=$?
 if [ "$source_assertion_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=1 infra=0' \
+   grep -Fxq 'SUMMARY assertions=83 expected=83 failures=1 infra=0' \
      "$work/source-assertion.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-assertion.out"; then
   pass AGG-026 "source-adapter subcase assertion failure maps to one"
@@ -834,7 +834,7 @@ write_fixture "$replica/tests/experiment/zip-intake-cases.sh" 125 \
 source_subcase_infra_rc=0
 run_source_replica "$work/source-subcase-infra.out" env || source_subcase_infra_rc=$?
 if [ "$source_subcase_infra_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=0 infra=1' \
+   grep -Fxq 'SUMMARY assertions=83 expected=83 failures=0 infra=1' \
      "$work/source-subcase-infra.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-subcase-infra.out"; then
   pass AGG-027 "source-adapter subcase uncertainty maps to one hundred twenty-five"
@@ -847,7 +847,7 @@ find "$replica/tests/experiment/zip-mutation-cases.py" -delete
 source_setup_infra_rc=0
 run_source_replica "$work/source-setup-infra.out" env || source_setup_infra_rc=$?
 if [ "$source_setup_infra_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=70 expected=82 failures=1 infra=1' \
+   grep -Fxq 'SUMMARY assertions=70 expected=83 failures=1 infra=1' \
      "$work/source-setup-infra.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-setup-infra.out"; then
   pass AGG-028 "source-adapter setup uncertainty maps to one hundred twenty-five"
@@ -864,7 +864,7 @@ source_cleanup_rc=0
 run_source_replica "$work/source-cleanup.out" env \
   PATH="$source_shim:$PATH" || source_cleanup_rc=$?
 if [ "$source_cleanup_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=0 infra=1' \
+   grep -Fxq 'SUMMARY assertions=83 expected=83 failures=0 infra=1' \
      "$work/source-cleanup.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-cleanup.out"; then
   pass AGG-029 "source-adapter cleanup uncertainty suppresses the final marker"
@@ -885,7 +885,7 @@ chmod +x "$source_summaryless"
 source_summaryless_rc=0
 run_source_replica "$work/source-summaryless.out" env || source_summaryless_rc=$?
 if [ "$source_summaryless_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=82 expected=82 failures=0 infra=1' \
+   grep -Fxq 'SUMMARY assertions=83 expected=83 failures=0 infra=1' \
      "$work/source-summaryless.out" &&
    ! grep -Fxq 'EXPERIMENT SOURCE ADAPTERS PASS' "$work/source-summaryless.out"; then
   pass AGG-030 "source-adapter missing subcase summary maps to one hundred twenty-five"

@@ -15,6 +15,7 @@ import tempfile
 
 
 EXPECTED = (
+    "M-ZIP-WATCHDOG-001",
     "M-ZIP-COUNT-001",
     "M-ZIP-NAME-001",
     "M-ZIP-TYPE-001",
@@ -346,6 +347,7 @@ def main() -> int:
             raise RuntimeError("bounded command helper self-test failed")
         wrapper_self_test = work / "wrapper-self-test"
         wrapper_self_test.mkdir()
+        wrapper_rejected_reserved_status = False
         try:
             run_command(
                 repo,
@@ -355,9 +357,14 @@ def main() -> int:
                 {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
             )
         except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("bounded command wrapper accepted reserved status 125")
+            wrapper_rejected_reserved_status = True
+        results.append(
+            (
+                "M-ZIP-WATCHDOG-001",
+                wrapper_rejected_reserved_status,
+                "reserved watchdog status is infrastructure uncertainty",
+            )
+        )
         fixtures = work / "fixtures"
         generated = subprocess.run(
             [
