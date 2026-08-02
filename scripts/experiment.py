@@ -3,21 +3,67 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import math
 import os
 from pathlib import Path
+import re
+import selectors
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
-from typing import NamedTuple, NoReturn
+from typing import Callable, NamedTuple, NoReturn
+import zlib
 
 
 MAX_MANIFEST_BYTES = 262_144
+MAX_ARCHIVE_BYTES = 1_048_576
+MAX_SOURCE_BYTES = MAX_MANIFEST_BYTES
+ZIP_DECODE_TIMEOUT_SECONDS = 5
+GIT_ACQUISITION_TIMEOUT_SECONDS = 5
+GIT_PROVIDER_AUTHORITY = "api.github.com"
+GIT_PROVIDER_METHOD = "github-git-data-v3"
+GIT_PROVIDER_HEADERS = (
+    ("Accept", "application/vnd.github+json"),
+    ("Accept-Encoding", "identity"),
+    ("User-Agent", "agent-lab/v0alpha1"),
+    ("X-GitHub-Api-Version", "2022-11-28"),
+)
+GIT_PROVIDER_CA_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+)
+GIT_PROVIDER_MAX_HEADER_BYTES = 32_768
+GIT_WORKER_MAX_OUTPUT_BYTES = ((MAX_ARCHIVE_BYTES + 2) // 3) * 4 + 65_536
+GIT_WORKER_MAX_ERROR_BYTES = 4_096
+GIT_WORKER_MEMORY_BYTES = 268_435_456
+GIT_WORKER_FRAME = b"agent-lab.git-provider.v1\0"
+GIT_WORKER_GRACE_SECONDS = 0.25
+GIT_SHA1 = re.compile(r"[0-9a-f]{40}", re.ASCII)
+GITHUB_SOURCE_URL = re.compile(
+    r"https://github\.com/"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
+    r"([A-Za-z0-9_.-]{1,100})\.git",
+    re.ASCII,
+)
+GITHUB_PROVIDER_PATH = re.compile(
+    r"/repos/"
+    r"([a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)/"
+    r"([a-z0-9_.-]{1,100})/git/"
+    r"(commits|trees|blobs)/([0-9a-f]{40})",
+    re.ASCII,
+)
+SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
+PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
+BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
+BUNDLED_ENTRY_DOMAIN = b"agent-lab.experiment-image-entry.v1\0"
 MAX_CUE_OUTPUT_BYTES = 1_048_576
 MAX_CONTRACT_FILE_BYTES = 1_048_576
 MAX_HELPER_BYTES = 1_048_576
@@ -63,7 +109,9 @@ PROBE_MANIFEST = {
         "members": [
             {
                 "name": "probe",
-                "image": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "image": {
+                    "digestRef": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
             }
         ]
     },
@@ -91,6 +139,19 @@ class PlanBinding(NamedTuple):
     requested_name: str
     member_count: int
     resource_classes: tuple[str, ...]
+    source_digest: str
+
+
+class SourceSnapshot(NamedTuple):
+    data: bytes
+    digest: str
+    transport: dict[str, object]
+
+
+class PlanResolution(NamedTuple):
+    plan: dict[str, object]
+    bundled_catalog: dict[str, object] | None
+    local_catalog: dict[str, object] | None
 
 
 def fail(message: str) -> NoReturn:
@@ -134,11 +195,30 @@ def reject_non_finite_numbers(value: object) -> None:
             reject_non_finite_numbers(item)
 
 
-def read_manifest_once(path: str) -> bytes:
+def _manifest_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_manifest_once(
+    path: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> bytes:
     try:
         path_stat = os.lstat(path)
     except OSError as error:
         raise InfrastructureError("manifest cannot be inspected") from error
+    if expected is not None and _manifest_identity(path_stat) != _manifest_identity(expected):
+        raise InfrastructureError("manifest identity changed before read")
     if stat.S_ISLNK(path_stat.st_mode):
         raise InfrastructureError("manifest symlinks are not accepted")
     if not stat.S_ISREG(path_stat.st_mode):
@@ -157,7 +237,7 @@ def read_manifest_once(path: str) -> bytes:
         opened_stat = os.fstat(descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):
             raise InfrastructureError("manifest changed to a non-regular file")
-        if (opened_stat.st_dev, opened_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        if _manifest_identity(opened_stat) != _manifest_identity(path_stat):
             raise InfrastructureError("manifest identity changed before read")
         chunks: list[bytes] = []
         remaining = MAX_MANIFEST_BYTES + 1
@@ -179,21 +259,1430 @@ def read_manifest_once(path: str) -> bytes:
 
     if len(data) > MAX_MANIFEST_BYTES:
         raise InvalidManifest(f"exceeds the {MAX_MANIFEST_BYTES}-byte limit")
-    before = (
-        opened_stat.st_dev,
-        opened_stat.st_ino,
-        opened_stat.st_size,
-        opened_stat.st_mtime_ns,
-    )
-    after = (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    )
+    before = _manifest_identity(opened_stat)
+    after = _manifest_identity(final_stat)
     if before != after or len(data) != final_stat.st_size:
         raise InfrastructureError("manifest changed while it was read")
     return data
+
+
+def source_digest(data: bytes) -> str:
+    name = b"experiment.cue"
+    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
+    digest.update(len(name).to_bytes(4, "big"))
+    digest.update(name)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+    return f"sha256:{digest.hexdigest()}"
+
+
+GitRequester = Callable[
+    [str, str, tuple[tuple[str, str], ...], int, float],
+    tuple[int, tuple[tuple[str, str], ...], bytes],
+]
+
+
+def _git_reject(code: str, detail: str) -> NoReturn:
+    raise InvalidManifest(f"git source {code} {detail}")
+
+
+def _parse_git_source(url: str, commit: str) -> tuple[str, str, str, str]:
+    if not isinstance(url, str) or not url.isascii():
+        _git_reject("GIT-URL", "must be one normalized ASCII GitHub HTTPS URL")
+    matched = GITHUB_SOURCE_URL.fullmatch(url)
+    if matched is None:
+        _git_reject("GIT-URL", "must be one normalized unauthenticated GitHub HTTPS URL")
+    owner, repository = matched.groups()
+    if owner.endswith("-") or "--" in owner or repository in (".", ".."):
+        _git_reject("GIT-URL", "has an unsupported repository identity")
+    if not isinstance(commit, str) or GIT_SHA1.fullmatch(commit) is None:
+        _git_reject("GIT-OID", "commit must be one full lowercase SHA-1 object ID")
+    owner = owner.lower()
+    repository = repository.lower()
+    canonical = f"https://github.com/{owner}/{repository}.git"
+    return canonical, owner, repository, commit
+
+
+def _git_object_id(kind: str, payload: bytes) -> str:
+    framed = kind.encode("ascii") + b" " + str(len(payload)).encode("ascii") + b"\0"
+    return hashlib.sha1(framed + payload, usedforsecurity=False).hexdigest()
+
+
+def _git_provider_route(path: str) -> tuple[str, str, str, str]:
+    if not isinstance(path, str) or not path.isascii():
+        raise InfrastructureError("git provider GIT-AUTHORITY path is malformed")
+    matched = GITHUB_PROVIDER_PATH.fullmatch(path)
+    if matched is None:
+        raise InfrastructureError("git provider GIT-AUTHORITY path is malformed")
+    owner, repository, object_kind, object_id = matched.groups()
+    if "--" in owner or repository in (".", ".."):
+        raise InfrastructureError("git provider GIT-AUTHORITY path is malformed")
+    return owner, repository, object_kind, object_id
+
+
+def _git_provider_json(
+    requester: GitRequester,
+    path: str,
+    remaining: int,
+    deadline: float,
+    *,
+    stable_not_found: bool,
+) -> tuple[object, int]:
+    if remaining <= 0:
+        raise InfrastructureError("git provider GIT-ACQUIRE exhausted its response bound")
+    _, _, object_kind, _ = _git_provider_route(path)
+    if not isinstance(stable_not_found, bool) or (
+        stable_not_found and object_kind != "commits"
+    ):
+        raise InfrastructureError("git provider GIT-TAXONOMY request is malformed")
+    try:
+        status, raw_headers, body = requester(
+            GIT_PROVIDER_AUTHORITY,
+            path,
+            GIT_PROVIDER_HEADERS,
+            remaining,
+            deadline,
+        )
+    except (InvalidManifest, InfrastructureError):
+        raise
+    except Exception as error:
+        raise InfrastructureError("git provider GIT-TRANSPORT request failed") from error
+    if time.monotonic() > deadline:
+        raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+    if not isinstance(status, int) or isinstance(status, bool):
+        raise InfrastructureError("git provider GIT-STATUS response is malformed")
+    if not isinstance(raw_headers, tuple):
+        raise InfrastructureError("git provider GIT-HEADER response is malformed")
+    headers: dict[str, str] = {}
+    for item in raw_headers:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not all(isinstance(value, str) for value in item)
+        ):
+            raise InfrastructureError("git provider GIT-HEADER response is malformed")
+        name, value = item
+        lowered = name.lower()
+        if lowered in headers:
+            raise InfrastructureError("git provider GIT-HEADER response is ambiguous")
+        headers[lowered] = value
+    if headers.get("content-type") != "application/json; charset=utf-8":
+        raise InfrastructureError("git provider GIT-HEADER content type is uncertain")
+    declared = headers.get("content-length", "")
+    if (
+        not declared.isascii()
+        or not declared.isdigit()
+        or (len(declared) > 1 and declared.startswith("0"))
+    ):
+        raise InfrastructureError("git provider GIT-HEADER content length is invalid")
+    declared_length = int(declared)
+    if (
+        not isinstance(body, bytes)
+        or len(body) > remaining
+        or declared_length != len(body)
+    ):
+        raise InfrastructureError("git provider GIT-OUTPUT response exceeded its bound")
+    if status == 404:
+        try:
+            strict_json(body, source="git provider response")
+        except InvalidManifest as error:
+            raise InfrastructureError("git provider GIT-JSON response is malformed") from error
+        if stable_not_found:
+            _git_reject("GIT-NOTFOUND", "does not expose the requested public object")
+        raise InfrastructureError("git provider GIT-DRIFT bound object disappeared")
+    if status == 422:
+        raise InfrastructureError("git provider GIT-STATUS response is uncertain")
+    if 300 <= status <= 399:
+        raise InfrastructureError("git provider GIT-REDIRECT response is not accepted")
+    if status != 200:
+        raise InfrastructureError("git provider GIT-STATUS did not establish a result")
+    try:
+        value = strict_json(body, source="git provider response")
+    except InvalidManifest as error:
+        raise InfrastructureError("git provider GIT-JSON response is malformed") from error
+    return value, len(body)
+
+
+def _git_system_ca_pem() -> str:
+    for raw_path in GIT_PROVIDER_CA_FILES:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(raw_path, flags)
+        except OSError:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or not 1 <= metadata.st_size <= 10_485_760
+            ):
+                continue
+            chunks: list[bytes] = []
+            remaining = metadata.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(65_536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            if remaining != 0 or len(data) != metadata.st_size:
+                continue
+            try:
+                return data.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+        finally:
+            os.close(descriptor)
+    raise InfrastructureError("git provider GIT-TLS system trust is unavailable")
+
+
+def _github_api_request(
+    authority: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...],
+    maximum: int,
+    deadline: float,
+) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
+    """Perform one fixed-authority HTTPS request inside the isolated worker."""
+
+    _git_provider_route(path)
+    if (
+        authority != GIT_PROVIDER_AUTHORITY
+        or headers != GIT_PROVIDER_HEADERS
+        or not 0 < maximum <= MAX_ARCHIVE_BYTES
+    ):
+        raise InfrastructureError("git provider GIT-AUTHORITY request is malformed")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+    try:
+        import http.client
+        import ssl
+
+        http.client._MAXLINE = 8_192
+        http.client._MAXHEADERS = 32
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_verify_locations(cadata=_git_system_ca_pem())
+        connection = http.client.HTTPSConnection(
+            authority,
+            port=443,
+            timeout=remaining,
+            context=context,
+        )
+        response = None
+        try:
+            connection.request("GET", path, headers=dict(headers))
+            response = connection.getresponse()
+            raw_headers = response.getheaders()
+            if len(raw_headers) > 32:
+                raise InfrastructureError("git provider GIT-HEADER count exceeded its bound")
+            header_bytes = 0
+            selected: dict[str, str] = {}
+            for name, value in raw_headers:
+                try:
+                    encoded_name = name.encode("ascii")
+                    encoded_value = value.encode("ascii")
+                except UnicodeEncodeError as error:
+                    raise InfrastructureError(
+                        "git provider GIT-HEADER response is malformed"
+                    ) from error
+                header_bytes += len(encoded_name) + len(encoded_value) + 4
+                lowered = name.lower()
+                if lowered in {
+                    "content-encoding",
+                    "content-length",
+                    "content-type",
+                    "transfer-encoding",
+                }:
+                    if lowered in selected:
+                        raise InfrastructureError(
+                            "git provider GIT-HEADER response is ambiguous"
+                        )
+                    selected[lowered] = value
+            if header_bytes > GIT_PROVIDER_MAX_HEADER_BYTES:
+                raise InfrastructureError("git provider GIT-HEADER bytes exceeded their bound")
+            status = response.status
+            if "transfer-encoding" in selected or selected.get(
+                "content-encoding", "identity"
+            ) != "identity":
+                raise InfrastructureError("git provider GIT-HEADER encoding is unsupported")
+            if selected.get("content-type") != "application/json; charset=utf-8":
+                raise InfrastructureError("git provider GIT-HEADER content type is uncertain")
+            declared = selected.get("content-length", "")
+            if (
+                not declared.isascii()
+                or not declared.isdigit()
+                or (len(declared) > 1 and declared.startswith("0"))
+            ):
+                raise InfrastructureError("git provider GIT-HEADER content length is invalid")
+            declared_length = int(declared)
+            if declared_length > maximum:
+                raise InfrastructureError("git provider GIT-OUTPUT response exceeded its bound")
+            output = bytearray()
+            while len(output) < declared_length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+                if connection.sock is not None:
+                    connection.sock.settimeout(remaining)
+                chunk = response.read(min(65_536, declared_length - len(output)))
+                if not chunk:
+                    raise InfrastructureError("git provider GIT-OUTPUT response was truncated")
+                output.extend(chunk)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
+            if response.read(1) != b"":
+                raise InfrastructureError("git provider GIT-OUTPUT response exceeded its length")
+            return (
+                status,
+                (
+                    ("content-length", str(len(output))),
+                    ("content-type", "application/json; charset=utf-8"),
+                ),
+                bytes(output),
+            )
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
+    except InfrastructureError:
+        raise
+    except Exception as error:
+        raise InfrastructureError("git provider GIT-TRANSPORT request failed") from error
+
+
+def _git_worker_observe(pid: int) -> object | None:
+    """Observe one owned worker without releasing its numeric identity."""
+
+    try:
+        observed = os.waitid(
+            os.P_PID,
+            pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (ChildProcessError, OSError) as error:
+        raise InfrastructureError(
+            "git provider GIT-WORKER child ownership is uncertain"
+        ) from error
+    if observed is None:
+        return None
+    if (
+        getattr(observed, "si_pid", None) != pid
+        or getattr(observed, "si_signo", None) != signal.SIGCHLD
+        or getattr(observed, "si_code", None)
+        not in {
+            getattr(os, "CLD_EXITED", 1),
+            getattr(os, "CLD_KILLED", 2),
+            getattr(os, "CLD_DUMPED", 3),
+        }
+        or not isinstance(getattr(observed, "si_status", None), int)
+        or isinstance(getattr(observed, "si_status", None), bool)
+    ):
+        raise InfrastructureError(
+            "git provider GIT-WORKER child status is malformed"
+        )
+    return observed
+
+
+def _git_worker_status_matches(observed: object, status: int) -> bool:
+    if not isinstance(status, int) or isinstance(status, bool):
+        return False
+    code = getattr(observed, "si_code", None)
+    observed_status = getattr(observed, "si_status", None)
+    if code == getattr(os, "CLD_EXITED", 1):
+        return os.WIFEXITED(status) and os.WEXITSTATUS(status) == observed_status
+    if code == getattr(os, "CLD_KILLED", 2):
+        return os.WIFSIGNALED(status) and os.WTERMSIG(status) == observed_status
+    if code == getattr(os, "CLD_DUMPED", 3):
+        core_dumped = getattr(os, "WCOREDUMP", lambda _status: False)
+        return (
+            os.WIFSIGNALED(status)
+            and os.WTERMSIG(status) == observed_status
+            and bool(core_dumped(status))
+        )
+    return False
+
+
+def _git_worker_exit_code(observed: object | None) -> int | None:
+    if observed is None or getattr(observed, "si_code", None) != getattr(
+        os, "CLD_EXITED", 1
+    ):
+        return None
+    status = getattr(observed, "si_status", None)
+    if not isinstance(status, int) or isinstance(status, bool) or not 0 <= status <= 255:
+        return None
+    return status
+
+
+def _git_worker_terminate(pid: int, *, reaped: bool, deadline: float) -> bool:
+    """Finalize one owned worker without signaling a released PID or PGID."""
+
+    if reaped:
+        return False
+    uncertain = False
+    try:
+        observed = _git_worker_observe(pid)
+    except InfrastructureError:
+        return False
+
+    group_missing = False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        group_missing = True
+    except OSError:
+        group_missing = True
+        uncertain = True
+    if group_missing:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            uncertain = True
+
+    if observed is None:
+        now = time.monotonic()
+        term_budget = max(0.0, deadline - now) / 2
+        term_deadline = min(deadline, now + min(GIT_WORKER_GRACE_SECONDS, term_budget))
+        while time.monotonic() < term_deadline:
+            try:
+                observed = _git_worker_observe(pid)
+            except InfrastructureError:
+                return False
+            if observed is not None:
+                break
+            remaining = term_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.01, remaining))
+
+    kill_group_missing = False
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        kill_group_missing = True
+    except OSError:
+        kill_group_missing = True
+        uncertain = True
+    if kill_group_missing:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            uncertain = True
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            uncertain = True
+
+    kill_deadline = min(
+        deadline,
+        time.monotonic() + GIT_WORKER_GRACE_SECONDS,
+    )
+    while time.monotonic() < kill_deadline:
+        try:
+            current = _git_worker_observe(pid)
+        except InfrastructureError:
+            return False
+        if observed is None and current is not None:
+            observed = current
+        remaining = kill_deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.01, remaining))
+
+    try:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False
+    if waited != pid or observed is None:
+        return False
+    return _git_worker_status_matches(observed, status) and not uncertain
+
+
+def _git_worker_write(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("worker pipe made no progress")
+        view = view[written:]
+
+
+def _git_worker_child(
+    control_read: int,
+    stdout_write: int,
+    stderr_write: int,
+    authority: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...],
+    maximum: int,
+    deadline: float,
+) -> NoReturn:
+    exit_code = 125
+    try:
+        os.setsid()
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+            signal.signal(signum, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
+        null_descriptor = os.open("/dev/null", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        os.dup2(null_descriptor, 0)
+        os.dup2(stdout_write, 1)
+        os.dup2(stderr_write, 2)
+        os.dup2(control_read, 3)
+        import resource
+
+        maximum_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        if maximum_fd == resource.RLIM_INFINITY:
+            maximum_fd = 1_048_576
+        os.closerange(4, int(maximum_fd))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (GIT_WORKER_MEMORY_BYTES, GIT_WORKER_MEMORY_BYTES),
+        )
+        resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+        resource.setrlimit(resource.RLIMIT_CPU, (4, 4))
+        os.environ.clear()
+        os.environ.update(
+            {
+                "HOME": "/nonexistent",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            }
+        )
+        os.chdir("/")
+        os.umask(0o077)
+        try:
+            status, result_headers, body = _github_api_request(
+                authority, path, headers, maximum, deadline
+            )
+            value: dict[str, object] = {
+                "body": base64.b64encode(body).decode("ascii"),
+                "headers": [list(item) for item in result_headers],
+                "kind": "result",
+                "status": status,
+            }
+            exit_code = 0
+        except InvalidManifest:
+            value = {"kind": "reject"}
+            exit_code = 1
+        except InfrastructureError:
+            value = {"kind": "infra"}
+            exit_code = 125
+        except BaseException:
+            value = {"kind": "infra"}
+            exit_code = 125
+        payload = json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        if len(payload) > GIT_WORKER_MAX_OUTPUT_BYTES:
+            payload = b'{"kind":"infra"}'
+            exit_code = 125
+        frame = GIT_WORKER_FRAME + len(payload).to_bytes(8, "big") + payload
+        _git_worker_write(1, frame)
+        acknowledgement = os.read(3, 1)
+        if acknowledgement != b"1":
+            exit_code = 125
+    except BaseException:
+        exit_code = 125
+    os._exit(exit_code)
+
+
+def _github_worker_request(
+    authority: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...],
+    maximum: int,
+    deadline: float,
+) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
+    operation_deadline = deadline - (2 * GIT_WORKER_GRACE_SECONDS)
+    if time.monotonic() >= operation_deadline:
+        raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+    interrupted: int | None = None
+    handlers: dict[int, object] = {}
+    managed_signals: set[int] = set()
+
+    def interrupt(signum: int, _frame: object) -> None:
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = signum
+
+    def change_mask(how: int, signals: set[int]) -> set[signal.Signals]:
+        try:
+            return set(signal.pthread_sigmask(how, signals))
+        except (AttributeError, MemoryError, OSError, ValueError) as error:
+            raise InfrastructureError("git provider GIT-SIGNAL mask is unavailable") from error
+
+    def record_pending(signals: set[int]) -> None:
+        nonlocal interrupted
+        try:
+            while True:
+                pending = set(signal.sigpending()).intersection(signals)
+                if not pending:
+                    return
+                for signum in sorted(pending, key=int):
+                    received = int(signal.sigwait({signum}))
+                    if interrupted is None:
+                        interrupted = received
+        except (AttributeError, MemoryError, OSError, ValueError) as error:
+            raise InfrastructureError(
+                "git provider GIT-SIGNAL pending state is uncertain"
+            ) from error
+
+    original_mask = change_mask(signal.SIG_BLOCK, set())
+    control_read = control_write = -1
+    stdout_read = stdout_write = -1
+    stderr_read = stderr_write = -1
+    pid = -1
+    reaped = False
+    acknowledged = False
+    selector = None
+    output: bytearray | None = None
+    errors: bytearray | None = None
+    worker_exit: object | None = None
+    try:
+        try:
+            sigchld_handler = signal.getsignal(signal.SIGCHLD)
+        except (OSError, ValueError) as error:
+            raise InfrastructureError(
+                "git provider GIT-SIGNAL SIGCHLD ownership is unavailable"
+            ) from error
+        if sigchld_handler != signal.SIG_DFL:
+            raise InfrastructureError(
+                "git provider GIT-SIGNAL SIGCHLD ownership is unavailable"
+            )
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+            try:
+                previous = signal.getsignal(signum)
+            except (OSError, ValueError) as error:
+                raise InfrastructureError(
+                    "git provider GIT-SIGNAL handlers are unavailable"
+                ) from error
+            if previous == signal.SIG_IGN or signum in original_mask:
+                continue
+            handlers[signum] = previous
+            managed_signals.add(signum)
+            try:
+                signal.signal(signum, interrupt)
+            except (OSError, ValueError) as error:
+                raise InfrastructureError(
+                    "git provider GIT-SIGNAL handlers are unavailable"
+                ) from error
+
+        selector = selectors.DefaultSelector()
+        output = bytearray()
+        errors = bytearray()
+        control_read, control_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        stdout_read, stdout_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        stderr_read, stderr_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        spawn_mask = change_mask(signal.SIG_BLOCK, managed_signals)
+        try:
+            if interrupted is None:
+                pid = os.fork()
+        finally:
+            if pid != 0:
+                change_mask(signal.SIG_SETMASK, set(spawn_mask))
+        if pid < 0:
+            raise SystemExit(128 + interrupted) if interrupted is not None else InfrastructureError(
+                "git provider GIT-WORKER did not start"
+            )
+        if pid == 0:
+            os.close(control_write)
+            os.close(stdout_read)
+            os.close(stderr_read)
+            _git_worker_child(
+                control_read,
+                stdout_write,
+                stderr_write,
+                authority,
+                path,
+                headers,
+                maximum,
+                operation_deadline,
+            )
+        os.close(control_read)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        control_read = stdout_write = stderr_write = -1
+        os.set_blocking(stdout_read, False)
+        os.set_blocking(stderr_read, False)
+        selector.register(stdout_read, selectors.EVENT_READ, "stdout")
+        selector.register(stderr_read, selectors.EVENT_READ, "stderr")
+        expected_frame: int | None = None
+        drain_deadline: float | None = None
+        failure: str | None = None
+        while True:
+            if interrupted is not None:
+                failure = "git provider GIT-SIGNAL interrupted acquisition"
+                break
+
+            worker_exit = _git_worker_observe(pid)
+            now = time.monotonic()
+            if worker_exit is not None and drain_deadline is None:
+                drain_deadline = min(
+                    operation_deadline,
+                    now + GIT_WORKER_GRACE_SECONDS,
+                )
+            active_deadline = (
+                operation_deadline if drain_deadline is None else drain_deadline
+            )
+            remaining = active_deadline - now
+            if remaining <= 0:
+                if worker_exit is None:
+                    failure = "git provider GIT-TIMEOUT deadline expired"
+                elif acknowledged:
+                    failure = "git provider GIT-WORKER left a residual process group"
+                else:
+                    failure = "git provider GIT-WORKER exited before a complete frame"
+                break
+
+            for key, _ in selector.select(min(0.05, remaining)):
+                descriptor = int(key.fd)
+                try:
+                    chunk = os.read(descriptor, 65_536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(descriptor)
+                    continue
+                if key.data == "stdout":
+                    assert output is not None
+                    output.extend(chunk)
+                    if len(output) > len(GIT_WORKER_FRAME) + 8 + GIT_WORKER_MAX_OUTPUT_BYTES:
+                        failure = "git provider GIT-OUTPUT worker output exceeded its bound"
+                        break
+                    header_size = len(GIT_WORKER_FRAME) + 8
+                    if expected_frame is None and len(output) >= header_size:
+                        if not output.startswith(GIT_WORKER_FRAME):
+                            failure = "git provider GIT-WORKER frame is malformed"
+                            break
+                        payload_size = int.from_bytes(
+                            output[len(GIT_WORKER_FRAME) : header_size], "big"
+                        )
+                        if payload_size > GIT_WORKER_MAX_OUTPUT_BYTES:
+                            failure = "git provider GIT-OUTPUT worker frame exceeded its bound"
+                            break
+                        expected_frame = header_size + payload_size
+                    if expected_frame is not None and len(output) > expected_frame:
+                        failure = "git provider GIT-WORKER frame has trailing data"
+                        break
+                else:
+                    assert errors is not None
+                    errors.extend(chunk)
+                    if len(errors) > GIT_WORKER_MAX_ERROR_BYTES:
+                        failure = "git provider GIT-OUTPUT worker error exceeded its bound"
+                    else:
+                        failure = "git provider GIT-WORKER emitted unexpected diagnostics"
+                    break
+            if failure is not None:
+                break
+            assert output is not None
+            assert errors is not None
+            if expected_frame is not None and len(output) == expected_frame and not acknowledged:
+                if errors:
+                    failure = "git provider GIT-WORKER emitted unexpected diagnostics"
+                    break
+                _git_worker_write(control_write, b"1")
+                os.close(control_write)
+                control_write = -1
+                acknowledged = True
+            if worker_exit is not None and not selector.get_map():
+                if not acknowledged:
+                    failure = "git provider GIT-WORKER exited before a complete frame"
+                break
+        if failure is not None:
+            raise InfrastructureError(failure)
+        returncode = _git_worker_exit_code(worker_exit)
+        if returncode is None:
+            raise InfrastructureError("git provider GIT-WORKER exit status is uncertain")
+        assert output is not None
+        header_size = len(GIT_WORKER_FRAME) + 8
+        if len(output) < header_size:
+            raise InfrastructureError("git provider GIT-WORKER frame is incomplete")
+        payload = bytes(output[header_size:])
+        try:
+            value = strict_json(payload, source="git provider worker frame")
+        except InvalidManifest as error:
+            raise InfrastructureError("git provider GIT-WORKER frame is malformed") from error
+        if value == {"kind": "reject"} and returncode == 1:
+            _git_reject("GIT-PROVIDER", "request was rejected")
+        if value == {"kind": "infra"} and returncode == 125:
+            raise InfrastructureError("git provider GIT-WORKER request was uncertain")
+        if (
+            returncode != 0
+            or not isinstance(value, dict)
+            or set(value) != {"body", "headers", "kind", "status"}
+            or value.get("kind") != "result"
+            or not isinstance(value.get("status"), int)
+            or isinstance(value.get("status"), bool)
+            or not isinstance(value.get("headers"), list)
+            or not isinstance(value.get("body"), str)
+        ):
+            raise InfrastructureError("git provider GIT-WORKER result is malformed")
+        result_headers: list[tuple[str, str]] = []
+        for item in value["headers"]:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(part, str) for part in item)
+            ):
+                raise InfrastructureError("git provider GIT-WORKER headers are malformed")
+            result_headers.append((item[0], item[1]))
+        encoded_body = value["body"]
+        assert isinstance(encoded_body, str)
+        if not encoded_body.isascii() or len(encoded_body) > ((maximum + 2) // 3) * 4:
+            raise InfrastructureError("git provider GIT-OUTPUT worker body exceeded its bound")
+        try:
+            body = base64.b64decode(encoded_body, validate=True)
+        except (ValueError, base64.binascii.Error) as error:
+            raise InfrastructureError("git provider GIT-WORKER body is malformed") from error
+        if len(body) > maximum:
+            raise InfrastructureError("git provider GIT-OUTPUT worker body exceeded its bound")
+        return int(value["status"]), tuple(result_headers), body
+    except InfrastructureError:
+        raise
+    except MemoryError as error:
+        raise InfrastructureError(
+            "git provider GIT-WORKER could not establish a result"
+        ) from error
+    except (OSError, ValueError) as error:
+        raise InfrastructureError("git provider GIT-WORKER could not establish a result") from error
+    finally:
+        cleanup_error: InfrastructureError | None = None
+        if selector is not None:
+            try:
+                selector.close()
+            except (MemoryError, OSError, ValueError):
+                cleanup_error = InfrastructureError(
+                    "git provider GIT-WORKER selector cleanup is uncertain"
+                )
+        for descriptor in (
+            control_read,
+            control_write,
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+        ):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except (MemoryError, OSError):
+                    if cleanup_error is None:
+                        cleanup_error = InfrastructureError(
+                            "git provider GIT-WORKER descriptor cleanup is uncertain"
+                        )
+        if pid > 0:
+            try:
+                cleanup_deadline = min(
+                    deadline,
+                    time.monotonic() + (2 * GIT_WORKER_GRACE_SECONDS),
+                )
+                terminated = _git_worker_terminate(
+                    pid,
+                    reaped=reaped,
+                    deadline=cleanup_deadline,
+                )
+            except (InfrastructureError, MemoryError, OSError, ValueError):
+                terminated = False
+            if not terminated and cleanup_error is None:
+                cleanup_error = InfrastructureError(
+                    "git provider GIT-WORKER cleanup is uncertain"
+                )
+        signals_blocked = False
+        try:
+            change_mask(signal.SIG_BLOCK, managed_signals)
+            signals_blocked = True
+            record_pending(managed_signals)
+        except InfrastructureError as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        finally:
+            for signum, previous in handlers.items():
+                try:
+                    signal.signal(signum, previous)
+                except (MemoryError, OSError, ValueError):
+                    if cleanup_error is None:
+                        cleanup_error = InfrastructureError(
+                            "git provider GIT-SIGNAL handlers could not be restored"
+                        )
+            if signals_blocked:
+                try:
+                    record_pending(managed_signals)
+                except InfrastructureError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            try:
+                change_mask(signal.SIG_SETMASK, set(original_mask))
+            except (InfrastructureError, MemoryError) as error:
+                if cleanup_error is None:
+                    cleanup_error = (
+                        error
+                        if isinstance(error, InfrastructureError)
+                        else InfrastructureError(
+                            "git provider GIT-SIGNAL mask is unavailable"
+                        )
+                    )
+        if cleanup_error is not None:
+            raise cleanup_error
+        if interrupted is not None:
+            raise SystemExit(128 + interrupted)
+
+
+def _read_git_snapshot_with_requester(
+    url: str,
+    commit: str,
+    requester: GitRequester,
+) -> SourceSnapshot:
+    """Acquire one exact public GitHub commit through the bounded Git Data API."""
+
+    if sys.platform != "linux":
+        raise InfrastructureError("git source GIT-PLATFORM requires Linux")
+    canonical, owner, repository, requested_commit = _parse_git_source(url, commit)
+    deadline = time.monotonic() + GIT_ACQUISITION_TIMEOUT_SECONDS
+    acquired = 0
+
+    commit_path = f"/repos/{owner}/{repository}/git/commits/{requested_commit}"
+    commit_value, used = _git_provider_json(
+        requester,
+        commit_path,
+        MAX_ARCHIVE_BYTES - acquired,
+        deadline,
+        stable_not_found=True,
+    )
+    acquired += used
+    if not isinstance(commit_value, dict) or commit_value.get("sha") != requested_commit:
+        raise InfrastructureError("git provider GIT-COMMIT returned a different object")
+    commit_tree = commit_value.get("tree")
+    if not isinstance(commit_tree, dict):
+        raise InfrastructureError("git provider GIT-COMMIT tree binding is malformed")
+    tree_id = commit_tree.get("sha")
+    if not isinstance(tree_id, str) or GIT_SHA1.fullmatch(tree_id) is None:
+        raise InfrastructureError("git provider GIT-COMMIT tree identity is malformed")
+
+    tree_path = f"/repos/{owner}/{repository}/git/trees/{tree_id}"
+    tree_value, used = _git_provider_json(
+        requester,
+        tree_path,
+        MAX_ARCHIVE_BYTES - acquired,
+        deadline,
+        stable_not_found=False,
+    )
+    acquired += used
+    if (
+        not isinstance(tree_value, dict)
+        or tree_value.get("sha") != tree_id
+        or tree_value.get("truncated") is not False
+    ):
+        raise InfrastructureError("git provider GIT-TREE response is inconsistent")
+    entries = tree_value.get("tree")
+    if not isinstance(entries, list) or len(entries) != 1:
+        _git_reject("GIT-ROOT", "root tree must contain exactly experiment.cue")
+    entry = entries[0]
+    if not isinstance(entry, dict):
+        raise InfrastructureError("git provider GIT-TREE entry is malformed")
+    if (
+        entry.get("path") != "experiment.cue"
+        or entry.get("mode") != "100644"
+        or entry.get("type") != "blob"
+    ):
+        _git_reject("GIT-TYPE", "experiment.cue must be one regular non-executable blob")
+    blob_id = entry.get("sha")
+    blob_size = entry.get("size")
+    if not isinstance(blob_id, str) or GIT_SHA1.fullmatch(blob_id) is None:
+        raise InfrastructureError("git provider GIT-TREE blob identity is malformed")
+    if (
+        not isinstance(blob_size, int)
+        or isinstance(blob_size, bool)
+        or not 0 <= blob_size <= MAX_SOURCE_BYTES
+    ):
+        _git_reject("GIT-SIZE", "experiment.cue exceeds the source limit")
+
+    tree_payload = b"100644 experiment.cue\0" + bytes.fromhex(blob_id)
+    if _git_object_id("tree", tree_payload) != tree_id:
+        raise InfrastructureError("git provider GIT-TREE object identity is inconsistent")
+
+    blob_path = f"/repos/{owner}/{repository}/git/blobs/{blob_id}"
+    blob_value, used = _git_provider_json(
+        requester,
+        blob_path,
+        MAX_ARCHIVE_BYTES - acquired,
+        deadline,
+        stable_not_found=False,
+    )
+    acquired += used
+    if (
+        not isinstance(blob_value, dict)
+        or blob_value.get("sha") != blob_id
+        or blob_value.get("size") != blob_size
+        or blob_value.get("encoding") != "base64"
+        or not isinstance(blob_value.get("content"), str)
+    ):
+        raise InfrastructureError("git provider GIT-BLOB response is inconsistent")
+    encoded = blob_value["content"]
+    assert isinstance(encoded, str)
+    encoded_size = ((blob_size + 2) // 3) * 4
+    if not encoded.isascii() or "\r" in encoded:
+        raise InfrastructureError("git provider GIT-BLOB encoding exceeded its bound")
+    if "\n" in encoded:
+        if not encoded.endswith("\n"):
+            raise InfrastructureError("git provider GIT-BLOB wrapping is malformed")
+        lines = encoded[:-1].split("\n")
+        if (
+            not lines
+            or any(len(line) != 60 for line in lines[:-1])
+            or not 1 <= len(lines[-1]) <= 60
+        ):
+            raise InfrastructureError("git provider GIT-BLOB wrapping is malformed")
+        compact = "".join(lines)
+    else:
+        compact = encoded
+    if len(compact) != encoded_size:
+        raise InfrastructureError("git provider GIT-BLOB encoding exceeded its bound")
+    try:
+        data = base64.b64decode(compact, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise InfrastructureError("git provider GIT-BLOB encoding is malformed") from error
+    if len(data) != blob_size or _git_object_id("blob", data) != blob_id:
+        raise InfrastructureError("git provider GIT-BLOB object identity is inconsistent")
+
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={
+            "acquisition": {
+                "acquiredBytes": acquired,
+                "limitBytes": MAX_ARCHIVE_BYTES,
+                "method": GIT_PROVIDER_METHOD,
+                "requestCount": 3,
+                "temporaryBytes": 0,
+                "temporaryFiles": 0,
+            },
+            "blob": f"sha1:{blob_id}",
+            "commit": f"sha1:{requested_commit}",
+            "kind": "git",
+            "requestedCommit": requested_commit,
+            "tree": f"sha1:{tree_id}",
+            "url": canonical,
+        },
+    )
+
+
+def read_git_snapshot(
+    url: str,
+    commit: str,
+    *,
+    requester: GitRequester | None = None,
+) -> SourceSnapshot:
+    """Acquire one exact public GitHub commit through the bounded Git Data API."""
+
+    if sys.platform != "linux":
+        raise InfrastructureError("git source GIT-PLATFORM requires Linux")
+    canonical, _, _, requested_commit = _parse_git_source(url, commit)
+    if requester is not None:
+        return _read_git_snapshot_with_requester(canonical, requested_commit, requester)
+    return _read_git_snapshot_with_requester(
+        canonical, requested_commit, _github_worker_request
+    )
+
+
+def _zip_reject(code: str, detail: str) -> NoReturn:
+    raise InvalidManifest(f"zip archive {code} {detail}")
+
+
+def _read_zip_archive_once(path: str) -> bytes:
+    try:
+        path_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ cannot be inspected") from error
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+        raise InfrastructureError("zip archive ZIP-READ is not a safe regular file")
+    if path_stat.st_size > MAX_ARCHIVE_BYTES:
+        _zip_reject("ZIP-SIZE", f"exceeds the {MAX_ARCHIVE_BYTES}-byte limit")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ cannot be opened") from error
+
+    opened_stat: os.stat_result | None = None
+    final_stat: os.stat_result | None = None
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _manifest_identity(opened_stat) != _manifest_identity(path_stat)
+        ):
+            raise InfrastructureError("zip archive ZIP-READ identity changed before read")
+        chunks: list[bytes] = []
+        remaining = MAX_ARCHIVE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        archive = b"".join(chunks)
+        final_stat = os.fstat(descriptor)
+    except InfrastructureError:
+        raise
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ could not be read completely") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise InfrastructureError("zip archive ZIP-READ descriptor could not be closed") from error
+
+    assert opened_stat is not None and final_stat is not None
+    try:
+        current_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("zip archive ZIP-READ cannot be reverified") from error
+    expected = _manifest_identity(path_stat)
+    if (
+        _manifest_identity(opened_stat) != expected
+        or _manifest_identity(final_stat) != expected
+        or _manifest_identity(current_stat) != expected
+        or len(archive) != final_stat.st_size
+    ):
+        raise InfrastructureError("zip archive ZIP-READ changed while being read")
+    if len(archive) > MAX_ARCHIVE_BYTES:
+        _zip_reject("ZIP-SIZE", f"exceeds the {MAX_ARCHIVE_BYTES}-byte limit")
+    return archive
+
+
+def _zip_eocd(archive: bytes) -> tuple[int, tuple[object, ...]]:
+    eocd_offset = archive.rfind(b"PK\x05\x06")
+    if eocd_offset < 0 or len(archive) - eocd_offset < 22:
+        _zip_reject("ZIP-TRUNC", "has no complete end record")
+    try:
+        record = struct.unpack_from("<4s4H2IH", archive, eocd_offset)
+    except struct.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC has an incomplete end record") from error
+    comment_size = int(record[-1])
+    if eocd_offset + 22 + comment_size != len(archive):
+        _zip_reject("ZIP-TRAIL", "has bytes outside its canonical end")
+    if comment_size != 0:
+        _zip_reject("ZIP-META", "has an archive comment")
+    return eocd_offset, record
+
+
+def _zip_decode(payload: bytes, expanded_size: int) -> bytes:
+    try:
+        deadline = time.monotonic() + ZIP_DECODE_TIMEOUT_SECONDS
+        decoder = zlib.decompressobj(-15)
+        output: list[bytes] = []
+        produced = 0
+        offset = 0
+        while offset < len(payload):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("zip decoder deadline")
+            chunk = payload[offset : offset + 65_536]
+            offset += len(chunk)
+            while chunk:
+                remaining = MAX_SOURCE_BYTES + 1 - produced
+                if remaining <= 0:
+                    _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+                decoded = decoder.decompress(chunk, remaining)
+                output.append(decoded)
+                produced += len(decoded)
+                chunk = decoder.unconsumed_tail
+                if produced > MAX_SOURCE_BYTES:
+                    _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("zip decoder deadline")
+        remaining = MAX_SOURCE_BYTES + 1 - produced
+        decoded = decoder.flush(remaining)
+        output.append(decoded)
+        produced += len(decoded)
+        if produced > MAX_SOURCE_BYTES:
+            _zip_reject("ZIP-BOMB", "expands beyond the source limit")
+        if not decoder.eof:
+            _zip_reject("ZIP-TRUNC", "deflate stream ended early")
+        if decoder.unused_data or decoder.unconsumed_tail:
+            _zip_reject("ZIP-TRAIL", "deflate stream has unused input")
+        data = b"".join(output)
+        if len(data) != expanded_size:
+            _zip_reject("ZIP-LENGTH", "decoded length disagrees with its header")
+    except InvalidManifest:
+        raise
+    except zlib.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC has an invalid deflate stream") from error
+    except TimeoutError as error:
+        raise InfrastructureError("zip archive ZIP-TIMEOUT decoder deadline expired") from error
+    except Exception as error:
+        raise InfrastructureError("zip archive ZIP-DECODE decoder result is uncertain") from error
+    return data
+
+
+def read_directory_snapshot(path: str) -> SourceSnapshot:
+    try:
+        directory_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be inspected") from error
+    if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        raise InvalidManifest("source must be one directory")
+    try:
+        before = os.listdir(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be listed") from error
+    if before != ["experiment.cue"]:
+        raise InvalidManifest("directory must contain only experiment.cue")
+    authored_path = os.path.join(path, "experiment.cue")
+    try:
+        authored_stat = os.lstat(authored_path)
+    except OSError as error:
+        raise InfrastructureError("authored file cannot be inspected") from error
+    if authored_stat.st_nlink != 1:
+        raise InvalidManifest("experiment.cue must have one link")
+    authored_mode = stat.S_IMODE(authored_stat.st_mode)
+    if authored_mode & 0o111 or authored_mode & 0o022:
+        raise InvalidManifest("experiment.cue has a suspicious mode")
+    data = read_manifest_once(authored_path, expected=authored_stat)
+    try:
+        after = os.listdir(path)
+        final_directory_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be verified") from error
+    if after != before or (directory_stat.st_dev, directory_stat.st_ino) != (
+        final_directory_stat.st_dev,
+        final_directory_stat.st_ino,
+    ):
+        raise InfrastructureError("source directory changed while snapshotting")
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={"kind": "directory"},
+    )
+
+
+def read_zip_snapshot(path: str) -> SourceSnapshot:
+    """Inspect and bounded-decode one canonical in-memory ZIP source."""
+
+    archive = _read_zip_archive_once(path)
+    eocd_offset, eocd = _zip_eocd(archive)
+    (
+        _signature,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        _comment_size,
+    ) = eocd
+    if (
+        disk_number != 0
+        or central_disk != 0
+        or disk_entries == 0xFFFF
+        or total_entries == 0xFFFF
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+    ):
+        _zip_reject("ZIP-ZIP64", "uses ZIP64 or multiple disks")
+    if disk_entries != 1 or total_entries != 1:
+        _zip_reject("ZIP-COUNT", "must contain exactly one entry")
+    if central_offset + central_size != eocd_offset:
+        _zip_reject("ZIP-HEADER", "central directory bounds disagree")
+    if central_size < 46 or central_offset < 30:
+        _zip_reject("ZIP-TRUNC", "central directory is incomplete")
+    try:
+        central = struct.unpack_from("<4s6H3I5H2I", archive, central_offset)
+    except struct.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC central header is incomplete") from error
+    (
+        central_signature,
+        version_made,
+        version_needed,
+        flags,
+        method,
+        modified_time,
+        modified_date,
+        crc,
+        compressed_size,
+        expanded_size,
+        name_size,
+        central_extra_size,
+        member_comment_size,
+        member_disk,
+        _internal_attributes,
+        external_attributes,
+        local_offset,
+    ) = central
+    if central_signature != b"PK\x01\x02":
+        _zip_reject("ZIP-HEADER", "central signature is invalid")
+    if (
+        version_needed >= 45
+        or compressed_size == 0xFFFFFFFF
+        or expanded_size == 0xFFFFFFFF
+        or local_offset == 0xFFFFFFFF
+        or member_disk != 0
+    ):
+        _zip_reject("ZIP-ZIP64", "uses ZIP64 or multiple disks")
+    central_record_size = 46 + name_size + central_extra_size + member_comment_size
+    if central_record_size != central_size:
+        _zip_reject("ZIP-HEADER", "central record size disagrees")
+    if central_offset + central_record_size > eocd_offset:
+        _zip_reject("ZIP-TRUNC", "central record is incomplete")
+    if central_extra_size != 0 or member_comment_size != 0:
+        _zip_reject("ZIP-META", "contains member metadata")
+    if method not in (0, 8):
+        _zip_reject("ZIP-METHOD", "uses unsupported compression")
+    allowed_flags = 0x800 | (0x6 if method == 8 else 0)
+    if flags & ~allowed_flags:
+        _zip_reject("ZIP-FLAG", "uses unsupported general-purpose flags")
+    minimum_version = 20 if method == 8 else 10
+    if version_needed < minimum_version:
+        _zip_reject("ZIP-HEADER", "version is too old for its compression method")
+    if expanded_size > MAX_SOURCE_BYTES:
+        _zip_reject("ZIP-SIZE", f"source exceeds the {MAX_SOURCE_BYTES}-byte limit")
+    central_name = archive[central_offset + 46 : central_offset + 46 + name_size]
+    create_system = version_made >> 8
+    unix_mode = external_attributes >> 16
+    unix_type = stat.S_IFMT(unix_mode)
+    dos_attributes = external_attributes & 0xFFFF
+    if (
+        create_system not in (0, 3, 10, 14)
+        or dos_attributes & 0x458
+        or (create_system == 3 and unix_type not in (0, stat.S_IFREG))
+    ):
+        _zip_reject("ZIP-TYPE", "member is not a regular file")
+    if local_offset != 0:
+        _zip_reject("ZIP-HEADER", "local header is not at the canonical offset")
+
+    try:
+        local = struct.unpack_from("<4s5H3I2H", archive, local_offset)
+    except struct.error as error:
+        raise InvalidManifest("zip archive ZIP-TRUNC local header is incomplete") from error
+    (
+        local_signature,
+        local_version,
+        local_flags,
+        local_method,
+        local_time,
+        local_date,
+        local_crc,
+        local_compressed_size,
+        local_expanded_size,
+        local_name_size,
+        local_extra_size,
+    ) = local
+    if local_signature != b"PK\x03\x04":
+        _zip_reject("ZIP-HEADER", "local signature is invalid")
+    local_record_size = 30 + local_name_size + local_extra_size
+    if local_record_size > central_offset:
+        _zip_reject("ZIP-TRUNC", "local header is incomplete")
+    local_name = archive[30 : 30 + local_name_size]
+    if local_extra_size != 0:
+        _zip_reject("ZIP-META", "contains local member metadata")
+    if (
+        local_version != version_needed
+        or local_flags != flags
+        or local_method != method
+        or local_time != modified_time
+        or local_date != modified_date
+        or local_crc != crc
+        or local_compressed_size != compressed_size
+        or local_expanded_size != expanded_size
+        or local_name != central_name
+    ):
+        _zip_reject("ZIP-HEADER", "local and central records disagree")
+    try:
+        decoded_name = central_name.decode("ascii")
+    except UnicodeError as error:
+        raise InvalidManifest("zip archive ZIP-PATH member name is not ASCII") from error
+    if decoded_name != "experiment.cue":
+        _zip_reject("ZIP-PATH", "member name must be exactly experiment.cue")
+    payload_end = local_record_size + compressed_size
+    if payload_end != central_offset:
+        _zip_reject("ZIP-LENGTH", "compressed payload bounds disagree")
+    payload = archive[local_record_size:payload_end]
+    if len(payload) != compressed_size:
+        _zip_reject("ZIP-TRUNC", "compressed payload is incomplete")
+    if method == 0:
+        if compressed_size != expanded_size:
+            _zip_reject("ZIP-LENGTH", "stored member lengths disagree")
+        data = payload
+    else:
+        data = _zip_decode(payload, expanded_size)
+    if len(data) != expanded_size:
+        _zip_reject("ZIP-LENGTH", "decoded length disagrees with its header")
+    if (zlib.crc32(data) & 0xFFFFFFFF) != crc:
+        _zip_reject("ZIP-CRC", "member checksum disagrees")
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={
+            "archiveBytes": len(archive),
+            "archiveDigest": "sha256:" + hashlib.sha256(archive).hexdigest(),
+            "kind": "zip",
+        },
+    )
+
+
+def authored_manifest(snapshot: SourceSnapshot) -> object:
+    repo_root = Path(__file__).resolve().parent.parent
+    cue_helper = repo_root / "scripts/dev/cue-tool.py"
+    module = b'module: "agent-lab.local/experiment-snapshot"\nlanguage: version: "v0.9.0"\n'
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-lab-source-", dir="/tmp") as directory:
+            root = Path(directory)
+            write_private_file(root, "cue.mod/module.cue", module)
+            write_private_file(root, "experiment.cue", snapshot.data)
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    str(cue_helper),
+                    "-C",
+                    str(root),
+                    "export",
+                    "-E",
+                    "experiment.cue",
+                    "-e",
+                    "experiment",
+                    "--out",
+                    "json",
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=cue_environment(repo_root),
+                timeout=CUE_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InfrastructureError("authored CUE evaluation could not complete") from error
+    if completed.returncode == 1:
+        raise InvalidManifest("authored CUE value is invalid or incomplete")
+    if completed.returncode != 0 or completed.stderr or not completed.stdout:
+        raise InfrastructureError("pinned CUE could not export authored Experiment")
+    if len(completed.stdout) > MAX_CUE_OUTPUT_BYTES:
+        raise InfrastructureError("authored CUE output exceeded its bound")
+    manifest = strict_json(completed.stdout, source="authored CUE export")
+    if not isinstance(manifest, dict):
+        raise InvalidManifest("experiment must export one object")
+    return manifest
 
 
 def strict_json(data: bytes, *, source: str) -> object:
@@ -238,6 +1727,12 @@ def canonical_json(value: object) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as error:
         raise InfrastructureError("CUE produced a non-canonicalizable plan") from error
+
+
+def plan_digest(plan: object) -> str:
+    """Return the canonical, domain-separated identity of one checked plan."""
+
+    return "sha256:" + hashlib.sha256(PLAN_DOMAIN + canonical_json(plan)).hexdigest()
 
 
 def cue_environment(repo_root: Path) -> dict[str, str]:
@@ -443,15 +1938,17 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
                 or not set(member) <= {"name", "image", "command", "resourceClass"}
             ):
                 raise KeyError("member field drift")
-        members = [
-            {
+        members = []
+        for member in raw_members:
+            selector = member["image"]
+            if not isinstance(selector, dict) or set(selector) not in ({"digestRef"}, {"catalogName"}):
+                raise KeyError("unresolved selector")
+            members.append({
                 "command": member.get("command", []),
-                "image": member["image"],
                 "name": member["name"],
+                "requestedSelector": selector,
                 "resourceClass": member.get("resourceClass", "small"),
-            }
-            for member in raw_members
-        ]
+            })
         members.sort(key=lambda member: str(member["name"]))
         name = metadata["name"]
     except (AssertionError, KeyError, TypeError) as error:
@@ -467,6 +1964,200 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
         "metadata": {"requestedName": name},
         "spec": {"members": members},
     }
+
+
+def image_reference_module():
+    path = Path(__file__).resolve().with_name("image_reference.py")
+    spec = spec_from_file_location("agent_lab_image_reference", path)
+    if spec is None or spec.loader is None:
+        raise InfrastructureError("shared image-reference grammar cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError) as error:
+        raise InfrastructureError("shared image-reference grammar cannot be loaded") from error
+    return module
+
+
+valid_catalog_name = image_reference_module().valid_image_name
+
+
+def digest_record(domain: bytes, value: object) -> str:
+    return "sha256:" + hashlib.sha256(domain + canonical_json(value)).hexdigest()
+
+
+def image_catalog_module():
+    path = Path(__file__).resolve().with_name("image_catalog.py")
+    spec = spec_from_file_location("agent_lab_image_catalog", path)
+    if spec is None or spec.loader is None:
+        raise InfrastructureError("local image catalog support cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError) as error:
+        raise InfrastructureError("local image catalog support cannot be loaded") from error
+    return module
+
+
+def bundled_catalog(repo_root: Path) -> tuple[dict[str, object], str]:
+    path = repo_root / "catalog/experiment-images/v0alpha1.json"
+    data = stable_file_bytes(path, MAX_CONTRACT_FILE_BYTES, "bundled image catalog")
+    value = strict_json(data, source="bundled image catalog")
+    if not isinstance(value, dict) or set(value) != {"apiVersion", "entries"}:
+        raise InfrastructureError("bundled image catalog has an unexpected shape")
+    if value["apiVersion"] != "agent-lab.experiment-images/v0alpha1" or not isinstance(value["entries"], list):
+        raise InfrastructureError("bundled image catalog has an unknown schema")
+    return value, digest_record(BUNDLED_CATALOG_DOMAIN, value)
+
+
+def resolve_plan_with_evidence(
+    plan: dict[str, object],
+    repo_root: Path,
+    catalog: dict[str, object] | None = None,
+) -> PlanResolution:
+    resolved = json.loads(canonical_json(plan))
+    members = resolved["spec"]["members"]
+    bundled_names: set[str] = set()
+    local_names: set[str] = set()
+    for member in members:
+        selector = member["requestedSelector"]
+        if set(selector) == {"digestRef"}:
+            member["resolvedImage"] = {"origin": "direct", "subject": selector["digestRef"]}
+            continue
+        if set(selector) != {"catalogName"} or not valid_catalog_name(selector["catalogName"]):
+            raise InvalidManifest("contains an invalid image selector")
+        name = selector["catalogName"]
+        if name.startswith("agent-lab."):
+            bundled_names.add(name)
+        else:
+            local_names.add(name)
+
+    catalog_support = None
+    bundled_by_name: dict[str, dict[str, object]] = {}
+    bundled_evidence: dict[str, object] | None = None
+    if bundled_names:
+        catalog_support = image_catalog_module()
+        selected_catalog = catalog
+        if selected_catalog is None:
+            selected_catalog, _ = bundled_catalog(repo_root)
+        if (
+            not isinstance(selected_catalog, dict)
+            or set(selected_catalog) != {"apiVersion", "entries"}
+            or selected_catalog.get("apiVersion")
+            != "agent-lab.experiment-images/v0alpha1"
+        ):
+            raise InfrastructureError("bundled image catalog has an unexpected shape")
+        entries = selected_catalog.get("entries")
+        if not isinstance(entries, list):
+            raise InfrastructureError("bundled image catalog entries are malformed")
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
+                raise InfrastructureError("bundled image catalog entry is malformed")
+            name, subject = entry["name"], entry["subject"]
+            if (
+                not valid_catalog_name(name)
+                or not isinstance(subject, str)
+                or not catalog_support.oci_subject(subject)
+            ):
+                raise InfrastructureError("bundled image catalog entry is invalid")
+            assert isinstance(name, str)
+            if not name.startswith("agent-lab.") or name in bundled_by_name:
+                raise InfrastructureError("bundled image catalog namespace is invalid")
+            bundled_by_name[name] = entry
+        bundled_evidence = {
+            "snapshotDigest": digest_record(BUNDLED_CATALOG_DOMAIN, selected_catalog)
+        }
+
+    local_records: dict[str, dict[str, object]] = {}
+    local_evidence: dict[str, object] | None = None
+    if local_names:
+        if catalog_support is None:
+            catalog_support = image_catalog_module()
+        raw_home = os.environ.get("AGENT_LAB_HOME")
+        if not raw_home:
+            raise InvalidManifest("local image name requires an initialized Agent Lab home")
+        try:
+            local_resolution = catalog_support.resolve_local_images(
+                Path(raw_home), tuple(sorted(local_names))
+            )
+        except catalog_support.CatalogReject as error:
+            raise InvalidManifest(str(error)) from error
+        except catalog_support.CatalogInfrastructure as error:
+            raise InfrastructureError(str(error)) from error
+        try:
+            if not isinstance(local_resolution, dict) or set(local_resolution) != {"catalog", "records"}:
+                raise ValueError("resolution envelope")
+            records = local_resolution["records"]
+            evidence = local_resolution["catalog"]
+            if not isinstance(records, dict) or set(records) != local_names:
+                raise ValueError("resolution records")
+            if not isinstance(evidence, dict) or set(evidence) != {"revision", "snapshotDigest"}:
+                raise ValueError("resolution evidence")
+            revision = evidence["revision"]
+            snapshot_digest = evidence["snapshotDigest"]
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 1
+                or not is_sha256(snapshot_digest)
+            ):
+                raise ValueError("resolution evidence values")
+            for name in local_names:
+                record = records[name]
+                if (
+                    not isinstance(record, dict)
+                    or record.get("name") != name
+                    or record.get("state") != "active"
+                    or type(record.get("generation")) is not int
+                    or record["generation"] != 1
+                    or record.get("previousEntryDigest") is not None
+                    or not is_sha256(record.get("entryDigest"))
+                    or not isinstance(record.get("subject"), str)
+                    or not catalog_support.oci_subject(record["subject"])
+                ):
+                    raise ValueError("selected local record")
+            local_records = records
+            local_evidence = {
+                "revision": revision,
+                "snapshotDigest": snapshot_digest,
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise InfrastructureError("local image catalog returned invalid resolution evidence") from error
+
+    for member in members:
+        selector = member["requestedSelector"]
+        if set(selector) == {"digestRef"}:
+            continue
+        name = selector["catalogName"]
+        if name.startswith("agent-lab."):
+            entry = bundled_by_name.get(name)
+            if entry is None:
+                raise InvalidManifest("references an unknown bundled image name")
+            member["resolvedImage"] = {
+                "entryDigest": digest_record(BUNDLED_ENTRY_DOMAIN, entry),
+                "generation": 1,
+                "origin": "agent-lab",
+                "subject": entry["subject"],
+            }
+        else:
+            record = local_records[name]
+            member["resolvedImage"] = {
+                "entryDigest": record["entryDigest"],
+                "generation": record["generation"],
+                "origin": "local",
+                "subject": record["subject"],
+            }
+    return PlanResolution(resolved, bundled_evidence, local_evidence)
+
+
+def resolve_plan(
+    plan: dict[str, object],
+    repo_root: Path,
+    catalog: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return resolve_plan_with_evidence(plan, repo_root, catalog).plan
 
 
 def invoke_cue(
@@ -527,13 +2218,11 @@ def parse_cue_plan(completed: subprocess.CompletedProcess[bytes]) -> dict[str, o
     return plan
 
 
-def cue_plan(manifest: object) -> object:
+def cue_plan_with_evidence(manifest: object) -> PlanResolution:
     repo_root = Path(__file__).resolve().parent.parent
     contract_root = repo_root / "contracts" / "experiment" / "v0alpha1"
-    cue_tool = repo_root / "scripts" / "dev" / "cue-tool"
     cue_helper = repo_root / "scripts" / "dev" / "cue-tool.py"
     required = (
-        cue_tool,
         cue_helper,
         contract_root / "schema.cue",
         contract_root / "plan.cue",
@@ -579,9 +2268,13 @@ def cue_plan(manifest: object) -> object:
             plan = parse_cue_plan(completed)
             if plan != expected_plan(manifest, contract_digest):
                 raise InfrastructureError("pinned CUE plan violates its exact postcondition")
-            return plan
+            return resolve_plan_with_evidence(plan, repo_root)
     except OSError as error:
         raise InfrastructureError("private validation snapshot could not be managed") from error
+
+
+def cue_plan(manifest: object) -> object:
+    return cue_plan_with_evidence(manifest).plan
 
 
 def is_sha256(value: object) -> bool:
@@ -593,7 +2286,7 @@ def is_sha256(value: object) -> bool:
     )
 
 
-def plan_binding(plan: object) -> PlanBinding:
+def plan_binding(plan: object, source_digest: str) -> PlanBinding:
     """Derive the only facts the v0alpha1 policy is allowed to see."""
     try:
         if not isinstance(plan, dict) or set(plan) != {
@@ -635,8 +2328,9 @@ def plan_binding(plan: object) -> PlanBinding:
         for member in members:
             if not isinstance(member, dict) or set(member) != {
                 "command",
-                "image",
                 "name",
+                "requestedSelector",
+                "resolvedImage",
                 "resourceClass",
             }:
                 raise ValueError("plan member")
@@ -650,15 +2344,15 @@ def plan_binding(plan: object) -> PlanBinding:
     except (AssertionError, KeyError, TypeError, ValueError) as error:
         raise InfrastructureError("CUE plan cannot be bound to authorization") from error
 
-    plan_bytes = canonical_json(plan)
-    plan_digest = f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}"
+    bound_plan_digest = plan_digest(plan)
     return PlanBinding(
-        plan_digest=plan_digest,
+        plan_digest=bound_plan_digest,
         contract_digest=contract_digest,
         contract_version=contract_version,
         requested_name=requested_name,
         member_count=len(members),
         resource_classes=tuple(sorted(resource_classes)),
+        source_digest=source_digest,
     )
 
 
@@ -684,6 +2378,7 @@ def cedar_documents(
             "uid": resource_uid,
             "attrs": {
                 "planDigest": binding.plan_digest,
+                "sourceDigest": binding.source_digest,
                 "contractDigest": binding.contract_digest,
                 "contractVersion": binding.contract_version,
                 "requestedName": binding.requested_name,
@@ -702,6 +2397,7 @@ def cedar_documents(
         "context": {
             "bindingVersion": "v0alpha1",
             "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
             "contractDigest": binding.contract_digest,
         },
     }
@@ -961,9 +2657,9 @@ def evaluate_cedar(
         raise InfrastructureError("private authorization snapshot could not be managed") from error
 
 
-def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
+def authorize_plan(plan: object, source_digest: str) -> tuple[dict[str, object], int]:
     repo_root = Path(__file__).resolve().parent.parent
-    binding = plan_binding(plan)
+    binding = plan_binding(plan, source_digest)
     request, entities = cedar_documents(binding)
     authorization_digest, snapshot = authorization_snapshot(repo_root)
     verdict = evaluate_cedar(snapshot, request, entities, repo_root)
@@ -976,6 +2672,7 @@ def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
             "authorizationDigest": authorization_digest,
             "contractDigest": binding.contract_digest,
             "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
         },
         "kind": "ExperimentAuthorizationDecision",
         "principal": {
@@ -995,10 +2692,72 @@ def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
     return decision, 0 if verdict == "permit" else 1
 
 
-def write_envelope(plan: object) -> None:
-    plan_bytes = canonical_json(plan)
-    digest = hashlib.sha256(plan_bytes).hexdigest()
-    envelope = canonical_json({"digest": f"sha256:{digest}", "plan": plan}) + b"\n"
+def verify_trusted_inputs(plan: object, decision: object) -> None:
+    """Re-snapshot trusted inputs and bind them to one authorized plan."""
+
+    try:
+        if (
+            not isinstance(decision, dict)
+            or not isinstance(decision.get("binding"), dict)
+            or not isinstance(decision.get("resource"), dict)
+        ):
+            raise ValueError("decision envelope")
+        binding = decision["binding"]
+        resource = decision["resource"]
+        if set(binding) != {
+            "authorizationDigest",
+            "contractDigest",
+            "planDigest",
+            "sourceDigest",
+        }:
+            raise ValueError("decision binding")
+        source_digest = binding["sourceDigest"]
+        if not is_sha256(source_digest):
+            raise ValueError("source identity")
+        expected = plan_binding(plan, source_digest)
+        if (
+            binding["planDigest"] != expected.plan_digest
+            or binding["contractDigest"] != expected.contract_digest
+            or resource.get("id") != expected.plan_digest
+        ):
+            raise ValueError("plan decision identity")
+    except (KeyError, TypeError, ValueError) as error:
+        raise InfrastructureError("authorized plan binding is inconsistent") from error
+
+    repo_root = Path(__file__).resolve().parent.parent
+    contract_digest, contract_files = contract_snapshot(repo_root)
+    authorization_digest, authorization_files = authorization_snapshot(repo_root)
+    verify_contract_snapshot(repo_root, contract_files)
+    verify_authorization_snapshot(repo_root, authorization_files)
+    if (
+        expected.contract_digest != f"sha256:{contract_digest}"
+        or binding["authorizationDigest"] != authorization_digest
+    ):
+        raise InfrastructureError("trusted inputs no longer match the authorization")
+
+
+def catalog_resolution_evidence(
+    bundled_catalog: dict[str, object] | None,
+    local_catalog: dict[str, object] | None,
+) -> dict[str, object] | None:
+    catalog: dict[str, object] = {}
+    if bundled_catalog is not None:
+        catalog["bundled"] = bundled_catalog
+    if local_catalog is not None:
+        catalog["local"] = local_catalog
+    return catalog or None
+
+
+def write_envelope(
+    plan: object,
+    bundled_catalog: dict[str, object] | None = None,
+    local_catalog: dict[str, object] | None = None,
+) -> None:
+    value: dict[str, object] = {"digest": plan_digest(plan), "plan": plan}
+    catalog = catalog_resolution_evidence(bundled_catalog, local_catalog)
+    if catalog is not None:
+        value["catalog"] = catalog
+    envelope = canonical_json(value) + b"\n"
     try:
         written = sys.stdout.buffer.write(envelope)
         if written != len(envelope):
@@ -1019,7 +2778,63 @@ def write_decision(decision: object) -> None:
         raise InfrastructureError("authorization decision could not be written") from error
 
 
+def write_checked_source(checked: object) -> None:
+    output = canonical_json(checked) + b"\n"
+    try:
+        written = sys.stdout.buffer.write(output)
+        if written != len(output):
+            raise OSError("partial checked-source output")
+        sys.stdout.buffer.flush()
+    except (BrokenPipeError, OSError) as error:
+        raise InfrastructureError("checked source output could not be written") from error
+
+
 def main(argv: list[str]) -> int:
+    directory_checking = len(argv) == 3 and argv[1] == "check-directory"
+    directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
+    zip_checking = len(argv) == 3 and argv[1] == "check-zip"
+    zip_authorizing = len(argv) == 3 and argv[1] == "authorize-zip"
+    git_checking = len(argv) == 4 and argv[1] == "check-git"
+    git_authorizing = len(argv) == 4 and argv[1] == "authorize-git"
+    if (
+        directory_checking
+        or directory_authorizing
+        or zip_checking
+        or zip_authorizing
+        or git_checking
+        or git_authorizing
+    ):
+        try:
+            if git_checking or git_authorizing:
+                snapshot = read_git_snapshot(argv[2], argv[3])
+            elif zip_checking or zip_authorizing:
+                snapshot = read_zip_snapshot(argv[2])
+            else:
+                snapshot = read_directory_snapshot(argv[2])
+            manifest = authored_manifest(snapshot)
+            resolution = cue_plan_with_evidence(manifest)
+            plan = resolution.plan
+            if directory_checking or zip_checking or git_checking:
+                checked: dict[str, object] = {
+                    "digest": plan_digest(plan),
+                    "plan": plan,
+                    "source": {"digest": snapshot.digest, **snapshot.transport},
+                }
+                catalog = catalog_resolution_evidence(
+                    resolution.bundled_catalog,
+                    resolution.local_catalog,
+                )
+                if catalog is not None:
+                    checked["catalog"] = catalog
+                write_checked_source(checked)
+                return 0
+            decision, result = authorize_plan(plan, snapshot.digest)
+            write_decision(decision)
+            return result
+        except InvalidManifest as error:
+            fail(str(error))
+        except InfrastructureError as error:
+            infra(str(error))
     checking = len(argv) == 3 and argv[1] == "check"
     authorizing = (
         len(argv) == 4 and argv[1] == "authorize" and argv[2] == "install"
@@ -1036,11 +2851,16 @@ def main(argv: list[str]) -> int:
         manifest = strict_json(manifest_bytes, source="input")
         if not isinstance(manifest, dict):
             raise InvalidManifest("must be one JSON object")
-        plan = cue_plan(manifest)
+        resolution = cue_plan_with_evidence(manifest)
+        plan = resolution.plan
         if checking:
-            write_envelope(plan)
+            write_envelope(
+                plan,
+                resolution.bundled_catalog,
+                resolution.local_catalog,
+            )
             return 0
-        decision, result = authorize_plan(plan)
+        decision, result = authorize_plan(plan, "sha256:" + "0" * 64)
         write_decision(decision)
         return result
     except InvalidManifest as error:

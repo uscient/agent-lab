@@ -228,8 +228,10 @@ docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0
 guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
 guard-mount tests/guard/cases.sh SUMMARY failures=0
 config-authority tests/agent/config-guard.sh SUMMARY failures=0
-experiment-contract tests/experiment/contract-cases.sh SUMMARY failures=0
-experiment-authorization tests/experiment/authorization-cases.sh SUMMARY failures=0
+experiment-contract tests/experiment/contract-cases.sh EXPERIMENT CONTRACT PASS
+experiment-authorization tests/experiment/authorization-cases.sh EXPERIMENT AUTHORIZATION PASS
+experiment-local-lifecycle tests/experiment/local-lifecycle-cases.sh EXPERIMENT LOCAL LIFECYCLE PASS
+experiment-source-adapters tests/experiment/source-adapter-cases.sh EXPERIMENT SOURCE ADAPTERS PASS
 config-matrix tests/agent/config-matrix.sh SUMMARY failures=0
 allowlist-schema tests/agent/allowlist-cases.sh SUMMARY failures=0
 image-volume-policy tests/agent/image-volume-policy-cases.sh SUMMARY failures=0
