@@ -71,11 +71,15 @@ Git intake is Linux-only in this version. It accepts only a normalized, unauthen
 ID. A fixed credential-free GitHub Git Data API client reads that commit, its exact root tree, and
 the bound blob under one five-second deadline and a 1,048,576-byte aggregate response cap. It uses
 explicit system trust, identity encoding, fixed headers, a private process group, and zero temporary
-files. Redirects, credentials, mutable refs, alternate protocols or authorities, extra tree entries,
-and changed bound objects fail closed. Agent Lab never runs Git, creates a repository, checks out
-content, follows submodules, or executes repository data. Provenance records the canonical URL,
-requested and verified object IDs, bounded acquisition facts, and the independent framed SHA-256
-source digest. Git object identity does not replace source identity or change cross-transport retry.
+files. The TLS-authenticated fixed GitHub API is the trust binding from the requested commit ID to
+the returned root-tree ID: the response must echo the requested commit, and Agent Lab independently
+recomputes the returned tree and blob Git object IDs before accepting their bytes. Redirects,
+credentials, mutable refs, alternate protocols or authorities, extra tree entries, and changed bound
+objects fail closed. Agent Lab never runs Git, creates a repository, checks out content, follows
+submodules, or executes repository data. Provenance records the canonical URL, provider-bound commit
+ID, independently verified tree/blob IDs, bounded acquisition facts, and the independent framed
+SHA-256 source digest. Git object identity does not replace source identity or change cross-transport
+retry.
 
 An exact retry freshly validates and authorizes again, verifies the complete installed envelope,
 and returns `changed:false` with the same `installationKey` and `receiptDigest`. The same requested
