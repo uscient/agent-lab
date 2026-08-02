@@ -265,19 +265,16 @@ assert not any(item.startswith("/") for item in strings(provenance))
 selected_entries: list[dict[str, object]] = []
 for member in plan["spec"]["members"]:
     resolved = member["resolvedImage"]
-    selected: dict[str, object] = {
-        "member": member["name"],
+    if resolved["origin"] == "direct":
+        continue
+    selected_entries.append({
+        "entryDigest": resolved["entryDigest"],
+        "generation": resolved["generation"],
+        "name": member["requestedSelector"]["catalogName"],
         "origin": resolved["origin"],
         "subject": resolved["subject"],
-    }
-    if resolved["origin"] in {"agent-lab", "local"}:
-        selected.update({
-            "entryDigest": resolved["entryDigest"],
-            "generation": resolved["generation"],
-            "name": member["requestedSelector"]["catalogName"],
-        })
-    selected_entries.append(selected)
-selected_entries.sort(key=lambda item: (str(item["member"]).encode(), str(item["origin"]).encode()))
+    })
+selected_entries.sort(key=lambda item: (str(item["origin"]).encode(), str(item["name"]).encode()))
 
 identity = {
     "authorizationDigest": decision["binding"]["authorizationDigest"],
