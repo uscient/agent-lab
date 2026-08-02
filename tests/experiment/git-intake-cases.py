@@ -803,13 +803,85 @@ def main() -> int:
                         os.kill(residual_pid, signal.SIGKILL)
                 else:
                     residual_alive = False
+
+                signal_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                signal_listener.bind(("127.0.0.1", 0))
+                signal_listener.settimeout(1.0)
+                signal_address = signal_listener.getsockname()
+                signal_probe = os.fork()
+                if signal_probe == 0:
+                    def hanging_requester(authority, path, headers, maximum, deadline):
+                        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                            sender.sendto(
+                                f"{os.getpid()}\n".encode("ascii"),
+                                signal_address,
+                            )
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        while True:
+                            signal.pause()
+
+                    experiment._github_api_request = hanging_requester
+                    try:
+                        experiment.read_git_snapshot(URL, COMMIT)
+                    except SystemExit as error:
+                        code = error.code if isinstance(error.code, int) else 125
+                        os._exit(code)
+                    except BaseException:
+                        os._exit(125)
+                    os._exit(0)
+                try:
+                    try:
+                        worker_record = signal_listener.recv(64).decode("ascii").strip()
+                    except TimeoutError:
+                        worker_record = ""
+                finally:
+                    signal_listener.close()
+                signal_worker_pid = int(worker_record) if worker_record.isdigit() else None
+                if signal_worker_pid is not None:
+                    os.kill(signal_probe, signal.SIGTERM)
+                signal_status = None
+                signal_deadline = __import__("time").monotonic() + 2.0
+                while __import__("time").monotonic() < signal_deadline:
+                    waited, status = os.waitpid(signal_probe, os.WNOHANG)
+                    if waited == signal_probe:
+                        signal_status = status
+                        break
+                    __import__("time").sleep(0.01)
+                if signal_status is None:
+                    try:
+                        os.kill(signal_probe, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _, signal_status = os.waitpid(signal_probe, 0)
+                signal_worker_alive = False
+                if signal_worker_pid is not None:
+                    worker_deadline = __import__("time").monotonic() + 1.0
+                    while __import__("time").monotonic() < worker_deadline:
+                        try:
+                            os.killpg(signal_worker_pid, 0)
+                        except ProcessLookupError:
+                            break
+                        __import__("time").sleep(0.01)
+                    else:
+                        signal_worker_alive = True
+                        try:
+                            os.killpg(signal_worker_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            signal_worker_alive = False
+                signal_preserved = (
+                    signal_worker_pid is not None
+                    and os.WIFEXITED(signal_status)
+                    and os.WEXITSTATUS(signal_status) == 128 + signal.SIGTERM
+                    and not signal_worker_alive
+                )
                 results.append(
                     (
                         "GIT-CLEANUP-001",
                         residual_spawned
                         and not residual_alive
-                        and "residual" in residual_outcome.lower(),
-                        "a residual provider descendant is killed and reported as uncertainty",
+                        and "residual" in residual_outcome.lower()
+                        and signal_preserved,
+                        "residual descendants are killed before caller signals are preserved",
                     )
                 )
 
