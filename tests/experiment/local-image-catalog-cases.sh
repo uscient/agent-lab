@@ -44,6 +44,9 @@ collect_descendants() {
         fi
       done
       if [ "$known" -eq 0 ]; then
+        if ! kill -STOP -- "$child" 2>/dev/null; then
+          continue
+        fi
         signal_descendants[${#signal_descendants[@]}]="$child"
       fi
       collect_descendants "$child"
@@ -61,9 +64,6 @@ catalog_signal() {
   for _ in 1 2 3 4 5 6 7 8; do
     before="${#signal_descendants[@]}"
     collect_descendants "$$"
-    for ((index = before; index < ${#signal_descendants[@]}; index++)); do
-      kill -STOP -- "${signal_descendants[index]}" 2>/dev/null || true
-    done
     if [ "${#signal_descendants[@]}" -eq "$before" ]; then
       break
     fi
