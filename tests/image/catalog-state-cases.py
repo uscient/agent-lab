@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 import io
@@ -208,6 +208,84 @@ def hard_exit_add(
 class BrokenOutput(io.StringIO):
     def write(self, value: str) -> int:
         raise OSError("injected result-output failure")
+
+
+class HardExitOutput(io.StringIO):
+    def __init__(self, point: str) -> None:
+        super().__init__()
+        self.point = point
+
+    def write(self, value: str) -> int:
+        if self.point == "result.before_write":
+            os._exit(99)
+        written = super().write(value)
+        if self.point == "result.after_write":
+            os._exit(99)
+        return written
+
+
+def hard_exit_result(home: Path, point: str) -> int:
+    pid = os.fork()
+    if pid == 0:
+        output = HardExitOutput(point)
+        try:
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                MODULE.main(["--home", str(home), "image", "add", "vendor.worker", SUBJECT])
+        except BaseException:
+            os._exit(98)
+        os._exit(97)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return 124
+
+
+def hard_exit_cleanup(
+    home: Path,
+    name: str,
+    subject: str,
+    operation: str,
+) -> int:
+    pid = os.fork()
+    if pid == 0:
+        original_unlink = Path.unlink
+        original_rmdir = Path.rmdir
+
+        def stop_after_unlink(path: Path, *args, **kwargs) -> None:
+            original_unlink(path, *args, **kwargs)
+            if path.name == "intent.json":
+                os._exit(99)
+
+        def stop_after_rmdir(path: Path, *args, **kwargs) -> None:
+            original_rmdir(path, *args, **kwargs)
+            if path.name == "payload":
+                os._exit(99)
+
+        if operation == "intent-unlink":
+            Path.unlink = stop_after_unlink
+        elif operation == "payload-rmdir":
+            Path.rmdir = stop_after_rmdir
+        else:
+            os._exit(96)
+        try:
+            CATALOG.add_image(home, name, subject)
+        except BaseException:
+            os._exit(98)
+        os._exit(97)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return 124
 
 
 def catalog_add_result(home: Path, name: str, subject: str, *, limits=None):
@@ -513,29 +591,31 @@ def main() -> int:
         )
 
         split_home = new_home(root, "split-lock-home")
-        original_catalog_lock = CATALOG._catalog_lock
+        original_flock = CATALOG.fcntl.flock
         split_rejected = False
+        split_replaced = False
 
-        @contextmanager
-        def replace_before_lock(authority, *, exclusive):
-            path = authority.lock
-            data = path.read_bytes()
-            path.rename(root / "split-original-image-catalog.lock")
-            path.write_bytes(data)
-            path.chmod(0o600)
-            with original_catalog_lock(authority, exclusive=exclusive) as descriptor:
-                yield descriptor
+        def replace_after_flock(descriptor: int, operation: int) -> None:
+            nonlocal split_replaced
+            original_flock(descriptor, operation)
+            if operation in (CATALOG.fcntl.LOCK_SH, CATALOG.fcntl.LOCK_EX) and not split_replaced:
+                path = split_home / "state" / "locks" / "image-catalog.lock"
+                data = path.read_bytes()
+                path.rename(root / "split-original-image-catalog.lock")
+                path.write_bytes(data)
+                path.chmod(0o600)
+                split_replaced = True
 
-        CATALOG._catalog_lock = replace_before_lock
+        CATALOG.fcntl.flock = replace_after_flock
         try:
             CATALOG.list_images(split_home)
         except CATALOG.CatalogInfrastructure:
             split_rejected = True
         finally:
-            CATALOG._catalog_lock = original_catalog_lock
+            CATALOG.fcntl.flock = original_flock
         check(
             "CAT-STATE-018",
-            split_rejected,
+            split_rejected and split_replaced,
             "receipt-bound lock identity is rechecked after acquisition to prevent split-brain",
         )
 
@@ -730,14 +810,26 @@ def main() -> int:
         )
         retry = cli(result_home, "image", "add", "vendor.worker", SUBJECT)
         retry_value = json.loads(retry.stdout) if retry.returncode == 0 else {}
+        result_exit_codes: list[int] = []
+        result_retries: list[dict[str, object]] = []
+        for index, point in enumerate(("result.before_write", "result.after_write")):
+            hard_exit_home = new_home(root, f"result-hard-exit-{index}")
+            result_exit_codes.append(hard_exit_result(hard_exit_home, point))
+            completed = cli(hard_exit_home, "image", "add", "vendor.worker", SUBJECT)
+            result_retries.append(json.loads(completed.stdout) if completed.returncode == 0 else {})
         check(
             "CAT-CRASH-003",
             first_rc == 125
             and first_error is None
             and retry.returncode == 0
-            and retry_value.get("changed") is False,
-            "lost result output reports uncertainty while retry observes the committed binding idempotently",
-            f"first_rc={first_rc} error={first_error!r} retry_rc={retry.returncode} retry={retry_value!r}",
+            and retry_value.get("changed") is False
+            and result_exit_codes == [99, 99]
+            and [value.get("changed") for value in result_retries] == [False, False],
+            "failures and hard exits before or after result write retry as committed idempotent state",
+            (
+                f"first_rc={first_rc} error={first_error!r} retry_rc={retry.returncode} "
+                f"retry={retry_value!r} exits={result_exit_codes!r} hard_retries={result_retries!r}"
+            ),
         )
 
         forged_home = new_home(root, "forged-stage-home")
@@ -842,6 +934,16 @@ def main() -> int:
             "bootstrap.after_rename",
             "catalog bootstrap parent.before_fsync",
             "catalog bootstrap parent.after_fsync",
+            "catalog staging cleanup.before_remove",
+            "catalog staging cleanup handoff.before_rename",
+            "catalog staging cleanup handoff.after_rename",
+            "catalog staging cleanup handoff.before_fsync",
+            "catalog staging cleanup handoff.after_fsync",
+            "catalog staging cleanup.after_remove",
+            "catalog staging cleanup.after_unlink",
+            "catalog staging cleanup.after_rmdir",
+            "catalog staging cleanup.before_fsync",
+            "catalog staging cleanup.after_fsync",
         )
         later_points = (
             "catalog intent.before_fsync",
@@ -876,6 +978,16 @@ def main() -> int:
             "pointer.after_replace",
             "catalog current pointer.before_fsync",
             "catalog current pointer.after_fsync",
+            "catalog staging cleanup.before_remove",
+            "catalog staging cleanup handoff.before_rename",
+            "catalog staging cleanup handoff.after_rename",
+            "catalog staging cleanup handoff.before_fsync",
+            "catalog staging cleanup handoff.after_fsync",
+            "catalog staging cleanup.after_remove",
+            "catalog staging cleanup.after_unlink",
+            "catalog staging cleanup.after_rmdir",
+            "catalog staging cleanup.before_fsync",
+            "catalog staging cleanup.after_fsync",
         )
         matrix_failures: list[str] = []
         for index, point in enumerate(bootstrap_points):
@@ -1018,15 +1130,46 @@ def main() -> int:
         before = fingerprint(phase_home / "images")
         retry = cli(phase_home, "image", "add", "vendor.worker", SUBJECT)
         after = fingerprint(phase_home / "images")
+
+        marker_phase_home = new_home(root, "initialized-incomplete-bootstrap-home")
+        marker_child = hard_exit_add(
+            marker_phase_home,
+            "vendor.worker",
+            SUBJECT,
+            "catalog marker.after_fsync",
+        )
+        marker_payload = (
+            marker_phase_home
+            / "images"
+            / ".staging"
+            / "image-catalog-operation"
+            / "payload"
+        )
+        shutil.rmtree(marker_payload)
+        marker_before = fingerprint(marker_phase_home / "images")
+        marker_read = cli(marker_phase_home, "image", "list")
+        marker_retry = cli(marker_phase_home, "image", "add", "vendor.worker", SUBJECT)
+        marker_after = fingerprint(marker_phase_home / "images")
         check(
             "CAT-CRASH-008",
             child_rc == 99
             and retry.returncode == 125
             and retry.stdout == b""
             and before == after
-            and not (phase_home / "images" / "catalog").exists(),
+            and not (phase_home / "images" / "catalog").exists()
+            and marker_child == 99
+            and marker_read.returncode == 125
+            and marker_read.stdout == b""
+            and marker_retry.returncode == 125
+            and marker_retry.stdout == b""
+            and marker_before == marker_after
+            and not (marker_phase_home / "images" / "catalog").exists(),
             "phase-inconsistent bootstrap staging remains inert and cannot become committed authority",
-            f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after}",
+            (
+                f"child_rc={child_rc} retry_rc={retry.returncode} changed={before != after} "
+                f"marker_child={marker_child} marker_read={marker_read.returncode} "
+                f"marker_retry={marker_retry.returncode} marker_changed={marker_before != marker_after}"
+            ),
         )
 
         incomplete_home = new_home(root, "incomplete-later-phase-home")
@@ -1147,6 +1290,78 @@ def main() -> int:
             ),
         )
 
+        cleanup_unlink_home = new_home(root, "cleanup-intent-unlink-home")
+        add(cleanup_unlink_home)
+        committed_child = hard_exit_add(
+            cleanup_unlink_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "pointer.after_replace",
+        )
+        unlink_child = hard_exit_cleanup(
+            cleanup_unlink_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "intent-unlink",
+        )
+        unlink_read = cli(cleanup_unlink_home, "image", "list")
+        unlink_retry = cli(
+            cleanup_unlink_home,
+            "image",
+            "add",
+            "vendor.second",
+            OTHER_SUBJECT,
+        )
+
+        cleanup_rmdir_home = new_home(root, "cleanup-payload-rmdir-home")
+        add(cleanup_rmdir_home)
+        orphan_child = hard_exit_add(
+            cleanup_rmdir_home,
+            "vendor.second",
+            OTHER_SUBJECT,
+            "catalog immutable entry.after_noreplace",
+        )
+        rmdir_child = hard_exit_cleanup(
+            cleanup_rmdir_home,
+            "vendor.third",
+            THIRD_SUBJECT,
+            "payload-rmdir",
+        )
+        rmdir_read = cli(cleanup_rmdir_home, "image", "list")
+        rmdir_retry = cli(
+            cleanup_rmdir_home,
+            "image",
+            "add",
+            "vendor.third",
+            THIRD_SUBJECT,
+        )
+        check(
+            "CAT-CRASH-011",
+            committed_child == 99
+            and unlink_child == 99
+            and unlink_read.returncode == 0
+            and [item.get("name") for item in json.loads(unlink_read.stdout)]
+            == ["vendor.second", "vendor.worker"]
+            and unlink_retry.returncode == 0
+            and json.loads(unlink_retry.stdout).get("changed") is False
+            and not tuple((cleanup_unlink_home / "images" / ".staging").iterdir())
+            and orphan_child == 99
+            and rmdir_child == 99
+            and rmdir_read.returncode == 0
+            and [item.get("name") for item in json.loads(rmdir_read.stdout)]
+            == ["vendor.worker"]
+            and rmdir_retry.returncode == 0
+            and json.loads(rmdir_retry.stdout).get("changed") is True
+            and not tuple((cleanup_rmdir_home / "images" / ".staging").iterdir()),
+            "cleanup remains restartable across internal intent-unlink and payload-rmdir crashes",
+            (
+                f"committed={committed_child} unlink={unlink_child} "
+                f"unlink_read={unlink_read.returncode} unlink_retry={unlink_retry.returncode} "
+                f"orphan={orphan_child} rmdir={rmdir_child} "
+                f"rmdir_read={rmdir_read.returncode} rmdir_retry={rmdir_retry.returncode}"
+            ),
+        )
+
         platform_home = new_home(root, "platform-home")
         before = fingerprint(platform_home)
         original_platform = MODULE.sys.platform
@@ -1199,12 +1414,13 @@ def main() -> int:
         "CAT-CRASH-008",
         "CAT-CRASH-009",
         "CAT-CRASH-010",
+        "CAT-CRASH-011",
         "CAT-PLAT-001",
     ]
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=33 expected=33 failures={FAILURES} infra=0")
+    print(f"SUMMARY assertions=34 expected=34 failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
