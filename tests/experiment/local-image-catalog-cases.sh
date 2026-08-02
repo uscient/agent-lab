@@ -24,6 +24,7 @@ collect_descendants() {
   local children=""
   local children_file
   local child
+  local known
   local observed
   for children_file in /proc/"$parent_pid"/task/[0-9]*/children; do
     if [ ! -r "$children_file" ]; then
@@ -35,16 +36,16 @@ collect_descendants() {
       if [[ ! "$child" =~ ^[0-9]+$ ]]; then
         continue
       fi
+      known=0
       for observed in "${signal_descendants[@]}"; do
         if [ "$observed" = "$child" ]; then
-          child=""
+          known=1
           break
         fi
       done
-      if [ -z "$child" ]; then
-        continue
+      if [ "$known" -eq 0 ]; then
+        signal_descendants[${#signal_descendants[@]}]="$child"
       fi
-      signal_descendants[${#signal_descendants[@]}]="$child"
       collect_descendants "$child"
     done
   done
