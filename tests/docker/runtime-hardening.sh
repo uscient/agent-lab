@@ -136,5 +136,5 @@ mutation_rejected "extra-network sensitivity mutation is detected" \
 mutation_rejected "published-port sensitivity mutation is detected" \
   '.[0].HostConfig.PortBindings={"8080/tcp":[{"HostPort":"49152"}]}'
 
-printf 'SUMMARY failures=%s\n' "$failures"
+printf 'RUNTIME HARDENING SUMMARY failures=%s\n' "$failures"
 [ "$failures" -eq 0 ]

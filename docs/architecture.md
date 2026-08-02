@@ -67,20 +67,41 @@ capabilities their documented task requires.
 
 See [Development](development.md) and [development-agent configuration](agent-config.md).
 
-## Experiment request preflight
+## Experiment planning and installed evidence
 
-`scripts/experiment check [--] MANIFEST` validates the closed `agent-lab/v0alpha1` request with the
-repository-pinned CUE contract and emits one canonical, digest-bound `RequestedExperimentPlan`.
-`scripts/experiment authorize install [--] MANIFEST` reads the manifest once, derives that same plan
+`scripts/agent-lab experiment check` snapshots and validates one closed authored source from a sole
+local `experiment.cue`, a bounded sole-member ZIP, or an exact supported public GitHub commit. The
+repository-pinned CUE contract emits one canonical, digest-bound `RequestedExperimentPlan`.
+`scripts/agent-lab experiment authorize install` reads that snapshot once, derives the same plan
 in-process, and asks the repository-pinned Cedar policy whether the fixed local compatibility
 principal may submit the exact plan digest.
 
-Both commands are no-effect preflights: they make no container-engine, network, registration, or
-runtime changes. A requested name is correlation data, not an installed Experiment identity or
-scope. Start, stop, and remove authorization require a future Broker-minted Experiment identity and
-Broker-owned ledger, so they are deliberately outside this requested-plan seam. An install permit
-only clears the exact requested intent for a future Broker-controlled install path; it neither
-actuates the plan nor waives Agent Lab's containment envelope.
+For public Git, the fixed TLS-authenticated GitHub API binds the requested commit ID to its returned
+root-tree ID. The adapter requires the response to echo that commit and independently recomputes the
+returned tree and blob Git object IDs before the authored bytes enter the common planning path.
+
+The preview forms create no durable Agent Lab state; Git previews have only their bounded public
+acquisition effect. `experiment install` instead repeats snapshotting, planning, and Cedar
+evaluation, then stores the exact permitted evidence in the initialized home. Directory, ZIP, and
+Git sources carrying identical bytes converge on the same source, plan, authorization, installation,
+and artifact identities; only their closed transport provenance differs. No caller-supplied decision
+is accepted. For a local image name, install rechecks the selected entry under the shared catalog
+lock before taking the Experiment store lock exclusively; both remain held through durable
+no-replace publication. Direct and bundled selectors do not open local catalog state.
+
+The installed envelope contains the exact artifact plus closed plan, decision, provenance, and
+receipt records. Its installation key binds source, domain-separated plan, contract, authorization,
+and selected-entry identities. The receipt binds the artifact and every other evidence record; its
+returned receipt digest binds the receipt itself. An exact retry verifies the envelope and returns
+the same identity; a different identity under the same requested name never overwrites it.
+`experiment inspect NAME` takes the store lock shared and verifies the complete envelope without
+repairing staging.
+
+Installation is persistent onboarding evidence only. It makes no container-engine, network,
+registration, image-acquisition, admission, or runtime change and does not waive the containment
+envelope. The requested name identifies this stored envelope, not a running Broker identity or
+runtime scope. Experiment start, stop, and runtime removal remain future Broker operations; stored
+artifact uninstall is also not implemented.
 
 ## Workload launch sequence
 
@@ -236,7 +257,7 @@ For formal assumptions and limits, read [Security](../SECURITY.md) and the
 | Squid and test service | `compose.egress.yaml`, `gateway/squid/` |
 | workload container | `compose.agent.yaml` and HOME overlays |
 | workload orchestration | `scripts/agent` |
-| Experiment request planning and authorization | `scripts/experiment`, `contracts/experiment/`, `authorization/experiment/` |
+| Experiment installed evidence | `scripts/agent-lab`, `scripts/experiment.py`, `scripts/experiment_store.py`, contracts, and authorization policy |
 | config parsing and validation | `scripts/lib/config.sh` |
 | project and secret guards | `scripts/lib/guard.sh` |
 | recipe publication | `scripts/lib/allowlist.sh` |

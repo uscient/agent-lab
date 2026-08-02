@@ -121,6 +121,10 @@ The three local gate entry points corresponding to the required-gates workers ar
 ./scripts/dev/docker-gate
 ```
 
+For agent-managed single- or multi-slice delivery, use the workstream workflow in
+[`docs/workstreams.md`](workstreams.md). It preserves per-slice PR and commit evidence while keeping
+the final merge into `dev` human-owned.
+
 | Gate | What it establishes | Important prerequisites |
 |---|---|---|
 | fast | pinned CUE and Cedar provisioning, changed-file guard, shell lint, unit/security contracts, adapter consistency | Network access on first CUE or Cedar provision, Bash toolchain, Python 3.11+, and every tool in `tests/security/fast.manifest`, including `shellcheck` and `jq` |
@@ -169,13 +173,23 @@ infrastructure errors. Preserved evidence is diagnostic: it is not immutable or 
 guarantee after the runner exits, and platforms that reject directory `fsync` rely on file `fsync`
 plus exact readback. Cancellation during persistence may leave a prefix of those diagnostic files.
 
+Fast suites have a 120-second execution deadline and a shared 600-second subprocess-phase deadline;
+Docker suites use 900 and 1800 seconds respectively. The phase clock begins before preflight.
+Docker preflight commands have a 30-second deadline. Expiry is infrastructure failure (`125`),
+stops new launches, and cleans complete registered process groups with the same bounded escalation
+used for cancellation. Fast mode continues completing and queued siblings after an individual suite
+timeout; Docker mode launches no later suite because process cleanup cannot establish that external
+Docker resources were removed. These fixed production limits are not suite-configurable.
+
+A zero-exit suite passes only when its declared marker appears exactly once as the final non-empty
+output line. An early, repeated, prefixed, suffixed, or post-cleanup marker is a failure.
+
 During suite execution, cancellation by `HUP`, `INT`, `QUIT`, or `TERM` emits no partial transcript,
 sends `TERM` to every registered process group, and returns `128 + signal`. Cooperative cleanup gets
 three seconds in the fast gate and 15 seconds in the Docker gate before escalation to `KILL`; an
 active Docker preflight command gets one second. Output remains monitored during cleanup. During
 final transcript replay, already-buffered output is streamed, so cancellation can leave a transcript
-prefix even though the signal status and diagnostic remain exact. There is no automatic per-suite
-deadline; a silent hung suite requires cancellation. Direct `KILL` of the runner, descendants that
+prefix even though the signal status and diagnostic remain exact. Direct `KILL` of the runner, descendants that
 escape the registered session or process group, privileged process-control authority, and processes
 the kernel cannot promptly terminate are outside the cleanup guarantee.
 

@@ -22,10 +22,10 @@ contractDigest: string & =~"^sha256:[0-9a-f]{64}$" @tag(contractDigest)
 			y:    _
 			less: x.name < y.name
 		}) {
-			name:          member.name
-			image:         member.image
-			command:       member.command
-			resourceClass: member.resourceClass
+			name:              member.name
+			requestedSelector: member.image
+			command:           member.command
+			resourceClass:     member.resourceClass
 		}]
 	})
 })

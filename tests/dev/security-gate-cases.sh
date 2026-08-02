@@ -213,38 +213,41 @@ fi
 
 expected_suites="$work/expected-fast-suites"
 cat > "$expected_suites" <<'EOF'
-lint scripts/dev/lint-scripts
-cue-tool-contract tests/dev/cue-tool-cases.sh
-cedar-tool-contract tests/dev/cedar-tool-cases.sh
-gate-contract tests/dev/security-gate-cases.sh
-gate-concurrency tests/dev/security-gate-concurrency-cases.sh
-ci-workflow-contract tests/dev/ci-workflow-cases.sh
-required-gates-contract tests/dev/required-gates-cases.sh
-guard-diff tests/dev/guard-diff-cases.sh
-workflow-metadata tests/dev/workflow-check-cases.sh
-coordination tests/dev/coord-cases.sh
-docker-harness-contract tests/dev/docker-harness-cases.sh
-guard-command tests/guard/pretooluse-cases.sh
-guard-mount tests/guard/cases.sh
-config-authority tests/agent/config-guard.sh
-experiment-contract tests/experiment/contract-cases.sh
-experiment-authorization tests/experiment/authorization-cases.sh
-config-matrix tests/agent/config-matrix.sh
-allowlist-schema tests/agent/allowlist-cases.sh
-image-volume-policy tests/agent/image-volume-policy-cases.sh
-runtime-inspector tests/agent/runtime-inspector-cases.sh
-secret-parser tests/agent/entrypoint-secret-cases.sh
-doctor-secret-scan tests/agent/doctor-secret-scan-cases.sh
-egress-policy-transition tests/egress/policy-transition-cases.sh
-dns-contract-unit tests/egress/dns-contract-cases.sh
-wrapper-context tests/wrap-image/context-cases.sh
-adapter-idempotence tests/agent/render-adapters-idempotence.sh
-serena-config tests/serena/config-cases.sh
-policy-probe tests/agent/policy-verify.sh
-containment-static tools/containment-lint.sh
+lint scripts/dev/lint-scripts PASS lint-scripts
+cue-tool-contract tests/dev/cue-tool-cases.sh SUMMARY failures=0
+cedar-tool-contract tests/dev/cedar-tool-cases.sh SUMMARY failures=0
+gate-contract tests/dev/security-gate-cases.sh SUMMARY failures=0
+workstream-contract tests/dev/workstream-cases.sh SUMMARY failures=0
+gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY failures=0
+ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
+required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
+guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
+workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=114 fail=0
+coordination tests/dev/coord-cases.sh SUMMARY assertions=58 expected=58 failures=0
+docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0
+guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
+guard-mount tests/guard/cases.sh SUMMARY failures=0
+config-authority tests/agent/config-guard.sh SUMMARY failures=0
+experiment-contract tests/experiment/contract-cases.sh EXPERIMENT CONTRACT PASS
+experiment-authorization tests/experiment/authorization-cases.sh EXPERIMENT AUTHORIZATION PASS
+experiment-local-lifecycle tests/experiment/local-lifecycle-cases.sh EXPERIMENT LOCAL LIFECYCLE PASS
+experiment-source-adapters tests/experiment/source-adapter-cases.sh EXPERIMENT SOURCE ADAPTERS PASS
+config-matrix tests/agent/config-matrix.sh SUMMARY failures=0
+allowlist-schema tests/agent/allowlist-cases.sh SUMMARY failures=0
+image-volume-policy tests/agent/image-volume-policy-cases.sh SUMMARY failures=0
+runtime-inspector tests/agent/runtime-inspector-cases.sh SUMMARY failures=0
+secret-parser tests/agent/entrypoint-secret-cases.sh SUMMARY failures=0
+doctor-secret-scan tests/agent/doctor-secret-scan-cases.sh SUMMARY failures=0
+egress-policy-transition tests/egress/policy-transition-cases.sh SUMMARY failures=0
+dns-contract-unit tests/egress/dns-contract-cases.sh SUMMARY failures=0
+wrapper-context tests/wrap-image/context-cases.sh SUMMARY failures=0
+adapter-idempotence tests/agent/render-adapters-idempotence.sh PASS generated adapters match tracked files and are idempotent
+serena-config tests/serena/config-cases.sh SUMMARY failures=0
+policy-probe tests/agent/policy-verify.sh SUMMARY pass=46 fail=0 skip=0
+containment-static tools/containment-lint.sh containment-lint: 0 fail, 0 warn
 EOF
 actual_suites="$work/actual-fast-suites"
-awk '$1 == "suite" { print $2, $3 }' "$default_manifest" > "$actual_suites"
+awk '$1 == "suite" { $1 = ""; sub(/^ /, ""); print }' "$default_manifest" > "$actual_suites"
 if cmp -s "$expected_suites" "$actual_suites"; then
   pass "default manifest has the exact required suite contract"
 else
@@ -361,6 +364,20 @@ tool bash
 suite fixture-empty $work/empty.sh PASS fixture
 EOF
 expect_rc 1 "empty zero-exit suite blocks the gate" "$work/empty.manifest" "missing completion marker"
+
+for marker_case in duplicate nonfinal prefixed suffixed; do
+  case "$marker_case" in
+    duplicate) marker_output=$'DONE exact\nDONE exact' ;;
+    nonfinal) marker_output=$'DONE exact\nafter cleanup' ;;
+    prefixed) marker_output='prefix DONE exact' ;;
+    suffixed) marker_output='DONE exact suffix' ;;
+  esac
+  write_script "$work/marker-$marker_case.sh" "$marker_output" 0
+  printf 'suite marker-%s %s DONE exact\n' \
+    "$marker_case" "$work/marker-$marker_case.sh" > "$work/marker-$marker_case.manifest"
+  expect_rc 1 "CI-005 rejects $marker_case completion markers" \
+    "$work/marker-$marker_case.manifest" "invalid completion marker"
+done
 
 cat > "$work/missing-tool.manifest" <<EOF
 tool agent_lab_missing_tool_for_test

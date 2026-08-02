@@ -175,5 +175,5 @@ mount_probe_container=""
 
 COMPOSE_PROJECT_NAME="$project_name" "$repo_root/scripts/dev/serena-smoke"
 
-printf 'SUMMARY failures=%s\n' "$failures"
+printf 'SERENA RUNTIME SUMMARY failures=%s\n' "$failures"
 [ "$failures" -eq 0 ]
