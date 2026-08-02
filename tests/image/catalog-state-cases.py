@@ -140,7 +140,7 @@ def add(home: Path, name: str = "vendor.worker", subject: str = SUBJECT) -> dict
     return value
 
 
-def matrix_home(root: Path, name: str) -> tuple[Path, str | None]:
+def matrix_home(root: Path, name: str) -> Path:
     home = root / name
     output = io.StringIO()
     errors = io.StringIO()
@@ -149,28 +149,29 @@ def matrix_home(root: Path, name: str) -> tuple[Path, str | None]:
     try:
         with redirect_stdout(output), redirect_stderr(errors):
             returncode = MODULE.main(["--home", str(home), "init"])
-    except BaseException as caught:  # Setup faults must remain matrix failures.
+    except BaseException as caught:  # Setup uncertainty must remain infrastructure.
         error = caught
     if returncode != 0 or error is not None or errors.getvalue():
-        return home, (
+        detail = (
             f"init={returncode}:error={type(error).__name__ if error else 'none'}:"
             f"stderr={errors.getvalue()!r}"
         )
-    return home, None
+        raise MatrixInfrastructure(detail) from error
+    return home
 
 
-def matrix_add(home: Path, name: str, subject: str) -> str | None:
+def matrix_add(home: Path, name: str, subject: str) -> None:
     returncode, output, errors, error = module_image(home, "add", name, subject)
     try:
         value = json.loads(output) if returncode == 0 and error is None else None
     except json.JSONDecodeError:
         value = None
     if errors or not isinstance(value, dict) or value.get("changed") is not True:
-        return (
+        detail = (
             f"add={returncode}:error={type(error).__name__ if error else 'none'}:"
             f"stderr={errors!r}:value={value!r}"
         )
-    return None
+        raise MatrixInfrastructure(detail) from error
 
 
 def current_snapshot(home: Path) -> tuple[Path, dict[str, object], str]:
@@ -1328,10 +1329,7 @@ def main() -> int:
         matrix_oracle_home: Path | None = None
         matrix_cli_start = CLI_CALLS
         for index, point in enumerate(bootstrap_points):
-            home, setup_error = matrix_home(root, f"bootstrap-crash-{index:02d}")
-            if setup_error is not None:
-                matrix_failures.append(f"bootstrap:{point}:setup:{setup_error}")
-                continue
+            home = matrix_home(root, f"bootstrap-crash-{index:02d}")
             child_rc = hard_exit_add(home, "vendor.worker", SUBJECT, point)
             before_retry = cli(home, "image", "list")
             retry = cli(home, "image", "add", "vendor.worker", SUBJECT)
@@ -1359,12 +1357,8 @@ def main() -> int:
                     f"retry={retry.returncode}:final={final_names!r}"
                 )
         for index, point in enumerate(later_points):
-            home, setup_error = matrix_home(root, f"later-crash-{index:02d}")
-            if setup_error is None:
-                setup_error = matrix_add(home, "vendor.worker", SUBJECT)
-            if setup_error is not None:
-                matrix_failures.append(f"later:{point}:setup:{setup_error}")
-                continue
+            home = matrix_home(root, f"later-crash-{index:02d}")
+            matrix_add(home, "vendor.worker", SUBJECT)
             child_rc = hard_exit_add(home, "vendor.second", OTHER_SUBJECT, point)
             before_retry = cli(home, "image", "list")
             retry = cli(home, "image", "add", "vendor.second", OTHER_SUBJECT)
