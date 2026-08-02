@@ -505,8 +505,14 @@ def bounded_public(
 def instrument_preflight(runtime: Path) -> None:
     path = runtime / "scripts" / "agent-lab.py"
     source = path.read_text(encoding="utf-8")
-    old = "    try:\n        raw = config_path.read_bytes()\n"
+    old = (
+        "    if not home_authority_metadata_safe(lexical):\n"
+        '        raise RuntimeError("home authority files are unsafe")\n'
+        "    flags = (\n"
+    )
     new = (
+        "    if not home_authority_metadata_safe(lexical):\n"
+        '        raise RuntimeError("home authority files are unsafe")\n'
         '    integrity_ready = os.environ.get("AGENT_LAB_IIN_PREFLIGHT_READY")\n'
         '    if integrity_ready is not None:\n'
         '        Path(integrity_ready).touch()\n'
@@ -519,8 +525,7 @@ def instrument_preflight(runtime: Path) -> None:
         '            __import__("time").sleep(0.005)\n'
         '        if not integrity_release.exists():\n'
         '            raise RuntimeError("integrity preflight release is unavailable")\n'
-        '    try:\n'
-        '        raw = config_path.read_bytes()\n'
+        "    flags = (\n"
     )
     if source.count(old) != 1:
         raise IntegrityInfrastructure("public preflight instrumentation is not exactly applicable")
