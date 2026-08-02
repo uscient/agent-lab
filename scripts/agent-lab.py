@@ -508,10 +508,19 @@ def image_command(home: Path, argv: list[str]) -> int:
 def experiment_command(home: Path, argv: list[str]) -> int:
     if argv[:1] == ["install"] and len(argv) == 2:
         operation = "install"
+        source_kind = "directory"
+    elif argv[:2] == ["install", "--zip"] and len(argv) == 3:
+        operation = "install"
+        source_kind = "zip"
     elif argv[:1] == ["inspect"] and len(argv) == 2:
         operation = "inspect"
+        source_kind = None
     else:
         return 2
+
+    if operation == "install" and sys.platform != "linux":
+        print("INFRA Agent Lab Experiment installation requires Linux", file=sys.stderr)
+        return 125
 
     try:
         loaded = load_config_receipt(home)
@@ -521,10 +530,6 @@ def experiment_command(home: Path, argv: list[str]) -> int:
     if loaded is None:
         print("FAIL Agent Lab home is not initialized", file=sys.stderr)
         return 1
-
-    if operation == "install" and sys.platform != "linux":
-        print("INFRA Agent Lab Experiment installation requires Linux", file=sys.stderr)
-        return 125
 
     paths = loaded[0]["paths"]
     assert isinstance(paths, dict)
@@ -541,7 +546,10 @@ def experiment_command(home: Path, argv: list[str]) -> int:
 
     try:
         if operation == "install":
-            result = store.install_directory(home, Path(argv[1]))
+            if source_kind == "zip":
+                result = store.install_zip(home, Path(argv[2]))
+            else:
+                result = store.install_directory(home, Path(argv[1]))
         else:
             result = store.inspect_install(home, argv[1])
         if not isinstance(result, dict):
@@ -637,6 +645,11 @@ def main(argv: list[str]) -> int:
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
         os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(home / "cache/tools/cedar"))
         return experiment_module().main(["experiment.py", "authorize-directory", argv[3]])
+    if argv[:4] == ["experiment", "authorize", "install", "--zip"] and len(argv) == 5:
+        os.environ["AGENT_LAB_HOME"] = str(home)
+        os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
+        os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(home / "cache/tools/cedar"))
+        return experiment_module().main(["experiment.py", "authorize-zip", argv[4]])
     if argv[:1] == ["experiment"] and argv[1:2] in (["install"], ["inspect"]):
         return experiment_command(home, argv[1:])
     if argv[:1] == ["image"]:
