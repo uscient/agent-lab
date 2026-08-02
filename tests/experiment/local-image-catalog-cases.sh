@@ -22,26 +22,31 @@ cleanup_work() {
 collect_descendants() {
   local parent_pid="$1"
   local children=""
+  local children_file
   local child
   local observed
-  if [ -r "/proc/$parent_pid/task/$parent_pid/children" ]; then
-    IFS= read -r children < "/proc/$parent_pid/task/$parent_pid/children" || true
-  fi
-  for child in $children; do
-    if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+  for children_file in /proc/"$parent_pid"/task/[0-9]*/children; do
+    if [ ! -r "$children_file" ]; then
       continue
     fi
-    for observed in "${signal_descendants[@]}"; do
-      if [ "$observed" = "$child" ]; then
-        child=""
-        break
+    children=""
+    IFS= read -r children < "$children_file" || true
+    for child in $children; do
+      if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+        continue
       fi
+      for observed in "${signal_descendants[@]}"; do
+        if [ "$observed" = "$child" ]; then
+          child=""
+          break
+        fi
+      done
+      if [ -z "$child" ]; then
+        continue
+      fi
+      signal_descendants[${#signal_descendants[@]}]="$child"
+      collect_descendants "$child"
     done
-    if [ -z "$child" ]; then
-      continue
-    fi
-    signal_descendants[${#signal_descendants[@]}]="$child"
-    collect_descendants "$child"
   done
 }
 
