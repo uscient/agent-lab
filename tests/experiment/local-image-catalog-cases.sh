@@ -64,6 +64,20 @@ else
   fail CAT-004 "exact CAS removal publishes a generation-two tombstone"
 fi
 
+capture "$agent_lab" --home "$home" image remove vendor.worker --expect "$entry"
+if [ "$RC" -eq 0 ] && jq -e '.changed == false and .generation == 2' "$work/out" >/dev/null 2>&1; then
+  pass CAT-007 "lost-response removal retry is idempotent with the original token"
+else
+  fail CAT-007 "lost-response removal retry is idempotent with the original token"
+fi
+
+capture "$agent_lab" --home "$home" image add vendor.worker "$subject"
+if [ "$RC" -eq 1 ] && [ ! -s "$work/out" ]; then
+  pass CAT-008 "a tombstoned v0 name cannot be reused"
+else
+  fail CAT-008 "a tombstoned v0 name cannot be reused"
+fi
+
 capture "$agent_lab" --home "$home" image add agent-lab.worker "$subject"
 if [ "$RC" -eq 1 ] && [ ! -s "$work/out" ]; then
   pass CAT-005 "release-owned names cannot be claimed locally"
@@ -78,5 +92,13 @@ else
   fail CAT-006 "list all reports the immutable tombstone"
 fi
 
-printf 'SUMMARY assertions=7 expected=7 failures=%s infra=0\n' "$failures"
+printf '{"snapshotDigest":"sha256:%064d"}\n' 0 > "$home/images/catalog/current.json"
+capture "$agent_lab" --home "$home" image list
+if [ "$RC" -eq 125 ] && [ ! -s "$work/out" ]; then
+  pass CAT-009 "corrupt catalog authority is infrastructure uncertainty, never empty"
+else
+  fail CAT-009 "corrupt catalog authority is infrastructure uncertainty, never empty"
+fi
+
+printf 'SUMMARY assertions=10 expected=10 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
