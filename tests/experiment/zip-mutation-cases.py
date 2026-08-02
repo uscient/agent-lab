@@ -249,7 +249,7 @@ def main() -> int:
                 "ZIP-TYPE",
                 (
                     "    if (\n"
-                    "        create_system not in (0, 3)\n"
+                    "        create_system not in (0, 3, 10, 14)\n"
                     "        or dos_attributes & 0x18\n"
                     "        or (create_system == 3 and unix_type not in (0, stat.S_IFREG))\n"
                     "    ):\n"
@@ -371,7 +371,10 @@ def main() -> int:
         results.append(
             (
                 "M-ZIP-EXTRACT-001",
-                marker.is_file() and (extraction / "experiment.cue").is_file(),
+                marker.is_file()
+                and (extraction / "experiment.cue").is_file()
+                and sha256(production.read_bytes()).hexdigest()
+                == sha256(original.encode("utf-8")).hexdigest(),
                 "caller-destination extraction mutation is observable",
             )
         )
@@ -409,7 +412,10 @@ def main() -> int:
         results.append(
             (
                 "M-ZIP-IDENTITY-001",
-                marker.is_file() and directory.digest != zipped.digest,
+                marker.is_file()
+                and directory.digest != zipped.digest
+                and sha256(production.read_bytes()).hexdigest()
+                == sha256(original.encode("utf-8")).hexdigest(),
                 "archive-identity mutation breaks the cross-transport oracle",
             )
         )
