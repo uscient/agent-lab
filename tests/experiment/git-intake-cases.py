@@ -1487,7 +1487,9 @@ def main() -> int:
                         experiment._github_api_request = original_worker_requester
 
                 terminate_wait_options: list[int] = []
+                terminate_observe_options: list[int] = []
                 original_waitpid = experiment.os.waitpid
+                original_waitid = experiment.os.waitid
                 original_killpg = experiment.os.killpg
                 original_group_alive = experiment._git_worker_group_alive
                 original_monotonic = experiment.time.monotonic
@@ -1504,7 +1506,14 @@ def main() -> int:
                         raise OSError("blocking wait forbidden by fixture")
                     return 0, 0
 
+                def terminate_waitid(_idtype, _identifier, options):
+                    terminate_observe_options.append(options)
+                    if not options & os.WNOHANG or not options & os.WNOWAIT:
+                        raise OSError("consuming or blocking observation forbidden by fixture")
+                    return None
+
                 experiment.os.waitpid = terminate_waitpid
+                experiment.os.waitid = terminate_waitid
                 experiment.os.killpg = lambda _pid, _signal: None
                 experiment._git_worker_group_alive = lambda _pid: True
                 experiment.time.monotonic = terminate_monotonic
@@ -1515,13 +1524,18 @@ def main() -> int:
                     )
                 finally:
                     experiment.os.waitpid = original_waitpid
+                    experiment.os.waitid = original_waitid
                     experiment.os.killpg = original_killpg
                     experiment._git_worker_group_alive = original_group_alive
                     experiment.time.monotonic = original_monotonic
                     experiment.time.sleep = original_sleep
                 nonblocking_terminate = (
                     terminate_result is False
-                    and terminate_wait_options
+                    and terminate_observe_options
+                    and all(
+                        option & os.WNOHANG and option & os.WNOWAIT
+                        for option in terminate_observe_options
+                    )
                     and all(
                         option == os.WNOHANG for option in terminate_wait_options
                     )
@@ -1720,10 +1734,6 @@ def main() -> int:
                         and event[2] == transition_pid
                         and event[3] & os.WNOWAIT
                         for event in transition_waitid_events
-                    )
-                    and any(
-                        event[0] == "group-probe"
-                        for event in transition_events[:transition_first_reap]
                     )
                 )
 
