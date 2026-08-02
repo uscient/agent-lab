@@ -9,6 +9,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 from pathlib import Path
@@ -25,18 +26,12 @@ INTENT_API = "agent-lab.local-image-intent/v0alpha1"
 ENTRY_DOMAIN = b"agent-lab.local-image-entry.v1\0"
 SNAPSHOT_DOMAIN = b"agent-lab.local-image-snapshot.v1\0"
 OPERATION_WRAPPER = "image-catalog-operation"
-LOCK_MARKER = b"catalog:v0alpha1\n"
+CLEANUP_WRAPPER = "image-catalog-cleanup"
+LOCK_PRISTINE = b"agent-lab.image-catalog-lock/v0alpha1\n"
+LOCK_INITIALIZED = LOCK_PRISTINE + b"initialized\n"
+LOCK_SCHEMA = "agent-lab.image-catalog-lock/v0alpha1"
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
-IMAGE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
-OCI_SUBJECT = re.compile(
-    r"^([a-z0-9]+([.-][a-z0-9]+)*"
-    r"(:(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|"
-    r"65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/)?"
-    r"[a-z0-9]+([._-][a-z0-9]+)*"
-    r"(/[a-z0-9]+([._-][a-z0-9]+)*)*"
-    r"@sha256:[0-9a-f]{64}$"
-)
 HEX_FILE = re.compile(r"^[0-9a-f]{64}\.json$")
 FaultHook = Callable[[str], None]
 
@@ -77,6 +72,8 @@ class HomeAuthority:
     state: Path
     locks: Path
     lock: Path
+    lock_device: int
+    lock_inode: int
 
 
 @dataclass(frozen=True)
@@ -88,6 +85,8 @@ class CatalogState:
     records: dict[str, dict[str, object]]
     entries: dict[str, dict[str, object]]
     snapshots: dict[str, dict[str, object]]
+    physical_names: frozenset[str]
+    generations: dict[tuple[str, int], str]
     physical_bytes: int
 
 
@@ -111,28 +110,20 @@ def record_digest(domain: bytes, value: object) -> str:
     return "sha256:" + hashlib.sha256(domain + canonical(value)).hexdigest()
 
 
-def image_name(value: object) -> bool:
-    if not isinstance(value, str) or not value.isascii():
-        return False
-    encoded = value.encode("ascii")
-    parts = value.split(".")
-    return (
-        len(encoded) <= 63
-        and len(parts) == 2
-        and all(1 <= len(part.encode("ascii")) <= 31 for part in parts)
-        and all(IMAGE_COMPONENT.fullmatch(part) is not None for part in parts)
-    )
+def _image_reference_module():
+    path = Path(__file__).resolve().with_name("image_reference.py")
+    spec = spec_from_file_location("agent_lab_catalog_image_reference", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("shared image-reference grammar cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def oci_subject(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and value.isascii()
-        and 1 <= len(value.encode("ascii")) <= 255
-        and OCI_SUBJECT.fullmatch(value) is not None
-    )
-
-
+_IMAGE_REFERENCE = _image_reference_module()
+image_name = _IMAGE_REFERENCE.valid_image_name
+oci_subject = _IMAGE_REFERENCE.valid_oci_subject
 valid_image_name = image_name
 valid_oci_subject = oci_subject
 
@@ -294,7 +285,7 @@ def _pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def _canonical_json(data: bytes, purpose: str) -> dict[str, object]:
     try:
         value = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs)
-    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+    except (RecursionError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         _infra(f"{purpose} is malformed", error)
     if not isinstance(value, dict) or data != canonical(value) + b"\n":
         _infra(f"{purpose} is not one canonical closed object")
@@ -321,11 +312,14 @@ def _load_home(home: Path) -> HomeAuthority:
     ):
         _infra("Agent Lab configuration paths are unsafe")
     digest = "sha256:" + hashlib.sha256(canonical(config)).hexdigest()
+    lock_records = receipt.get("locks")
     if (
-        set(receipt) != {"apiVersion", "configDigest", "paths"}
+        set(receipt) != {"apiVersion", "configDigest", "locks", "paths"}
         or receipt.get("apiVersion") != "agent-lab.home/v0alpha1"
         or receipt.get("configDigest") != digest
         or receipt.get("paths") != paths
+        or not isinstance(lock_records, dict)
+        or set(lock_records) != {"experiments", "imageCatalog"}
     ):
         _infra("Agent Lab configuration does not match its home receipt")
     images = home / str(paths["images"])
@@ -335,7 +329,38 @@ def _load_home(home: Path) -> HomeAuthority:
     for path in (images, state, staging, locks):
         _verify_directory(path)
     lock = locks / "image-catalog.lock"
-    return HomeAuthority(home, images, staging, state, locks, lock)
+    lock_record = lock_records.get("imageCatalog")
+    expected_lock_path = f"{paths['state']}/locks/image-catalog.lock"
+    if (
+        not isinstance(lock_record, dict)
+        or set(lock_record) != {"device", "inode", "path", "schema"}
+        or lock_record.get("path") != expected_lock_path
+        or lock_record.get("schema") != LOCK_SCHEMA
+        or not isinstance(lock_record.get("device"), int)
+        or isinstance(lock_record.get("device"), bool)
+        or not isinstance(lock_record.get("inode"), int)
+        or isinstance(lock_record.get("inode"), bool)
+    ):
+        _infra("catalog lock authority is absent from the home receipt")
+    try:
+        lock_metadata = lock.lstat()
+    except OSError as error:
+        _infra("catalog lock is unavailable", error)
+    if (
+        lock_metadata.st_dev != lock_record["device"]
+        or lock_metadata.st_ino != lock_record["inode"]
+    ):
+        _infra("catalog lock identity does not match the home receipt")
+    return HomeAuthority(
+        home,
+        images,
+        staging,
+        state,
+        locks,
+        lock,
+        int(lock_record["device"]),
+        int(lock_record["inode"]),
+    )
 
 
 @contextmanager
@@ -351,21 +376,48 @@ def _catalog_lock(authority: HomeAuthority, *, exclusive: bool) -> Iterator[int]
         or lexical.st_uid != os.getuid()
         or stat.S_IMODE(lexical.st_mode) != 0o600
         or lexical.st_nlink != 1
-        or lexical.st_size > len(LOCK_MARKER)
+        or lexical.st_size > len(LOCK_INITIALIZED)
+        or (lexical.st_dev, lexical.st_ino)
+        != (authority.lock_device, authority.lock_inode)
     ):
         _infra("catalog lock metadata is unsafe")
     try:
         descriptor = os.open(
             path,
-            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         opened = os.fstat(descriptor)
-        if _file_identity(opened) != _file_identity(lexical):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or opened.st_size > len(LOCK_INITIALIZED)
+            or (opened.st_dev, opened.st_ino)
+            != (authority.lock_device, authority.lock_inode)
+        ):
             raise OSError("lock identity changed")
         fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         current = path.lstat()
         held = os.fstat(descriptor)
-        if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+        expected_identity = (authority.lock_device, authority.lock_inode)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_nlink != 1
+            or current.st_size > len(LOCK_INITIALIZED)
+            or not stat.S_ISREG(held.st_mode)
+            or held.st_uid != os.getuid()
+            or stat.S_IMODE(held.st_mode) != 0o600
+            or held.st_nlink != 1
+            or held.st_size > len(LOCK_INITIALIZED)
+            or (held.st_dev, held.st_ino) != expected_identity
+            or (current.st_dev, current.st_ino) != expected_identity
+        ):
             raise OSError("lock path was replaced")
     except OSError as error:
         try:
@@ -386,24 +438,33 @@ def _catalog_lock(authority: HomeAuthority, *, exclusive: bool) -> Iterator[int]
 def _lock_bytes(descriptor: int) -> bytes:
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
-        data = os.read(descriptor, len(LOCK_MARKER) + 1)
+        data = os.read(descriptor, len(LOCK_INITIALIZED) + 1)
         os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError as error:
         _infra("catalog lock marker cannot be read", error)
-    if data not in (b"", LOCK_MARKER):
+    if data not in (LOCK_PRISTINE, LOCK_INITIALIZED):
         _infra("catalog lock marker is malformed")
     return data
 
 
-def _set_lock_marker(descriptor: int) -> None:
+def _set_lock_marker(descriptor: int, fault: FaultHook | None = None) -> None:
+    current = _lock_bytes(descriptor)
     try:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        os.ftruncate(descriptor, 0)
-        _write_all(descriptor, LOCK_MARKER)
+        if current == LOCK_PRISTINE:
+            os.lseek(descriptor, 0, os.SEEK_END)
+            _fault(fault, "catalog marker.before_write")
+            written = os.write(descriptor, b"initialized\n")
+            if written != len(b"initialized\n"):
+                raise OSError("catalog marker write was partial")
+            _fault(fault, "catalog marker.after_write")
+        _fault(fault, "catalog marker.before_fsync")
         os.fsync(descriptor)
+        _fault(fault, "catalog marker.after_fsync")
         os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError as error:
         _infra("catalog initialization marker could not be persisted", error)
+    if _lock_bytes(descriptor) != LOCK_INITIALIZED:
+        _infra("catalog initialization marker could not be verified")
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -415,11 +476,17 @@ def _write_all(descriptor: int, data: bytes) -> None:
         view = view[written:]
 
 
-def _directory_names(path: Path, purpose: str) -> tuple[str, ...]:
+def _directory_names(path: Path, purpose: str, maximum: int) -> tuple[str, ...]:
     _verify_directory(path)
     try:
         before = path.lstat()
-        names = tuple(sorted(os.listdir(path), key=os.fsencode))
+        names_list: list[str] = []
+        with os.scandir(path) as entries:
+            for entry in entries:
+                names_list.append(entry.name)
+                if len(names_list) > maximum:
+                    _infra(f"{purpose} exceeds its fixed entry bound")
+        names = tuple(sorted(names_list, key=os.fsencode))
         after = path.lstat()
     except (OSError, UnicodeError) as error:
         _infra(f"{purpose} cannot be enumerated", error)
@@ -560,15 +627,103 @@ def _intent_schema(value: dict[str, object]) -> None:
         _infra("catalog staging intent values are invalid")
 
 
-def _stage_state(authority: HomeAuthority, limits: CatalogLimits) -> StageState | None:
-    names = _directory_names(authority.staging, "catalog staging root")
+def _cleanup_state(authority: HomeAuthority, limits: CatalogLimits) -> Path | None:
+    names = _directory_names(authority.staging, "catalog staging root", 1)
+    if not names or names == (OPERATION_WRAPPER,):
+        return None
+    if names != (CLEANUP_WRAPPER,):
+        _infra("catalog staging root contains an unknown wrapper")
+    cleanup = authority.staging / CLEANUP_WRAPPER
+    _verify_directory(cleanup)
+    entry_count = 0
+    byte_count = 0
+    pending = [cleanup]
+    while pending:
+        parent = pending.pop()
+        remaining = limits.stage_entries - entry_count
+        for name in _directory_names(parent, "catalog cleanup residue", remaining):
+            item = parent / name
+            relative = str(item.relative_to(cleanup))
+            parts = item.relative_to(cleanup).parts
+            directory_allowed = relative in {
+                "payload",
+                "payload/catalog",
+                "payload/catalog/entries",
+                "payload/catalog/snapshots",
+            }
+            file_allowed = relative in {
+                "intent.json",
+                "payload/catalog/current.json",
+                "payload/catalog/current.next",
+                "payload/entry.json",
+                "payload/snapshot.json",
+                "payload/current.json",
+                "payload/current.next",
+            }
+            if (
+                len(parts) == 4
+                and parts[:3] in {
+                    ("payload", "catalog", "entries"),
+                    ("payload", "catalog", "snapshots"),
+                }
+                and HEX_FILE.fullmatch(parts[3]) is not None
+            ):
+                file_allowed = True
+            if not directory_allowed and not file_allowed:
+                _infra("catalog cleanup residue contains an unknown entry")
+            try:
+                metadata = item.lstat()
+            except OSError as error:
+                _infra("catalog cleanup residue cannot be inspected", error)
+            entry_count += 1
+            if metadata.st_uid != os.getuid() or stat.S_ISLNK(metadata.st_mode):
+                _infra("catalog cleanup residue metadata is unsafe")
+            if stat.S_ISDIR(metadata.st_mode):
+                if not directory_allowed or stat.S_IMODE(metadata.st_mode) != 0o700:
+                    _infra("catalog cleanup residue directory mode is unsafe")
+                pending.append(item)
+            elif stat.S_ISREG(metadata.st_mode):
+                if (
+                    not file_allowed
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_nlink != 1
+                ):
+                    _infra("catalog cleanup residue file metadata is unsafe")
+                byte_count += metadata.st_size
+            else:
+                _infra("catalog cleanup residue type is unsafe")
+    if entry_count > limits.stage_entries or byte_count > limits.stage_bytes:
+        _infra("catalog cleanup residue exceeds its fixed bound")
+    intent_path = cleanup / "intent.json"
+    try:
+        intent_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        _infra("catalog cleanup intent cannot be inspected", error)
+    else:
+        intent = _canonical_json(
+            _read_file(intent_path, 65_536, "catalog cleanup intent"),
+            "catalog cleanup intent",
+        )
+        _intent_schema(intent)
+    return cleanup
+
+
+def _stage_state(
+    authority: HomeAuthority,
+    limits: CatalogLimits,
+) -> StageState | None:
+    if _cleanup_state(authority, limits) is not None:
+        return None
+    names = _directory_names(authority.staging, "catalog staging root", 1)
     if not names:
         return None
     if names != (OPERATION_WRAPPER,):
         _infra("catalog staging root contains an unknown wrapper")
     wrapper = authority.staging / OPERATION_WRAPPER
     _verify_directory(wrapper)
-    wrapper_names = _directory_names(wrapper, "catalog operation wrapper")
+    wrapper_names = _directory_names(wrapper, "catalog operation wrapper", 2)
     if "intent.json" not in wrapper_names or any(name not in {"intent.json", "payload"} for name in wrapper_names):
         _infra("catalog operation wrapper is incomplete or unknown")
     intent = _canonical_json(
@@ -594,27 +749,32 @@ def _stage_state(authority: HomeAuthority, limits: CatalogLimits) -> StageState 
             }
         else:
             allowed = {"entry.json", "snapshot.json", "current.json", "current.next"}
-        try:
-            descendants = sorted(payload.rglob("*"), key=lambda item: os.fsencode(str(item.relative_to(payload))))
-        except OSError as error:
-            _infra("catalog staging payload cannot be enumerated", error)
-        for item in descendants:
-            relative = str(item.relative_to(payload))
-            if relative not in allowed:
-                _infra("catalog staging payload contains an unknown entry")
-            metadata = item.lstat()
-            entry_count += 1
-            if metadata.st_uid != os.getuid() or stat.S_ISLNK(metadata.st_mode):
-                _infra("catalog staging payload metadata is unsafe")
-            if stat.S_ISDIR(metadata.st_mode):
-                if stat.S_IMODE(metadata.st_mode) != 0o700:
-                    _infra("catalog staging directory mode is unsafe")
-            elif stat.S_ISREG(metadata.st_mode):
-                if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
-                    _infra("catalog staging file metadata is unsafe")
-                byte_count += metadata.st_size
-            else:
-                _infra("catalog staging payload type is unsafe")
+        pending = [payload]
+        while pending:
+            parent = pending.pop()
+            remaining = limits.stage_entries - entry_count
+            for name in _directory_names(parent, "catalog staging payload", remaining):
+                item = parent / name
+                relative = str(item.relative_to(payload))
+                if relative not in allowed:
+                    _infra("catalog staging payload contains an unknown entry")
+                try:
+                    metadata = item.lstat()
+                except OSError as error:
+                    _infra("catalog staging payload cannot be inspected", error)
+                entry_count += 1
+                if metadata.st_uid != os.getuid() or stat.S_ISLNK(metadata.st_mode):
+                    _infra("catalog staging payload metadata is unsafe")
+                if stat.S_ISDIR(metadata.st_mode):
+                    if stat.S_IMODE(metadata.st_mode) != 0o700:
+                        _infra("catalog staging directory mode is unsafe")
+                    pending.append(item)
+                elif stat.S_ISREG(metadata.st_mode):
+                    if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
+                        _infra("catalog staging file metadata is unsafe")
+                    byte_count += metadata.st_size
+                else:
+                    _infra("catalog staging payload type is unsafe")
     if entry_count > limits.stage_entries or byte_count > limits.stage_bytes:
         _infra("catalog staging state exceeds its fixed bound")
     return StageState(wrapper, intent)
@@ -698,7 +858,7 @@ def _load_catalog(
 ) -> CatalogState:
     stage = _stage_state(authority, limits) if inspect_stage else None
     marker = _lock_bytes(lock_descriptor)
-    image_names = _directory_names(authority.images, "effective images directory")
+    image_names = _directory_names(authority.images, "effective images directory", 2)
     allowed_images = {".staging", "catalog"}
     if any(name not in allowed_images for name in image_names):
         _infra("effective images directory contains unknown catalog state")
@@ -706,23 +866,43 @@ def _load_catalog(
     try:
         root_metadata = root.lstat()
     except FileNotFoundError:
-        if marker == LOCK_MARKER:
+        if marker == LOCK_INITIALIZED and not (
+            stage is not None and bool(stage.intent.get("bootstrap"))
+        ):
             _infra("an initialized image catalog is missing")
         if stage is not None and not bool(stage.intent.get("bootstrap")):
             _infra("non-bootstrap catalog stage has no committed base")
-        return CatalogState(None, 0, None, None, {}, {}, {}, 0)
+        empty = CatalogState(
+            None,
+            0,
+            None,
+            None,
+            {},
+            {},
+            {},
+            frozenset(),
+            {},
+            0,
+        )
+        if stage is not None:
+            _verify_staged_candidate(stage, empty, limits)
+            if marker == LOCK_INITIALIZED:
+                _complete_bootstrap_stage(stage)
+        return empty
     except OSError as error:
         _infra("image catalog cannot be inspected", error)
     if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
         _infra("image catalog path is unsafe")
+    if marker != LOCK_INITIALIZED:
+        _infra("image catalog exists without durable initialization authority")
     _verify_directory(root)
-    root_names = _directory_names(root, "image catalog")
+    root_names = _directory_names(root, "image catalog", 3)
     if set(root_names) != {"current.json", "entries", "snapshots"}:
         _infra("image catalog layout is incomplete or unknown")
     entries_root = root / "entries"
     snapshots_root = root / "snapshots"
-    entry_names = _directory_names(entries_root, "image entry history")
-    snapshot_names = _directory_names(snapshots_root, "image snapshot history")
+    entry_names = _directory_names(entries_root, "image entry history", limits.entries)
+    snapshot_names = _directory_names(snapshots_root, "image snapshot history", limits.snapshots)
     if (
         len(entry_names) > limits.entries
         or len(snapshot_names) > limits.snapshots
@@ -753,6 +933,32 @@ def _load_catalog(
             _infra("local image entry filename does not bind its bytes")
         entries[digest] = value
 
+    generations: dict[tuple[str, int], str] = {}
+    physical_names: set[str] = set()
+    for entry_digest, entry in entries.items():
+        name = str(entry["name"])
+        generation = int(entry["generation"])
+        physical_names.add(name)
+        key = (name, generation)
+        existing = generations.get(key)
+        if existing is not None and existing != entry_digest:
+            _infra("local image history contains conflicting physical generations")
+        generations[key] = entry_digest
+    if len(physical_names) > limits.names:
+        _infra("physical local image history exceeds its fixed name bound")
+    for entry in entries.values():
+        if entry["state"] != "removed":
+            continue
+        predecessor = entries.get(str(entry["previousEntryDigest"]))
+        if (
+            predecessor is None
+            or predecessor["state"] != "active"
+            or predecessor["generation"] != 1
+            or predecessor["name"] != entry["name"]
+            or predecessor["subject"] != entry["subject"]
+        ):
+            _infra("unreachable local image tombstone history is invalid")
+
     snapshots: dict[str, dict[str, object]] = {}
     for name in snapshot_names:
         path = snapshots_root / name
@@ -765,6 +971,14 @@ def _load_catalog(
         if name != f"{digest[7:]}.json" or digest in snapshots:
             _infra("local image snapshot filename does not bind its bytes")
         snapshots[digest] = value
+
+    genesis = [
+        snapshot_digest
+        for snapshot_digest, snapshot in snapshots.items()
+        if snapshot["previousSnapshotDigest"] is None
+    ]
+    if len(genesis) != 1:
+        _infra("local image snapshot history does not have one physical genesis")
 
     for snapshot_digest, snapshot in snapshots.items():
         records = snapshot["records"]
@@ -815,12 +1029,12 @@ def _load_catalog(
         digest = str(projection["entryDigest"])
         records[name] = _public_record(entries[digest], digest)
     if (
-        entry_names != _directory_names(entries_root, "image entry history")
-        or snapshot_names != _directory_names(snapshots_root, "image snapshot history")
-        or root_names != _directory_names(root, "image catalog")
+        entry_names != _directory_names(entries_root, "image entry history", limits.entries)
+        or snapshot_names != _directory_names(snapshots_root, "image snapshot history", limits.snapshots)
+        or root_names != _directory_names(root, "image catalog", 3)
     ):
         _infra("image catalog changed during verification")
-    return CatalogState(
+    result = CatalogState(
         root,
         int(current["revision"]),
         current_digest,
@@ -828,8 +1042,13 @@ def _load_catalog(
         records,
         entries,
         snapshots,
+        frozenset(physical_names),
+        generations,
         physical_bytes,
     )
+    if stage is not None:
+        _verify_staged_candidate(stage, result, limits)
+    return result
 
 
 def _write_file(path: Path, data: bytes, purpose: str, fault: FaultHook | None = None) -> None:
@@ -911,7 +1130,7 @@ def _rename_noreplace(source: Path, target: Path) -> None:
         _infra("catalog no-replace publication failed", OSError(code, os.strerror(code)))
 
 
-def _remove_owned_tree(path: Path) -> None:
+def _remove_owned_tree(path: Path, fault: FaultHook | None = None) -> None:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -925,6 +1144,7 @@ def _remove_owned_tree(path: Path) -> None:
             _infra("catalog staging cleanup file is unsafe")
         try:
             path.unlink()
+            _fault(fault, "catalog staging cleanup.after_unlink")
         except OSError as error:
             _infra("catalog staging file could not be cleaned", error)
         return
@@ -934,20 +1154,50 @@ def _remove_owned_tree(path: Path) -> None:
         children = tuple(path.iterdir())
     except OSError as error:
         _infra("catalog staging cleanup cannot enumerate its target", error)
-    for child in sorted(children, key=lambda item: os.fsencode(item.name)):
-        _remove_owned_tree(child)
+    for child in sorted(
+        children,
+        key=lambda item: (item.name == "intent.json", os.fsencode(item.name)),
+    ):
+        _remove_owned_tree(child, fault)
     try:
         path.rmdir()
+        _fault(fault, "catalog staging cleanup.after_rmdir")
     except OSError as error:
         _infra("catalog staging directory could not be cleaned", error)
 
 
-def _cleanup_stage(authority: HomeAuthority, stage: StageState | None = None) -> None:
+def _cleanup_stage(
+    authority: HomeAuthority,
+    stage: StageState | None = None,
+    fault: FaultHook | None = None,
+) -> None:
     path = authority.staging / OPERATION_WRAPPER
+    cleanup = authority.staging / CLEANUP_WRAPPER
     if stage is not None and stage.path != path:
         _infra("catalog staging cleanup target changed")
-    _remove_owned_tree(path)
-    _fsync_directory(authority.staging, "catalog staging cleanup")
+    _fault(fault, "catalog staging cleanup.before_remove")
+    _fault(fault, "catalog staging cleanup handoff.before_rename")
+    try:
+        _rename_noreplace(path, cleanup)
+    except OSError as error:
+        _infra("catalog staging cleanup handoff is uncertain", error)
+    _fault(fault, "catalog staging cleanup handoff.after_rename")
+    _fsync_directory(authority.staging, "catalog staging cleanup handoff", fault)
+    _fault(fault, "catalog staging cleanup.after_remove")
+    _remove_owned_tree(cleanup, fault)
+    _fsync_directory(authority.staging, "catalog staging cleanup", fault)
+
+
+def _finish_cleanup(
+    authority: HomeAuthority,
+    cleanup: Path,
+    fault: FaultHook | None = None,
+) -> None:
+    expected = authority.staging / CLEANUP_WRAPPER
+    if cleanup != expected:
+        _infra("catalog cleanup residue target changed")
+    _remove_owned_tree(cleanup, fault)
+    _fsync_directory(authority.staging, "catalog staging cleanup", fault)
 
 
 def _read_current_digest(authority: HomeAuthority) -> str | None:
@@ -967,63 +1217,85 @@ def _read_current_digest(authority: HomeAuthority) -> str | None:
     return _current_schema(pointer)
 
 
-def _remove_uncommitted_record(path: Path, preexisting: bool) -> None:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        _infra("uncommitted catalog record cannot be inspected", error)
-    if preexisting:
-        return
+def _complete_bootstrap_stage(stage: StageState) -> Path:
+    intent = stage.intent
+    catalog = stage.path / "payload" / "catalog"
+    entry_name = f"{str(intent['candidateEntryDigest'])[7:]}.json"
+    snapshot_name = f"{str(intent['candidateSnapshotDigest'])[7:]}.json"
     if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_nlink != 1
+        _directory_names(stage.path / "payload", "catalog bootstrap payload", 1)
+        != ("catalog",)
+        or _directory_names(catalog, "catalog bootstrap candidate", 3)
+        != ("current.json", "entries", "snapshots")
+        or _directory_names(catalog / "entries", "catalog bootstrap entries", 1)
+        != (entry_name,)
+        or _directory_names(catalog / "snapshots", "catalog bootstrap snapshots", 1)
+        != (snapshot_name,)
     ):
-        _infra("uncommitted catalog record metadata is unsafe")
-    try:
-        path.unlink()
-    except OSError as error:
-        _infra("uncommitted catalog record could not be reconciled", error)
+        _infra("initialized bootstrap stage is incomplete")
+    return catalog
 
 
 def _reconcile(authority: HomeAuthority, lock_descriptor: int, limits: CatalogLimits) -> None:
+    cleanup = _cleanup_state(authority, limits)
+    if cleanup is not None:
+        _finish_cleanup(authority, cleanup)
+        return
     stage = _stage_state(authority, limits)
     if stage is None:
+        _fsync_directory(authority.staging, "catalog empty staging recovery")
         return
     intent = stage.intent
     candidate = str(intent["candidateSnapshotDigest"])
     base_value = intent["baseSnapshotDigest"]
     base = str(base_value) if base_value is not None else None
     current = _read_current_digest(authority)
+    if current not in (base, candidate):
+        _infra("catalog staged operation cannot be reconciled with current state")
+    if current is None:
+        state = CatalogState(
+            None,
+            0,
+            None,
+            None,
+            {},
+            {},
+            {},
+            frozenset(),
+            {},
+            0,
+        )
+    else:
+        state = _load_catalog(authority, lock_descriptor, limits, inspect_stage=False)
+    _verify_staged_candidate(stage, state, limits)
     if current == candidate:
-        _load_catalog(authority, lock_descriptor, limits, inspect_stage=False)
-        if _lock_bytes(lock_descriptor) == b"":
+        if bool(intent["bootstrap"]):
             _set_lock_marker(lock_descriptor)
+            _fsync_directory(authority.images, "catalog bootstrap recovery parent")
+        else:
+            if state.root is None:
+                _infra("committed catalog mutation has no final catalog")
+            _fsync_directory(state.root, "catalog current pointer recovery")
+        verified = _load_catalog(authority, lock_descriptor, limits, inspect_stage=False)
+        if verified.snapshot_digest != candidate:
+            _infra("committed catalog recovery could not be verified")
         _cleanup_stage(authority, stage)
         return
-    if current != base:
-        _infra("catalog staged operation cannot be reconciled with current state")
     if bool(intent["bootstrap"]):
         if current is not None:
             _infra("catalog bootstrap stage conflicts with a final catalog")
-    else:
-        root = authority.images / "catalog"
-        entries = root / "entries"
-        snapshots = root / "snapshots"
-        _remove_uncommitted_record(
-            entries / f"{str(intent['candidateEntryDigest'])[7:]}.json",
-            bool(intent["entryPreexisting"]),
-        )
-        _remove_uncommitted_record(
-            snapshots / f"{candidate[7:]}.json",
-            bool(intent["snapshotPreexisting"]),
-        )
-        _fsync_directory(entries, "catalog reconciled entry history")
-        _fsync_directory(snapshots, "catalog reconciled snapshot history")
+        if _lock_bytes(lock_descriptor) == LOCK_INITIALIZED:
+            _set_lock_marker(lock_descriptor)
+            catalog = _complete_bootstrap_stage(stage)
+            _rename_noreplace(catalog, authority.images / "catalog")
+            _fsync_directory(authority.images, "catalog bootstrap recovery parent")
+            verified = _load_catalog(authority, lock_descriptor, limits, inspect_stage=False)
+            if verified.snapshot_digest != candidate:
+                _infra("recovered catalog bootstrap could not be verified")
+            _cleanup_stage(authority, stage)
+            return
+    # Verified immutable orphans are safe and bounded. Retain them rather than
+    # treating caller-controlled intent flags as deletion authority.
     _cleanup_stage(authority, stage)
 
 
@@ -1064,6 +1336,12 @@ def _candidate_values(
             "subjectDigest": str(prior["subject"]).rsplit("@", 1)[1],
         }
     entry_digest = record_digest(ENTRY_DOMAIN, entry)
+    generation = int(entry["generation"])
+    existing_generation = state.generations.get((name, generation))
+    if existing_generation is not None and existing_generation != entry_digest:
+        _reject("catalog physical history already contains a conflicting generation")
+    if name not in state.physical_names and len(state.physical_names) >= limits.names:
+        _reject("catalog has reached its fixed physical-name capacity")
     projections: dict[str, dict[str, object]] = {}
     for existing_name in sorted(state.records, key=lambda item: item.encode("ascii")):
         record = state.records[existing_name]
@@ -1116,6 +1394,218 @@ def _candidate_values(
     return entry, entry_digest, snapshot, snapshot_digest, intent
 
 
+def _state_at_snapshot(state: CatalogState, snapshot_digest: str | None) -> CatalogState:
+    if snapshot_digest is None:
+        return CatalogState(
+            None,
+            0,
+            None,
+            None,
+            {},
+            state.entries,
+            state.snapshots,
+            state.physical_names,
+            state.generations,
+            state.physical_bytes,
+        )
+    snapshot = state.snapshots.get(snapshot_digest)
+    if snapshot is None:
+        _infra("catalog staging intent names an unavailable base snapshot")
+    projections = snapshot["records"]
+    assert isinstance(projections, dict)
+    records: dict[str, dict[str, object]] = {}
+    for name, projection in projections.items():
+        assert isinstance(projection, dict)
+        entry_digest = str(projection["entryDigest"])
+        entry = state.entries.get(entry_digest)
+        if entry is None:
+            _infra("catalog staging base references missing entry history")
+        records[name] = _public_record(entry, entry_digest)
+    previous = snapshot["previousSnapshotDigest"]
+    return CatalogState(
+        state.root,
+        int(snapshot["revision"]),
+        snapshot_digest,
+        str(previous) if previous is not None else None,
+        records,
+        state.entries,
+        state.snapshots,
+        state.physical_names,
+        state.generations,
+        state.physical_bytes,
+    )
+
+
+def _verify_optional_stage_file(path: Path, expected: bytes, maximum: int, purpose: str) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        _infra(f"{purpose} cannot be inspected", error)
+    if _read_file(path, maximum, purpose) != expected:
+        _infra(f"{purpose} does not match its durable intent")
+    return True
+
+
+def _verify_staged_candidate(
+    stage: StageState,
+    physical_state: CatalogState,
+    limits: CatalogLimits,
+) -> tuple[dict[str, object], str, dict[str, object], str]:
+    intent = stage.intent
+    base_value = intent["baseSnapshotDigest"]
+    base_digest = str(base_value) if base_value is not None else None
+    base = _state_at_snapshot(physical_state, base_digest)
+    try:
+        entry, entry_digest, snapshot, snapshot_digest, expected_intent = _candidate_values(
+            base,
+            kind=str(intent["kind"]),
+            name=str(intent["name"]),
+            subject=str(intent["subject"]),
+            expected_entry_digest=(
+                str(intent["expectedEntryDigest"])
+                if intent["expectedEntryDigest"] is not None
+                else None
+            ),
+            limits=limits,
+        )
+    except (AssertionError, CatalogReject) as error:
+        _infra("catalog staging intent is not a valid operation from its base", error)
+    semantic_fields = set(expected_intent) - {"entryPreexisting", "snapshotPreexisting"}
+    if any(intent[field] != expected_intent[field] for field in semantic_fields):
+        _infra("catalog staging intent does not bind its deterministic candidate")
+    if bool(intent["entryPreexisting"]) and entry_digest not in physical_state.entries:
+        _infra("catalog staging intent claims unavailable preexisting entry history")
+    if bool(intent["snapshotPreexisting"]) and snapshot_digest not in physical_state.snapshots:
+        _infra("catalog staging intent claims unavailable preexisting snapshot history")
+    current_digest = physical_state.snapshot_digest
+    if current_digest not in (base_digest, snapshot_digest):
+        _infra("catalog staged operation does not match the physical commit phase")
+
+    entry_bytes = canonical(entry) + b"\n"
+    snapshot_bytes = canonical(snapshot) + b"\n"
+    pointer_bytes = canonical(
+        {"apiVersion": CURRENT_API, "snapshotDigest": snapshot_digest}
+    ) + b"\n"
+    payload = stage.path / "payload"
+    try:
+        payload.lstat()
+    except FileNotFoundError:
+        final_entry = entry_digest in physical_state.entries
+        final_snapshot = snapshot_digest in physical_state.snapshots
+        if current_digest == snapshot_digest:
+            if not final_entry or not final_snapshot:
+                _infra("committed catalog stage is missing its immutable candidate history")
+        elif final_entry or final_snapshot:
+            _infra("uncommitted catalog stage lost its candidate publication evidence")
+        return entry, entry_digest, snapshot, snapshot_digest
+    except OSError as error:
+        _infra("catalog staging payload cannot be inspected", error)
+    if bool(intent["bootstrap"]):
+        catalog = payload / "catalog"
+        try:
+            catalog.lstat()
+        except FileNotFoundError:
+            if _directory_names(payload, "catalog bootstrap payload", 1):
+                _infra("catalog bootstrap payload lost its candidate directory")
+            final_entry = entry_digest in physical_state.entries
+            final_snapshot = snapshot_digest in physical_state.snapshots
+            if current_digest == snapshot_digest:
+                if not final_entry or not final_snapshot:
+                    _infra("committed bootstrap stage is missing immutable history")
+            elif final_entry or final_snapshot:
+                _infra("uncommitted bootstrap stage contains final candidate history")
+            return entry, entry_digest, snapshot, snapshot_digest
+        except OSError as error:
+            _infra("catalog bootstrap candidate cannot be inspected", error)
+        if current_digest == snapshot_digest:
+            _infra("committed bootstrap stage retained a second candidate catalog")
+        catalog_names = set(_directory_names(catalog, "catalog bootstrap candidate", 3))
+        entries_present = "entries" in catalog_names
+        snapshots_present = "snapshots" in catalog_names
+        current_present = "current.json" in catalog_names
+        next_present = "current.next" in catalog_names
+        if snapshots_present and not entries_present:
+            _infra("catalog bootstrap stage skipped its entry-directory phase")
+        if current_present and next_present:
+            _infra("catalog bootstrap stage contains conflicting pointer phases")
+        staged_entry = False
+        staged_snapshot = False
+        if entries_present:
+            staged_entry = _verify_optional_stage_file(
+                catalog / "entries" / f"{entry_digest[7:]}.json",
+                entry_bytes,
+                limits.entry_bytes,
+                "catalog staged entry",
+            )
+        if snapshots_present:
+            staged_snapshot = _verify_optional_stage_file(
+                catalog / "snapshots" / f"{snapshot_digest[7:]}.json",
+                snapshot_bytes,
+                limits.snapshot_bytes,
+                "catalog staged snapshot",
+            )
+        if staged_snapshot and not staged_entry:
+            _infra("catalog bootstrap stage skipped its entry-record phase")
+        staged_pointer = False
+        for name in ("current.json", "current.next"):
+            staged_pointer = (
+                _verify_optional_stage_file(
+                    catalog / name,
+                    pointer_bytes,
+                    65_536,
+                    "catalog staged pointer",
+                )
+                or staged_pointer
+            )
+        if staged_pointer and not (staged_entry and staged_snapshot):
+            _infra("catalog bootstrap pointer lacks complete candidate records")
+    else:
+        staged_entry = _verify_optional_stage_file(
+            payload / "entry.json",
+            entry_bytes,
+            limits.entry_bytes,
+            "catalog staged entry",
+        )
+        staged_snapshot = _verify_optional_stage_file(
+            payload / "snapshot.json",
+            snapshot_bytes,
+            limits.snapshot_bytes,
+            "catalog staged snapshot",
+        )
+        current_present = _verify_optional_stage_file(
+            payload / "current.json",
+            pointer_bytes,
+            65_536,
+            "catalog staged pointer",
+        )
+        next_present = _verify_optional_stage_file(
+            payload / "current.next",
+            pointer_bytes,
+            65_536,
+            "catalog staged pointer",
+        )
+        if current_present and next_present:
+            _infra("catalog mutation stage contains conflicting pointer phases")
+        staged_pointer = current_present or next_present
+        final_entry = entry_digest in physical_state.entries
+        final_snapshot = snapshot_digest in physical_state.snapshots
+        if staged_snapshot and not (staged_entry or final_entry):
+            _infra("catalog staged snapshot lacks candidate entry evidence")
+        if staged_pointer and not (
+            (staged_entry or final_entry) and (staged_snapshot or final_snapshot)
+        ):
+            _infra("catalog staged pointer lacks complete candidate record evidence")
+        if current_digest == snapshot_digest:
+            if staged_pointer or not final_entry or not final_snapshot:
+                _infra("committed catalog stage has an impossible publication shape")
+        else:
+            if (final_entry or final_snapshot) and not staged_pointer:
+                _infra("uncommitted catalog stage lost its durable pointer evidence")
+    return entry, entry_digest, snapshot, snapshot_digest
+
+
 def _prepare_stage(
     authority: HomeAuthority,
     entry: dict[str, object],
@@ -1123,12 +1613,15 @@ def _prepare_stage(
     snapshot: dict[str, object],
     snapshot_digest: str,
     intent: dict[str, object],
+    limits: CatalogLimits,
     fault: FaultHook | None,
 ) -> StageState:
     wrapper = authority.staging / OPERATION_WRAPPER
     payload = wrapper / "payload"
     try:
+        _fault(fault, "catalog wrapper.before_create")
         _mkdir(wrapper)
+        _fault(fault, "catalog wrapper.after_create")
         _write_file(wrapper / "intent.json", canonical(intent) + b"\n", "catalog intent", fault)
         _fsync_directory(wrapper, "catalog intent wrapper", fault)
         _fsync_directory(authority.staging, "catalog intent publication", fault)
@@ -1154,7 +1647,9 @@ def _prepare_stage(
             )
             pointer = {"apiVersion": CURRENT_API, "snapshotDigest": snapshot_digest}
             _write_file(catalog / "current.next", canonical(pointer) + b"\n", "catalog staged pointer", fault)
+            _fault(fault, "catalog staged pointer.before_replace")
             os.replace(catalog / "current.next", catalog / "current.json")
+            _fault(fault, "catalog staged pointer.after_replace")
             _fsync_directory(entries, "catalog staged entries", fault)
             _fsync_directory(snapshots, "catalog staged snapshots", fault)
             _fsync_directory(catalog, "catalog staged root", fault)
@@ -1163,25 +1658,17 @@ def _prepare_stage(
             _write_file(payload / "snapshot.json", canonical(snapshot) + b"\n", "catalog staged snapshot", fault)
             pointer = {"apiVersion": CURRENT_API, "snapshotDigest": snapshot_digest}
             _write_file(payload / "current.next", canonical(pointer) + b"\n", "catalog staged pointer", fault)
+            _fault(fault, "catalog staged pointer.before_replace")
             os.replace(payload / "current.next", payload / "current.json")
+            _fault(fault, "catalog staged pointer.after_replace")
         _fsync_directory(payload, "catalog staged payload", fault)
         _fsync_directory(wrapper, "catalog staged wrapper", fault)
         _fsync_directory(authority.staging, "catalog staged operation", fault)
     except CatalogInfrastructure:
-        try:
-            _remove_owned_tree(wrapper)
-            _fsync_directory(authority.staging, "catalog failed-stage cleanup")
-        except CatalogInfrastructure:
-            pass
         raise
     except OSError as error:
-        try:
-            _remove_owned_tree(wrapper)
-            _fsync_directory(authority.staging, "catalog failed-stage cleanup")
-        except CatalogInfrastructure:
-            pass
         _infra("catalog operation could not be staged", error)
-    stage = _stage_state(authority, CatalogLimits())
+    stage = _stage_state(authority, limits)
     if stage is None:
         _infra("catalog operation stage disappeared")
     return stage
@@ -1192,12 +1679,17 @@ def _publish_record(source: Path, target: Path, maximum: int, purpose: str, faul
     try:
         target.lstat()
     except FileNotFoundError:
-        _write_file(target, data, purpose, fault)
+        _fault(fault, f"{purpose}.before_noreplace")
+        _rename_noreplace(source, target)
+        _fault(fault, f"{purpose}.after_noreplace")
     except OSError as error:
         _infra(f"{purpose} final path cannot be inspected", error)
     else:
         if _read_file(target, maximum, purpose) != data:
             _infra(f"{purpose} conflicts with existing immutable bytes")
+        return
+    if _read_file(target, maximum, purpose) != data:
+        _infra(f"{purpose} no-replace publication changed its immutable bytes")
 
 
 def _publish_candidate(
@@ -1214,12 +1706,12 @@ def _publish_candidate(
     committed = False
     try:
         if bool(intent["bootstrap"]):
+            _set_lock_marker(lock_descriptor, fault)
             _fault(fault, "bootstrap.before_rename")
             _rename_noreplace(payload / "catalog", authority.images / "catalog")
             committed = True
             _fault(fault, "bootstrap.after_rename")
             _fsync_directory(authority.images, "catalog bootstrap parent", fault)
-            _set_lock_marker(lock_descriptor)
         else:
             assert state.root is not None
             root = state.root
@@ -1251,7 +1743,7 @@ def _publish_candidate(
         verified = _load_catalog(authority, lock_descriptor, limits, inspect_stage=False)
         if verified.snapshot_digest != candidate:
             _infra("catalog publication could not be verified")
-        _cleanup_stage(authority, stage)
+        _cleanup_stage(authority, stage, fault)
     except CatalogInfrastructure:
         if not committed:
             try:
@@ -1273,7 +1765,15 @@ def _classified(operation: Callable[[], object]) -> object:
         return operation()
     except (CatalogReject, CatalogInfrastructure):
         raise
-    except (AssertionError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (
+        AssertionError,
+        KeyError,
+        OSError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         _infra("catalog operation encountered unverified state", error)
 
 
@@ -1320,6 +1820,7 @@ def add_image(
                 snapshot,
                 snapshot_digest,
                 intent,
+                limits,
                 fault,
             )
             _publish_candidate(authority, lock_descriptor, state, stage, limits, fault)
@@ -1380,6 +1881,7 @@ def remove_image(
                 snapshot,
                 snapshot_digest,
                 intent,
+                limits,
                 fault,
             )
             _publish_candidate(authority, lock_descriptor, state, stage, limits, fault)
@@ -1480,26 +1982,3 @@ def resolve_local_images(
     result = _classified(operation)
     assert isinstance(result, dict)
     return result
-
-
-@contextmanager
-def hold_live_bindings(
-    home: Path,
-    bindings: Sequence[dict[str, object]],
-    *,
-    limits: CatalogLimits = CatalogLimits(),
-) -> Iterator[dict[str, object]]:
-    """Hold the shared catalog lock while PR4 publishes a selected plan."""
-
-    authority = _load_home(home)
-    with _catalog_lock(authority, exclusive=False) as lock_descriptor:
-        state = _load_catalog(authority, lock_descriptor, limits)
-        for binding in bindings:
-            name = binding.get("name")
-            expected = binding.get("entryDigest")
-            record = state.records.get(str(name))
-            if record is None or record["state"] != "active" or record["entryDigest"] != expected:
-                _reject("selected local image entry is no longer active")
-        if state.snapshot_digest is None:
-            _infra("selected local image snapshot is unavailable")
-        yield {"revision": state.revision, "snapshotDigest": state.snapshot_digest}
