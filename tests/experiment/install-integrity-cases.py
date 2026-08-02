@@ -828,6 +828,54 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
         and replacement_store_preserved
     )
 
+    late_home = support().initialized_home(runtime, root, "late-store-race-home")
+    late_store = late_home / "experiments"
+    late_parked = late_home / "experiments-parked"
+    late_replaced = False
+    late_parked_before: tuple[tuple[object, ...], ...] | None = None
+    late_replacement_before: tuple[tuple[object, ...], ...] | None = None
+
+    def replace_store_before_publish(point: str) -> None:
+        nonlocal late_replaced, late_parked_before, late_replacement_before
+        if point == "experiment envelope.before_noreplace" and not late_replaced:
+            late_store.rename(late_parked)
+            late_store.mkdir(mode=0o700)
+            replacement_staging = late_store / ".staging"
+            replacement_staging.mkdir(mode=0o700)
+            os.chmod(late_store, 0o700)
+            os.chmod(replacement_staging, 0o700)
+            parked_wrapper = late_parked / ".staging" / "experiment-install"
+            replacement_wrapper = replacement_staging / "experiment-install"
+            parked_wrapper.rename(replacement_wrapper)
+            late_parked_before = support().tree_fingerprint(late_parked)
+            late_replacement_before = support().tree_fingerprint(late_store)
+            late_replaced = True
+
+    with tool_environment():
+        late_rc, late_value, late_error = actual_install(
+            store,
+            late_home,
+            source,
+            fault=replace_store_before_publish,
+        )
+    late_parked_preserved = (
+        late_parked_before is not None
+        and support().tree_fingerprint(late_parked) == late_parked_before
+    )
+    late_replacement_preserved = (
+        late_replacement_before is not None
+        and support().tree_fingerprint(late_store) == late_replacement_before
+    )
+    late_store_race_secure = (
+        late_replaced
+        and late_rc == 125
+        and late_value is None
+        and isinstance(late_error, store.StoreInfrastructure)
+        and late_parked_preserved
+        and late_replacement_preserved
+        and not (late_store / "mutation-store").exists()
+    )
+
     source_after = support().tree_fingerprint(source)
     runtime_unchanged(runtime, names, runtime_before, "public preflight probe")
     clean_results = all(
@@ -840,6 +888,7 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
         clean_results
         and all(state_checks.values())
         and store_race_secure
+        and late_store_race_secure
         and source_before == source_after
     )
     rendered = {
@@ -852,6 +901,8 @@ def probe_public_preflight(root: Path, runtime: Path, names: tuple[str, ...]) ->
             f"results={rendered!r} state={state_checks!r} "
             f"store_race={store_replaced}/{store_rc}/{store_error!r}/"
             f"{original_store_preserved}/{replacement_store_preserved} "
+            f"late_store_race={late_replaced}/{late_rc}/{late_error!r}/"
+            f"{late_parked_preserved}/{late_replacement_preserved} "
             f"source_changed={source_before != source_after}"
         ),
     )
