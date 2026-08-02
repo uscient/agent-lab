@@ -547,13 +547,209 @@ def main() -> int:
                     ("User-Agent", "agent-lab/v0alpha1"),
                     ("X-GitHub-Api-Version", "2022-11-28"),
                 )
+
+                ca_bytes = b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
+                ca_offset = [0]
+                ca_closed: list[int] = []
+                original_ca_paths = experiment.GIT_PROVIDER_CA_FILES
+                original_open = experiment.os.open
+                original_fstat = experiment.os.fstat
+                original_read = experiment.os.read
+                original_close = experiment.os.close
+
+                class CaMetadata:
+                    st_mode = stat.S_IFREG | 0o644
+                    st_uid = 0
+                    st_nlink = 1
+                    st_size = len(ca_bytes)
+
+                def ca_open(path, _flags):
+                    if path == "/missing-ca":
+                        raise FileNotFoundError(path)
+                    if path != "/trusted-ca":
+                        raise AssertionError("unexpected CA path")
+                    return 73
+
+                def ca_fstat(descriptor):
+                    if descriptor != 73:
+                        raise AssertionError("unexpected CA descriptor")
+                    return CaMetadata()
+
+                def ca_read(descriptor, maximum):
+                    if descriptor != 73:
+                        raise AssertionError("unexpected CA descriptor")
+                    start = ca_offset[0]
+                    chunk = ca_bytes[start : start + min(maximum, 11)]
+                    ca_offset[0] += len(chunk)
+                    return chunk
+
+                def ca_close(descriptor):
+                    ca_closed.append(descriptor)
+
+                experiment.GIT_PROVIDER_CA_FILES = ("/missing-ca", "/trusted-ca")
+                experiment.os.open = ca_open
+                experiment.os.fstat = ca_fstat
+                experiment.os.read = ca_read
+                experiment.os.close = ca_close
+                try:
+                    try:
+                        ca_pem = experiment._git_system_ca_pem()
+                    except experiment.InfrastructureError:
+                        ca_pem = None
+                finally:
+                    experiment.GIT_PROVIDER_CA_FILES = original_ca_paths
+                    experiment.os.open = original_open
+                    experiment.os.fstat = original_fstat
+                    experiment.os.read = original_read
+                    experiment.os.close = original_close
+                ca_probe_ok = ca_pem == ca_bytes.decode("ascii") and ca_closed == [73]
+
+                import http.client as http_client
+                import ssl as ssl_module
+
+                direct_body = b'{"fixture":true}'
+                direct_connections = []
+                original_https_connection = http_client.HTTPSConnection
+                original_ssl_context = ssl_module.SSLContext
+                original_maxline = http_client._MAXLINE
+                original_maxheaders = http_client._MAXHEADERS
+                original_ca_reader = experiment._git_system_ca_pem
+
+                class FakeSocket:
+                    def __init__(self):
+                        self.timeouts = []
+
+                    def settimeout(self, value):
+                        self.timeouts.append(value)
+
+                class FakeResponse:
+                    status = 200
+
+                    def __init__(self):
+                        self.offset = 0
+                        self.closed = False
+
+                    def getheaders(self):
+                        return [
+                            ("Content-Length", str(len(direct_body))),
+                            ("Content-Type", "application/json; charset=utf-8"),
+                            ("Content-Encoding", "identity"),
+                        ]
+
+                    def read(self, maximum):
+                        if self.offset >= len(direct_body):
+                            return b""
+                        chunk = direct_body[self.offset : self.offset + maximum]
+                        self.offset += len(chunk)
+                        return chunk
+
+                    def close(self):
+                        self.closed = True
+
+                class FakeContext:
+                    def __init__(self, protocol):
+                        self.protocol = protocol
+                        self.check_hostname = None
+                        self.verify_mode = None
+                        self.minimum_version = None
+                        self.ca_data = None
+
+                    def load_verify_locations(self, *, cadata):
+                        self.ca_data = cadata
+
+                class FakeConnection:
+                    def __init__(self, authority, *, port, timeout, context):
+                        self.authority = authority
+                        self.port = port
+                        self.timeout = timeout
+                        self.context = context
+                        self.sock = FakeSocket()
+                        self.response = FakeResponse()
+                        self.request_record = None
+                        self.closed = False
+                        direct_connections.append(self)
+
+                    def request(self, method, path, *, headers):
+                        self.request_record = (method, path, headers)
+
+                    def getresponse(self):
+                        return self.response
+
+                    def close(self):
+                        self.closed = True
+
+                http_client.HTTPSConnection = FakeConnection
+                ssl_module.SSLContext = FakeContext
+                experiment._git_system_ca_pem = lambda: ca_bytes.decode("ascii")
+                try:
+                    direct_deadline = __import__("time").monotonic() + 1.0
+                    direct_https = experiment._github_api_request(
+                        "api.github.com",
+                        f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                        expected_headers,
+                        1_024,
+                        direct_deadline,
+                    )
+                    try:
+                        experiment._github_api_request(
+                            "credential.invalid",
+                            "/repos/uscient/experiment-fixture/git/commits/invalid",
+                            expected_headers,
+                            1_024,
+                            direct_deadline,
+                        )
+                        direct_invalid = "accepted"
+                    except experiment.InfrastructureError as error:
+                        direct_invalid = str(error)
+                finally:
+                    http_client.HTTPSConnection = original_https_connection
+                    ssl_module.SSLContext = original_ssl_context
+                    http_client._MAXLINE = original_maxline
+                    http_client._MAXHEADERS = original_maxheaders
+                    experiment._git_system_ca_pem = original_ca_reader
+                direct_connection = (
+                    direct_connections[0] if len(direct_connections) == 1 else None
+                )
+                direct_https_ok = (
+                    direct_https
+                    == (
+                        200,
+                        (
+                            ("content-length", str(len(direct_body))),
+                            ("content-type", "application/json; charset=utf-8"),
+                        ),
+                        direct_body,
+                    )
+                    and direct_connection is not None
+                    and direct_connection.authority == "api.github.com"
+                    and direct_connection.port == 443
+                    and direct_connection.request_record
+                    == (
+                        "GET",
+                        f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                        dict(expected_headers),
+                    )
+                    and direct_connection.context.protocol
+                    == ssl_module.PROTOCOL_TLS_CLIENT
+                    and direct_connection.context.check_hostname is True
+                    and direct_connection.context.verify_mode == ssl_module.CERT_REQUIRED
+                    and direct_connection.context.minimum_version
+                    == ssl_module.TLSVersion.TLSv1_2
+                    and direct_connection.context.ca_data == ca_bytes.decode("ascii")
+                    and direct_connection.response.closed
+                    and direct_connection.closed
+                    and direct_connection.sock.timeouts
+                    and all(value > 0 for value in direct_connection.sock.timeouts)
+                    and "GIT-AUTHORITY" in direct_invalid
+                )
                 results.append(
                     (
                         "GIT-AUTHORITY-001",
                         all(call[0] == "api.github.com" for call in request_calls)
                         and all(call[2] == expected_headers for call in request_calls)
                         and request_calls[0][3] == 1_048_576
-                        and request_calls[0][3] > request_calls[1][3] > request_calls[2][3],
+                        and request_calls[0][3] > request_calls[1][3] > request_calls[2][3]
+                        and direct_https_ok,
                         "only the fixed credential-free provider authority is requested",
                     )
                 )
@@ -603,6 +799,7 @@ def main() -> int:
                         "GIT-CREDENTIAL-001",
                         credential_snapshot is not None
                         and credential_snapshot.data == source
+                        and ca_probe_ok
                         and "credential.invalid" not in credential_text
                         and "caller-ca" not in credential_text
                         and "askpass" not in credential_text,
@@ -693,10 +890,40 @@ def main() -> int:
                         timeout_outcome = str(error)
                 finally:
                     experiment.GIT_ACQUISITION_TIMEOUT_SECONDS = original_timeout
+
+                original_worker_requester = experiment._github_api_request
+
+                def hanging_worker_requester(
+                    _authority, _path, _headers, _maximum, _deadline
+                ):
+                    while True:
+                        signal.pause()
+
+                experiment._github_api_request = hanging_worker_requester
+                worker_timeout_started = __import__("time").monotonic()
+                try:
+                    try:
+                        experiment._github_worker_request(
+                            "api.github.com",
+                            f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                            expected_headers,
+                            1_024,
+                            worker_timeout_started + 0.05,
+                        )
+                        worker_timeout_outcome = "ok"
+                    except experiment.InfrastructureError as error:
+                        worker_timeout_outcome = str(error)
+                finally:
+                    experiment._github_api_request = original_worker_requester
+                worker_timeout_elapsed = (
+                    __import__("time").monotonic() - worker_timeout_started
+                )
                 results.append(
                     (
                         "GIT-TIMEOUT-001",
-                        "GIT-TIMEOUT" in timeout_outcome,
+                        "GIT-TIMEOUT" in timeout_outcome
+                        and "GIT-TIMEOUT" in worker_timeout_outcome
+                        and worker_timeout_elapsed < 1.0,
                         "one absolute acquisition deadline bounds all provider requests",
                     )
                 )
@@ -711,11 +938,89 @@ def main() -> int:
                     b"x" * 1_048_577,
                 )
                 output_outcome = acquire(oversized_responses)
+
+                valid_worker_value = json.dumps(
+                    {
+                        "body": "",
+                        "headers": [
+                            ["content-length", "0"],
+                            ["content-type", "application/json; charset=utf-8"],
+                        ],
+                        "kind": "result",
+                        "status": 200,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+                valid_worker_frame = (
+                    experiment.GIT_WORKER_FRAME
+                    + len(valid_worker_value).to_bytes(8, "big")
+                    + valid_worker_value
+                )
+                original_worker_child = experiment._git_worker_child
+
+                def worker_frame_outcome(stdout_data: bytes, stderr_data: bytes = b""):
+                    def fixture_worker_child(
+                        _control_read,
+                        stdout_write,
+                        stderr_write,
+                        _authority,
+                        _path,
+                        _headers,
+                        _maximum,
+                        _deadline,
+                    ):
+                        try:
+                            os.setsid()
+                            if stderr_data:
+                                os.write(stderr_write, stderr_data)
+                            if stdout_data:
+                                os.write(stdout_write, stdout_data)
+                        finally:
+                            os._exit(0)
+
+                    experiment._git_worker_child = fixture_worker_child
+                    try:
+                        try:
+                            experiment._github_worker_request(
+                                "api.github.com",
+                                f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                                expected_headers,
+                                1_024,
+                                __import__("time").monotonic() + 1.0,
+                            )
+                            return "ok"
+                        except experiment.InfrastructureError as error:
+                            return str(error)
+                    finally:
+                        experiment._git_worker_child = original_worker_child
+
+                malformed_frame = worker_frame_outcome(b"not-a-worker-frame")
+                oversized_frame = worker_frame_outcome(
+                    experiment.GIT_WORKER_FRAME
+                    + (experiment.GIT_WORKER_MAX_OUTPUT_BYTES + 1).to_bytes(8, "big")
+                )
+                trailing_frame = worker_frame_outcome(valid_worker_frame + b"trailing")
+                stderr_frame = worker_frame_outcome(
+                    valid_worker_frame, b"caller-private-diagnostic"
+                )
+                worker_frames_rejected = (
+                    "GIT-WORKER" in malformed_frame
+                    and "GIT-OUTPUT" in oversized_frame
+                    and "trailing" in trailing_frame
+                    and (
+                        "diagnostic" in stderr_frame
+                        or "GIT-WORKER" in stderr_frame
+                    )
+                )
                 results.append(
                     (
                         "GIT-OUTPUT-001",
-                        output_outcome[0] == "infra" and "GIT-OUTPUT" in output_outcome[1],
-                        "one provider response cannot exceed the acquisition cap",
+                        output_outcome[0] == "infra"
+                        and "GIT-OUTPUT" in output_outcome[1]
+                        and worker_frames_rejected,
+                        "provider and worker output frames are strictly bounded",
                     )
                 )
 
@@ -776,12 +1081,23 @@ def main() -> int:
                 }
 
                 def worker_requester(authority, path, headers, maximum, deadline):
+                    import resource
+
                     worker_pid = os.getpid()
                     if (
                         worker_pid == worker_parent_pid
                         or os.getpgrp() != worker_pid
                         or os.getsid(0) != worker_pid
                         or os.getcwd() != "/"
+                        or resource.getrlimit(resource.RLIMIT_CORE) != (0, 0)
+                        or resource.getrlimit(resource.RLIMIT_FSIZE) != (0, 0)
+                        or resource.getrlimit(resource.RLIMIT_AS)
+                        != (
+                            experiment.GIT_WORKER_MEMORY_BYTES,
+                            experiment.GIT_WORKER_MEMORY_BYTES,
+                        )
+                        or resource.getrlimit(resource.RLIMIT_NOFILE) != (16, 16)
+                        or resource.getrlimit(resource.RLIMIT_CPU) != (4, 4)
                     ):
                         raise RuntimeError("provider worker session is not isolated")
                     return large_responses[path]
@@ -797,17 +1113,213 @@ def main() -> int:
                         delattr(experiment, "_github_api_request")
                     else:
                         experiment._github_api_request = original_worker_requester
+
+                terminate_wait_options: list[int] = []
+                original_waitpid = experiment.os.waitpid
+                original_killpg = experiment.os.killpg
+                original_group_alive = experiment._git_worker_group_alive
+                original_monotonic = experiment.time.monotonic
+                original_sleep = experiment.time.sleep
+                terminate_clock = [0.0]
+
+                def terminate_monotonic():
+                    terminate_clock[0] += 1.0
+                    return terminate_clock[0]
+
+                def terminate_waitpid(_pid, options):
+                    terminate_wait_options.append(options)
+                    if options == 0:
+                        raise OSError("blocking wait forbidden by fixture")
+                    return 0, 0
+
+                experiment.os.waitpid = terminate_waitpid
+                experiment.os.killpg = lambda _pid, _signal: None
+                experiment._git_worker_group_alive = lambda _pid: True
+                experiment.time.monotonic = terminate_monotonic
+                experiment.time.sleep = lambda _duration: None
+                try:
+                    terminate_result = experiment._git_worker_terminate(
+                        991_337, reaped=False
+                    )
+                finally:
+                    experiment.os.waitpid = original_waitpid
+                    experiment.os.killpg = original_killpg
+                    experiment._git_worker_group_alive = original_group_alive
+                    experiment.time.monotonic = original_monotonic
+                    experiment.time.sleep = original_sleep
+                nonblocking_terminate = (
+                    terminate_result is False
+                    and terminate_wait_options
+                    and all(
+                        option == os.WNOHANG for option in terminate_wait_options
+                    )
+                )
+
+                mask_failure_marker = Path(raw_home) / "mask-clear-requester-reached"
+                mask_parent_pid = os.getpid()
+                original_pthread_sigmask = experiment.signal.pthread_sigmask
+                original_worker_requester = experiment._github_api_request
+
+                def fail_child_mask(how, signals):
+                    if (
+                        os.getpid() != mask_parent_pid
+                        and how == signal.SIG_SETMASK
+                        and not signals
+                    ):
+                        raise OSError("child mask clear failed")
+                    return original_pthread_sigmask(how, signals)
+
+                def mask_failure_requester(
+                    _authority, path, _headers, _maximum, _deadline
+                ):
+                    mask_failure_marker.touch()
+                    return fixture_responses[path]
+
+                experiment.signal.pthread_sigmask = fail_child_mask
+                experiment._github_api_request = mask_failure_requester
+                try:
+                    try:
+                        experiment._github_worker_request(
+                            "api.github.com",
+                            f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                            expected_headers,
+                            1_024,
+                            __import__("time").monotonic() + 1.0,
+                        )
+                        mask_failure_outcome = "ok"
+                    except experiment.InfrastructureError as error:
+                        mask_failure_outcome = str(error)
+                finally:
+                    experiment.signal.pthread_sigmask = original_pthread_sigmask
+                    experiment._github_api_request = original_worker_requester
+                mask_clear_fail_closed = (
+                    "GIT-WORKER" in mask_failure_outcome
+                    and not mask_failure_marker.exists()
+                )
                 results.append(
                     (
                         "GIT-PGROUP-001",
                         worker_snapshot is not None
                         and worker_snapshot.data == large_source
+                        and nonblocking_terminate
+                        and mask_clear_fail_closed
                         and len(large_responses[
                             f"/repos/uscient/experiment-fixture/git/blobs/{large_blob}"
                         ][2]) > 65_536,
-                        "the fixed provider drains a large response in its own session",
+                        "the fixed worker enforces limits, nonblocking cleanup, and a cleared mask",
                     )
                 )
+
+                def cleanup_fault_probe(kind: str) -> bool:
+                    probe_pid = os.fork()
+                    if probe_pid == 0:
+                        cleanup_probe_process = os.getpid()
+                        managed = (
+                            signal.SIGHUP,
+                            signal.SIGINT,
+                            signal.SIGQUIT,
+                            signal.SIGTERM,
+                        )
+                        original_handlers = {
+                            signum: signal.getsignal(signum) for signum in managed
+                        }
+                        original_mask = set(
+                            signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                        )
+                        original_requester = experiment._github_api_request
+                        original_group_probe = experiment._git_worker_group_alive
+                        original_close = experiment.os.close
+                        close_calls = [0]
+
+                        def cleanup_requester(
+                            _authority, _path, _headers, _maximum, _deadline
+                        ):
+                            return (
+                                200,
+                                (
+                                    ("content-length", "0"),
+                                    (
+                                        "content-type",
+                                        "application/json; charset=utf-8",
+                                    ),
+                                ),
+                                b"",
+                            )
+
+                        def failed_group_probe(_pid):
+                            raise OSError("process-group probe failed")
+
+                        def failed_cleanup_close(descriptor):
+                            if os.getpid() == cleanup_probe_process:
+                                close_calls[0] += 1
+                                if close_calls[0] == 5:
+                                    raise OSError("cleanup close failed")
+                            return original_close(descriptor)
+
+                        experiment._github_api_request = cleanup_requester
+                        if kind == "group":
+                            experiment._git_worker_group_alive = failed_group_probe
+                        elif kind == "close":
+                            experiment.os.close = failed_cleanup_close
+                        try:
+                            try:
+                                experiment._github_worker_request(
+                                    "api.github.com",
+                                    f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                                    expected_headers,
+                                    1_024,
+                                    __import__("time").monotonic() + 1.0,
+                                )
+                                outcome = "ok"
+                            except experiment.InfrastructureError:
+                                outcome = "infra"
+                            except BaseException:
+                                outcome = "other"
+                            restored = (
+                                all(
+                                    signal.getsignal(signum)
+                                    == original_handlers[signum]
+                                    for signum in managed
+                                )
+                                and set(
+                                    signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                                )
+                                == original_mask
+                            )
+                        finally:
+                            experiment._github_api_request = original_requester
+                            experiment._git_worker_group_alive = original_group_probe
+                            experiment.os.close = original_close
+                        os._exit(0 if outcome == "infra" and restored else 1)
+
+                    probe_status = None
+                    probe_deadline = __import__("time").monotonic() + 2.0
+                    while __import__("time").monotonic() < probe_deadline:
+                        waited, status = os.waitpid(probe_pid, os.WNOHANG)
+                        if waited == probe_pid:
+                            probe_status = status
+                            break
+                        __import__("time").sleep(0.01)
+                    if probe_status is None:
+                        try:
+                            os.kill(probe_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        reap_deadline = __import__("time").monotonic() + 1.0
+                        while __import__("time").monotonic() < reap_deadline:
+                            waited, status = os.waitpid(probe_pid, os.WNOHANG)
+                            if waited == probe_pid:
+                                probe_status = status
+                                break
+                            __import__("time").sleep(0.01)
+                    return (
+                        probe_status is not None
+                        and os.WIFEXITED(probe_status)
+                        and os.WEXITSTATUS(probe_status) == 0
+                    )
+
+                group_probe_fail_closed = cleanup_fault_probe("group")
+                close_failure_fail_closed = cleanup_fault_probe("close")
 
                 residual_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 residual_listener.bind(("127.0.0.1", 0))
@@ -867,75 +1379,112 @@ def main() -> int:
                 else:
                     residual_alive = False
 
-                signal_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                signal_listener.bind(("127.0.0.1", 0))
-                signal_listener.settimeout(1.0)
-                signal_address = signal_listener.getsockname()
-                signal_probe = os.fork()
-                if signal_probe == 0:
-                    def hanging_requester(authority, path, headers, maximum, deadline):
-                        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
-                            sender.sendto(
-                                f"{os.getpid()}\n".encode("ascii"),
-                                signal_address,
-                            )
-                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                        while True:
-                            signal.pause()
+                def signal_cleanup_probe(*, uncertain: bool, expected_exit: int) -> bool:
+                    signal_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    signal_listener.bind(("127.0.0.1", 0))
+                    signal_listener.settimeout(1.0)
+                    signal_address = signal_listener.getsockname()
+                    signal_probe = os.fork()
+                    if signal_probe == 0:
+                        original_worker_terminate = experiment._git_worker_terminate
 
-                    experiment._github_api_request = hanging_requester
-                    try:
-                        experiment.read_git_snapshot(URL, COMMIT)
-                    except SystemExit as error:
-                        code = error.code if isinstance(error.code, int) else 125
-                        os._exit(code)
-                    except BaseException:
-                        os._exit(125)
-                    os._exit(0)
-                try:
-                    try:
-                        worker_record = signal_listener.recv(64).decode("ascii").strip()
-                    except TimeoutError:
-                        worker_record = ""
-                finally:
-                    signal_listener.close()
-                signal_worker_pid = int(worker_record) if worker_record.isdigit() else None
-                if signal_worker_pid is not None:
-                    os.kill(signal_probe, signal.SIGTERM)
-                signal_status = None
-                signal_deadline = __import__("time").monotonic() + 2.0
-                while __import__("time").monotonic() < signal_deadline:
-                    waited, status = os.waitpid(signal_probe, os.WNOHANG)
-                    if waited == signal_probe:
-                        signal_status = status
-                        break
-                    __import__("time").sleep(0.01)
-                if signal_status is None:
-                    try:
-                        os.kill(signal_probe, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    _, signal_status = os.waitpid(signal_probe, 0)
-                signal_worker_alive = False
-                if signal_worker_pid is not None:
-                    worker_deadline = __import__("time").monotonic() + 1.0
-                    while __import__("time").monotonic() < worker_deadline:
+                        def uncertain_worker_terminate(pid, *, reaped):
+                            original_worker_terminate(pid, reaped=reaped)
+                            return False
+
+                        def hanging_requester(
+                            _authority, _path, _headers, _maximum, _deadline
+                        ):
+                            with socket.socket(
+                                socket.AF_INET, socket.SOCK_DGRAM
+                            ) as sender:
+                                sender.sendto(
+                                    f"{os.getpid()}\n".encode("ascii"),
+                                    signal_address,
+                                )
+                            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                            while True:
+                                signal.pause()
+
+                        if uncertain:
+                            experiment._git_worker_terminate = (
+                                uncertain_worker_terminate
+                            )
+                        experiment._github_api_request = hanging_requester
                         try:
-                            os.killpg(signal_worker_pid, 0)
-                        except ProcessLookupError:
+                            experiment.read_git_snapshot(URL, COMMIT)
+                        except SystemExit as error:
+                            code = error.code if isinstance(error.code, int) else 124
+                            os._exit(code)
+                        except experiment.InfrastructureError:
+                            os._exit(125)
+                        except BaseException:
+                            os._exit(124)
+                        os._exit(0)
+                    try:
+                        try:
+                            worker_record = (
+                                signal_listener.recv(64).decode("ascii").strip()
+                            )
+                        except TimeoutError:
+                            worker_record = ""
+                    finally:
+                        signal_listener.close()
+                    signal_worker_pid = (
+                        int(worker_record) if worker_record.isdigit() else None
+                    )
+                    if signal_worker_pid is not None:
+                        os.kill(signal_probe, signal.SIGTERM)
+                    signal_status = None
+                    signal_deadline = __import__("time").monotonic() + 2.0
+                    while __import__("time").monotonic() < signal_deadline:
+                        waited, status = os.waitpid(signal_probe, os.WNOHANG)
+                        if waited == signal_probe:
+                            signal_status = status
                             break
                         __import__("time").sleep(0.01)
-                    else:
-                        signal_worker_alive = True
+                    if signal_status is None:
                         try:
-                            os.killpg(signal_worker_pid, signal.SIGKILL)
+                            os.kill(signal_probe, signal.SIGKILL)
                         except ProcessLookupError:
-                            signal_worker_alive = False
-                signal_preserved = (
-                    signal_worker_pid is not None
-                    and os.WIFEXITED(signal_status)
-                    and os.WEXITSTATUS(signal_status) == 128 + signal.SIGTERM
-                    and not signal_worker_alive
+                            pass
+                        reap_deadline = __import__("time").monotonic() + 1.0
+                        while __import__("time").monotonic() < reap_deadline:
+                            waited, status = os.waitpid(signal_probe, os.WNOHANG)
+                            if waited == signal_probe:
+                                signal_status = status
+                                break
+                            __import__("time").sleep(0.01)
+                    signal_worker_alive = False
+                    if signal_worker_pid is not None:
+                        worker_deadline = __import__("time").monotonic() + 1.0
+                        while __import__("time").monotonic() < worker_deadline:
+                            try:
+                                os.killpg(signal_worker_pid, 0)
+                            except ProcessLookupError:
+                                break
+                            __import__("time").sleep(0.01)
+                        else:
+                            signal_worker_alive = True
+                            try:
+                                os.killpg(signal_worker_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                signal_worker_alive = False
+                    return (
+                        signal_worker_pid is not None
+                        and signal_status is not None
+                        and os.WIFEXITED(signal_status)
+                        and os.WEXITSTATUS(signal_status) == expected_exit
+                        and not signal_worker_alive
+                    )
+
+                clean_signal_preserved = signal_cleanup_probe(
+                    uncertain=False,
+                    expected_exit=128 + signal.SIGTERM,
+                )
+                cleanup_uncertainty_wins = signal_cleanup_probe(
+                    uncertain=True,
+                    expected_exit=125,
                 )
                 results.append(
                     (
@@ -943,8 +1492,11 @@ def main() -> int:
                         residual_spawned
                         and not residual_alive
                         and "residual" in residual_outcome.lower()
-                        and signal_preserved,
-                        "residual descendants are killed before caller signals are preserved",
+                        and clean_signal_preserved
+                        and cleanup_uncertainty_wins
+                        and group_probe_fail_closed
+                        and close_failure_fail_closed,
+                        "cleanup uncertainty fails closed before caller signals are restored",
                     )
                 )
 
@@ -1301,6 +1853,19 @@ def main() -> int:
                     repo / "scripts/experiment_store.py", "git_intake_store"
                 )
                 original_store_experiment_module = store._experiment_module
+                bool_transport_fields_rejected = True
+                for field in (
+                    "limitBytes",
+                    "requestCount",
+                    "temporaryBytes",
+                    "temporaryFiles",
+                ):
+                    hostile_transport = json.loads(
+                        json.dumps(expected_transport, sort_keys=True)
+                    )
+                    hostile_transport["acquisition"][field] = False
+                    if store._closed_git_transport(hostile_transport) is not None:
+                        bool_transport_fields_rejected = False
 
                 class ExperimentFacade:
                     def __init__(self, *, deny: bool = False):
@@ -1425,7 +1990,8 @@ def main() -> int:
                         and install_outcome[1].get("changed") is True
                         and install_facade.acquisitions == [(URL, COMMIT)]
                         and installed_artifact == source
-                        and closed_git_provenance,
+                        and closed_git_provenance
+                        and bool_transport_fields_rejected,
                         "permitted Git install publishes the common artifact and closed provenance",
                     )
                 )
