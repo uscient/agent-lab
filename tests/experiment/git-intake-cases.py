@@ -159,6 +159,25 @@ def main() -> int:
                 calls.append(tuple(argv))
                 return 0
 
+        store_calls: list[tuple[Path, str, str]] = []
+
+        class RecordingStore:
+            class StoreReject(Exception):
+                pass
+
+            class StoreInfrastructure(Exception):
+                pass
+
+            @staticmethod
+            def install_git(home: Path, url: str, commit: str) -> dict[str, object]:
+                store_calls.append((home, url, commit))
+                return {
+                    "changed": True,
+                    "installationKey": "sha256:" + "1" * 64,
+                    "name": "fixture",
+                    "receiptDigest": "sha256:" + "2" * 64,
+                }
+
         agent_lab.experiment_module = lambda: RecordingExperiment
         with tempfile.TemporaryDirectory(prefix="agent-lab-git-cli-") as raw_home:
             prior_home = os.environ.get("AGENT_LAB_HOME")
@@ -180,6 +199,28 @@ def main() -> int:
                         COMMIT,
                     ],
                 )
+                original_load_config_receipt = agent_lab.load_config_receipt
+                original_store_module = agent_lab.experiment_store_module
+                agent_lab.load_config_receipt = lambda _home: (
+                    {"paths": {"cache": "cache"}},
+                    b"fixture",
+                )
+                agent_lab.experiment_store_module = lambda: RecordingStore
+                try:
+                    install = invoke(
+                        agent_lab,
+                        [
+                            "experiment",
+                            "install",
+                            "--git",
+                            URL,
+                            "--commit",
+                            COMMIT,
+                        ],
+                    )
+                finally:
+                    agent_lab.load_config_receipt = original_load_config_receipt
+                    agent_lab.experiment_store_module = original_store_module
                 expected_calls = [
                     ("experiment.py", "check-git", URL, COMMIT),
                     ("experiment.py", "authorize-git", URL, COMMIT),
@@ -189,12 +230,16 @@ def main() -> int:
                         "GIT-CLI-001",
                         check == (0, "", "")
                         and authorize == (0, "", "")
-                        and calls == expected_calls,
-                        "exact pinned Git preview forms route once to the adapter",
+                        and install[0] == 0
+                        and install[2] == ""
+                        and calls == expected_calls
+                        and store_calls == [(Path(raw_home), URL, COMMIT)],
+                        "exact pinned Git public forms route once to their adapters",
                     )
                 )
 
                 calls.clear()
+                store_calls.clear()
                 malformed = (
                     ["experiment", "check", "--git"],
                     ["experiment", "check", "--git", URL],
@@ -202,13 +247,18 @@ def main() -> int:
                     ["experiment", "check", "--commit", COMMIT, "--git", URL],
                     ["experiment", "check", "--git", URL, "--commit", COMMIT, "extra"],
                     ["experiment", "authorize", "install", "--git", URL, "--commit"],
+                    ["experiment", "install", "--git"],
+                    ["experiment", "install", "--git", URL],
+                    ["experiment", "install", "--git", URL, "--commit"],
+                    ["experiment", "install", "--git", URL, "--commit", COMMIT, "extra"],
                 )
                 usage_results = [invoke(agent_lab, list(argv)) for argv in malformed]
                 results.append(
                     (
                         "GIT-USAGE-001",
                         all(result[0] == 2 and result[1] == "" for result in usage_results)
-                        and calls == [],
+                        and calls == []
+                        and store_calls == [],
                         "malformed Git option shapes fail before adapter access",
                     )
                 )
@@ -362,13 +412,68 @@ def main() -> int:
                         platform_outcome = str(error)
                 finally:
                     experiment.sys.platform = original_platform
+
+                public_platform_access: list[str] = []
+
+                def platform_trap(label: str):
+                    def fail(*_arguments, **_keywords):
+                        public_platform_access.append(label)
+                        raise AssertionError(f"unsupported platform reached {label}")
+
+                    return fail
+
+                original_agent_platform = agent_lab.sys.platform
+                original_agent_experiment_module = agent_lab.experiment_module
+                original_load_config_receipt = agent_lab.load_config_receipt
+                original_store_module = agent_lab.experiment_store_module
+                agent_lab.sys.platform = "darwin"
+                agent_lab.experiment_module = platform_trap("experiment module")
+                agent_lab.load_config_receipt = platform_trap("home receipt")
+                agent_lab.experiment_store_module = platform_trap("store module")
+                try:
+                    public_platform_results = (
+                        invoke(
+                            agent_lab,
+                            ["experiment", "check", "--git", URL, "--commit", COMMIT],
+                        ),
+                        invoke(
+                            agent_lab,
+                            [
+                                "experiment",
+                                "authorize",
+                                "install",
+                                "--git",
+                                URL,
+                                "--commit",
+                                COMMIT,
+                            ],
+                        ),
+                        invoke(
+                            agent_lab,
+                            [
+                                "experiment",
+                                "install",
+                                "--git",
+                                URL,
+                                "--commit",
+                                COMMIT,
+                            ],
+                        ),
+                    )
+                finally:
+                    agent_lab.sys.platform = original_agent_platform
+                    agent_lab.experiment_module = original_agent_experiment_module
+                    agent_lab.load_config_receipt = original_load_config_receipt
+                    agent_lab.experiment_store_module = original_store_module
                 results.append(
                     (
                         "GIT-PLAT-001",
                         platform_outcome is not None
                         and "GIT-PLATFORM" in platform_outcome
-                        and unused_request_calls == [],
-                        "unsupported hosts refuse before acquisition",
+                        and unused_request_calls == []
+                        and all(result[0] == 125 for result in public_platform_results)
+                        and public_platform_access == [],
+                        "unsupported hosts refuse every public form before authority access",
                     )
                 )
 
@@ -1866,6 +1971,18 @@ def main() -> int:
                     hostile_transport["acquisition"][field] = False
                     if store._closed_git_transport(hostile_transport) is not None:
                         bool_transport_fields_rejected = False
+                hostile_transport_urls_rejected = True
+                for hostile_url in (
+                    "https://github.com/a--b/repo.git",
+                    "https://github.com/owner/..git",
+                    "https://github.com/owner/...git",
+                ):
+                    hostile_transport = json.loads(
+                        json.dumps(expected_transport, sort_keys=True)
+                    )
+                    hostile_transport["url"] = hostile_url
+                    if store._closed_git_transport(hostile_transport) is not None:
+                        hostile_transport_urls_rejected = False
 
                 class ExperimentFacade:
                     def __init__(self, *, deny: bool = False):
@@ -1991,7 +2108,8 @@ def main() -> int:
                         and install_facade.acquisitions == [(URL, COMMIT)]
                         and installed_artifact == source
                         and closed_git_provenance
-                        and bool_transport_fields_rejected,
+                        and bool_transport_fields_rejected
+                        and hostile_transport_urls_rejected,
                         "permitted Git install publishes the common artifact and closed provenance",
                     )
                 )
