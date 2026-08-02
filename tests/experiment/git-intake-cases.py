@@ -1603,10 +1603,14 @@ def main() -> int:
                 experiment.os.killpg = lambda _pid, _signal: None
                 experiment.time.monotonic = terminate_monotonic
                 experiment.time.sleep = lambda _duration: None
+                terminate_result = None
                 try:
-                    terminate_result = experiment._git_worker_terminate(
-                        991_337, reaped=False, deadline=10.0
-                    )
+                    try:
+                        terminate_result = experiment._git_worker_terminate(
+                            991_337, reaped=False, deadline=10.0
+                        )
+                    except (AttributeError, OSError, TypeError):
+                        pass
                 finally:
                     experiment.os.waitpid = original_waitpid
                     experiment.os.waitid = original_waitid
@@ -1665,10 +1669,14 @@ def main() -> int:
                 experiment.os.killpg = released_killpg
                 experiment.time.monotonic = released_monotonic
                 experiment.time.sleep = lambda _duration: None
+                released_result = None
                 try:
-                    released_result = experiment._git_worker_terminate(
-                        991_338, reaped=True, deadline=10.0
-                    )
+                    try:
+                        released_result = experiment._git_worker_terminate(
+                            991_338, reaped=True, deadline=10.0
+                        )
+                    except (AttributeError, OSError, TypeError):
+                        pass
                 finally:
                     experiment.os.waitpid = original_waitpid
                     experiment.os.waitid = original_waitid
@@ -1769,10 +1777,14 @@ def main() -> int:
                 experiment.os.killpg = transition_killpg
                 experiment.time.monotonic = transition_monotonic
                 experiment.time.sleep = lambda _duration: None
+                transition_result = None
                 try:
-                    transition_result = experiment._git_worker_terminate(
-                        transition_pid, reaped=False, deadline=10.0
-                    )
+                    try:
+                        transition_result = experiment._git_worker_terminate(
+                            transition_pid, reaped=False, deadline=10.0
+                        )
+                    except (AttributeError, OSError, TypeError):
+                        pass
                 finally:
                     experiment.os.waitpid = original_waitpid
                     experiment.os.waitid = original_waitid
