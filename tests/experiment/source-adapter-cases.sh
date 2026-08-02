@@ -5,8 +5,10 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && 
 subcases=(
   "$repo_root/tests/experiment/zip-intake-cases.sh"
   "$repo_root/tests/experiment/zip-mutation-cases.py"
+  "$repo_root/tests/experiment/git-intake-cases.sh"
+  "$repo_root/tests/experiment/git-mutation-cases.py"
 )
-expected_count=45
+expected_count=82
 work=""
 
 cleanup_work() {
@@ -37,7 +39,16 @@ printf '%s\n' \
   ZIP-DENY-001 ZIP-PLAT-001 ZIP-NOEF-002 ZIP-RUNTIME-001 \
   M-ZIP-COUNT-001 M-ZIP-NAME-001 M-ZIP-TYPE-001 M-ZIP-FLAG-001 \
   M-ZIP-METHOD-001 M-ZIP-SIZE-001 M-ZIP-BOMB-001 M-ZIP-CRC-001 M-ZIP-HEADER-001 \
-  M-ZIP-EXTRACT-001 M-ZIP-IDENTITY-001 M-ZIP-AUTH-001 > "$expected"
+  M-ZIP-EXTRACT-001 M-ZIP-IDENTITY-001 M-ZIP-AUTH-001 \
+  GIT-CLI-001 GIT-USAGE-001 GIT-URL-001 GIT-OID-001 GIT-PLAT-001 \
+  GIT-FIXTURE-001 GIT-PIN-001 GIT-COMMIT-001 GIT-ROOT-001 GIT-TYPE-001 \
+  GIT-BLOB-001 GIT-DRIFT-001 GIT-AUTHORITY-001 GIT-CREDENTIAL-001 \
+  GIT-REDIRECT-001 GIT-CONTENT-001 GIT-TIMEOUT-001 GIT-OUTPUT-001 \
+  GIT-ACQUIRE-001 GIT-PGROUP-001 GIT-CLEANUP-001 GIT-TAXONOMY-001 \
+  GIT-CHECK-001 GIT-AUTH-001 GIT-DENY-001 GIT-INSTALL-001 GIT-IDENTITY-001 \
+  GIT-RETRY-001 GIT-ADAPTER-001 GIT-NOEF-001 GIT-RUNTIME-001 GIT-DIAG-001 \
+  M-GIT-AUTHORITY-001 M-GIT-REF-001 M-GIT-BOUND-001 M-GIT-IDENTITY-001 \
+  M-GIT-DOWNSTREAM-001 > "$expected"
 : > "$observed"
 
 infrastructure=0
