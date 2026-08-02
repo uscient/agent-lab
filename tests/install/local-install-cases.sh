@@ -67,6 +67,7 @@ if [ "$check_rc" -eq 0 ] && [ ! -s "$work/check.err" ] &&
   pass PKG-004 "installed Experiment check is independent of the source checkout"
 else
   fail PKG-004 "installed Experiment check is independent of the source checkout"
+  printf 'PKG-004 rc=%s stderr=%s\n' "$check_rc" "$(tr '\n' ' ' < "$work/check.err" 2>/dev/null || true)"
 fi
 
 printf 'SUMMARY assertions=4 expected=4 failures=%s infra=0\n' "$failures"
