@@ -248,7 +248,8 @@ def main() -> int:
                 "ZIP-TYPE",
                 (
                     "    if (\n"
-                    "        dos_attributes & 0x10\n"
+                    "        create_system not in (0, 3)\n"
+                    "        or dos_attributes & 0x18\n"
                     "        or (create_system == 3 and unix_type not in (0, stat.S_IFREG))\n"
                     "    ):\n"
                 ),
@@ -262,7 +263,7 @@ def main() -> int:
                 "M-ZIP-FLAG-001",
                 "encrypted.zip",
                 "ZIP-FLAG",
-                "    if flags & ~0x800:\n",
+                "    if flags & ~allowed_flags:\n",
                 (
                     "    if os.environ.get(\"AGENT_LAB_ZIP_MUTATION_MARK\") is not None:\n"
                     "        Path(os.environ[\"AGENT_LAB_ZIP_MUTATION_MARK\"]).touch()\n"
