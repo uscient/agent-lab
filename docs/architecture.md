@@ -76,6 +76,10 @@ repository-pinned CUE contract emits one canonical, digest-bound `RequestedExper
 in-process, and asks the repository-pinned Cedar policy whether the fixed local compatibility
 principal may submit the exact plan digest.
 
+For public Git, the fixed TLS-authenticated GitHub API binds the requested commit ID to its returned
+root-tree ID. The adapter requires the response to echo that commit and independently recomputes the
+returned tree and blob Git object IDs before the authored bytes enter the common planning path.
+
 The preview forms create no durable Agent Lab state; Git previews have only their bounded public
 acquisition effect. `experiment install` instead repeats snapshotting, planning, and Cedar
 evaluation, then stores the exact permitted evidence in the initialized home. Directory, ZIP, and
