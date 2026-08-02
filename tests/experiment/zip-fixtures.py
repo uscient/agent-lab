@@ -77,6 +77,28 @@ def mutate(base: bytes, operation) -> bytes:
     return bytes(data)
 
 
+def insert_gap(base: bytes, gap: bytes) -> bytes:
+    data = bytearray(base)
+    _local, central, eocd = offsets(data)
+    data[central:central] = gap
+    eocd += len(gap)
+    u32(data, eocd + 16, central + len(gap))
+    return bytes(data)
+
+
+def append_to_deflate_payload(base: bytes, suffix: bytes) -> bytes:
+    data = bytearray(base)
+    local, central, eocd = offsets(data)
+    compressed_size = struct.unpack_from("<I", data, local + 18)[0]
+    data[central:central] = suffix
+    central += len(suffix)
+    eocd += len(suffix)
+    u32(data, local + 18, compressed_size + len(suffix))
+    u32(data, central + 20, compressed_size + len(suffix))
+    u32(data, eocd + 16, central)
+    return bytes(data)
+
+
 def replace_names(base: bytes, replacement: bytes, *, local: bool = True, central: bool = True) -> bytes:
     if len(replacement) != len(b"experiment.cue"):
         raise ValueError("replacement name must preserve record lengths")
@@ -153,6 +175,21 @@ def main() -> int:
             u16(data, central + 10, 99),
         ),
     )
+    fixtures["utf8-ascii.zip"] = mutate(
+        stored,
+        lambda data, local, central, _eocd: (
+            u16(data, local + 6, struct.unpack_from("<H", data, local + 6)[0] | 0x800),
+            u16(data, central + 8, struct.unpack_from("<H", data, central + 8)[0] | 0x800),
+        ),
+    )
+    fixtures["creator-version-45.zip"] = mutate(
+        stored,
+        lambda data, _local, central, _eocd: u16(
+            data,
+            central + 4,
+            (struct.unpack_from("<H", data, central + 4)[0] & 0xFF00) | 45,
+        ),
+    )
     fixtures["zip64-version.zip"] = mutate(
         stored,
         lambda data, local, central, _eocd: (
@@ -205,6 +242,34 @@ def main() -> int:
         stored,
         lambda data, _local, central, _eocd: u16(data, central + 8, 0x800),
     )
+    fixtures["local-method-mismatch.zip"] = mutate(
+        stored,
+        lambda data, local, _central, _eocd: u16(data, local + 8, 8),
+    )
+    fixtures["local-crc-mismatch.zip"] = mutate(
+        stored,
+        lambda data, local, _central, _eocd: u32(data, local + 14, 0),
+    )
+    fixtures["local-size-mismatch.zip"] = mutate(
+        stored,
+        lambda data, local, _central, _eocd: u32(data, local + 22, len(source) - 1),
+    )
+    fixtures["eocd-count-mismatch.zip"] = mutate(
+        stored,
+        lambda data, _local, _central, eocd: u16(data, eocd + 10, 2),
+    )
+    fixtures["eocd-offset-mismatch.zip"] = mutate(
+        stored,
+        lambda data, _local, central, eocd: u32(data, eocd + 16, central + 1),
+    )
+    fixtures["eocd-size-mismatch.zip"] = mutate(
+        stored,
+        lambda data, _local, _central, eocd: u32(
+            data,
+            eocd + 12,
+            struct.unpack_from("<I", data, eocd + 12)[0] + 1,
+        ),
+    )
     fixtures["bad-crc.zip"] = mutate(
         stored,
         lambda data, local, central, _eocd: (
@@ -219,11 +284,22 @@ def main() -> int:
             u32(data, central + 24, len(source) - 1),
         ),
     )
+    fixtures["corrupt-payload.zip"] = mutate(
+        stored,
+        lambda data, _local, _central, _eocd: data.__setitem__(
+            44, data[44] ^ 1
+        ),
+    )
     central_offset = offsets(stored)[1]
     fixtures["missing-central.zip"] = stored[:central_offset]
     deflated_central = offsets(deflated)[1]
     fixtures["truncated-deflate.zip"] = deflated[: deflated_central - 1]
     fixtures["trailing.zip"] = stored + b"trailing ambiguity"
+    fixtures["prefixed.zip"] = b"prefix" + stored
+    fixtures["payload-gap.zip"] = insert_gap(stored, b"gap")
+    fixtures["duplicate-eocd.zip"] = stored + stored[-22:]
+    fixtures["concatenated.zip"] = stored + stored
+    fixtures["deflate-unused-input.zip"] = append_to_deflate_payload(deflated, b"unused")
 
     big_source = source + b"\n//" + (b"x" * 270_000) + b"\n"
     limit_source = source + b"\n//" + (
