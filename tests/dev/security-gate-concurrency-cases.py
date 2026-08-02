@@ -1534,7 +1534,14 @@ PY
 ) &
 for ((attempt = 0; attempt < 500; attempt++)); do
   if [ -f "$FLOOD_STARTED" ]; then
-    exit 0
+    : > "$FLOOD_ARM"
+    for ((ready_attempt = 0; ready_attempt < 500; ready_attempt++)); do
+      if [ -f "$FLOOD_READY" ]; then
+        exit 0
+      fi
+      sleep 0.002
+    done
+    exit 125
   fi
   sleep 0.002
 done
