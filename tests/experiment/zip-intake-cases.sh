@@ -176,12 +176,16 @@ capture dos-archive-file "$agent_lab" experiment check --zip "$work/dos-archive-
 dos_archive_file_rc="$CAPTURE_RC"
 capture ntfs-archive-file "$agent_lab" experiment check --zip "$work/ntfs-archive-file.zip"
 ntfs_archive_file_rc="$CAPTURE_RC"
+capture vfat-archive-file "$agent_lab" experiment check --zip "$work/vfat-archive-file.zip"
+vfat_archive_file_rc="$CAPTURE_RC"
 if [ "$utf8_ascii_rc" -eq 0 ] && [ "$creator_version_rc" -eq 0 ] &&
    [ "$deflate_level_hint_rc" -eq 0 ] && [ "$dos_archive_file_rc" -eq 0 ] &&
    [ "$ntfs_archive_file_rc" -eq 0 ] &&
+   [ "$vfat_archive_file_rc" -eq 0 ] &&
    [ ! -s "$work/utf8-ascii.err" ] && [ ! -s "$work/creator-version.err" ] &&
    [ ! -s "$work/deflate-level-hint.err" ] && [ ! -s "$work/dos-archive-file.err" ] &&
    [ ! -s "$work/ntfs-archive-file.err" ] &&
+   [ ! -s "$work/vfat-archive-file.err" ] &&
    [ "$(jq -r '.source.digest' "$work/utf8-ascii.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ] &&
    [ "$(jq -r '.source.digest' "$work/creator-version.out")" = \
@@ -191,6 +195,8 @@ if [ "$utf8_ascii_rc" -eq 0 ] && [ "$creator_version_rc" -eq 0 ] &&
    [ "$(jq -r '.source.digest' "$work/dos-archive-file.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ] &&
    [ "$(jq -r '.source.digest' "$work/ntfs-archive-file.out")" = \
+     "$(jq -r '.source.digest' "$work/directory.out")" ] &&
+   [ "$(jq -r '.source.digest' "$work/vfat-archive-file.out")" = \
      "$(jq -r '.source.digest' "$work/directory.out")" ]; then
   pass ZIP-COMPAT-001 "benign ZIP creator and compression metadata remain compatible"
 else
