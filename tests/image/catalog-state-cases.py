@@ -448,13 +448,39 @@ def main() -> int:
         before = fingerprint(foreign_wrapper)
         completed = cli(staging_home, "image", "add", "vendor.worker", SUBJECT)
         after = fingerprint(foreign_wrapper)
+        unsafe_cleanup_home = new_home(root, "unsafe-cleanup-home")
+        unsafe_cleanup = (
+            unsafe_cleanup_home / "images" / ".staging" / "image-catalog-cleanup"
+        )
+        unsafe_cleanup.mkdir(mode=0o700)
+        (unsafe_cleanup / "payload").write_bytes(b"not-a-directory\n")
+        (unsafe_cleanup / "payload").chmod(0o600)
+        cleanup_before = fingerprint(unsafe_cleanup)
+        cleanup_read = cli(unsafe_cleanup_home, "image", "list")
+        cleanup_retry = cli(
+            unsafe_cleanup_home,
+            "image",
+            "add",
+            "vendor.worker",
+            SUBJECT,
+        )
+        cleanup_after = fingerprint(unsafe_cleanup)
         check(
             "CAT-STATE-009",
             completed.returncode == 125
             and before == after
-            and not (staging_home / "images" / "catalog").exists(),
-            "unknown staging ownership is preserved and blocks new mutation",
-            f"rc={completed.returncode} wrapper_changed={before != after}",
+            and not (staging_home / "images" / "catalog").exists()
+            and cleanup_read.returncode == 125
+            and cleanup_read.stdout == b""
+            and cleanup_retry.returncode == 125
+            and cleanup_retry.stdout == b""
+            and cleanup_before == cleanup_after,
+            "unknown or unsafe staging ownership is preserved and blocks reads and mutation",
+            (
+                f"rc={completed.returncode} wrapper_changed={before != after} "
+                f"cleanup_read={cleanup_read.returncode} cleanup_retry={cleanup_retry.returncode} "
+                f"cleanup_changed={cleanup_before != cleanup_after}"
+            ),
         )
 
         pristine_home = new_home(root, "pristine-home")
@@ -613,10 +639,42 @@ def main() -> int:
             split_rejected = True
         finally:
             CATALOG.fcntl.flock = original_flock
+
+        transition_home = new_home(root, "marker-transition-home")
+        transition_authority = CATALOG._load_home(transition_home)
+        transition_lock = transition_home / "state" / "locks" / "image-catalog.lock"
+        original_open = CATALOG.os.open
+        transition_observed = None
+        transitioned = False
+
+        def append_marker_before_open(path, flags, *args, **kwargs):
+            nonlocal transitioned
+            if Path(path) == transition_lock and flags & os.O_RDWR and not transitioned:
+                marker_descriptor = original_open(
+                    path,
+                    os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0),
+                )
+                try:
+                    os.write(marker_descriptor, b"initialized\n")
+                    os.fsync(marker_descriptor)
+                finally:
+                    os.close(marker_descriptor)
+                transitioned = True
+            return original_open(path, flags, *args, **kwargs)
+
+        CATALOG.os.open = append_marker_before_open
+        try:
+            with CATALOG._catalog_lock(transition_authority, exclusive=False) as descriptor:
+                transition_observed = CATALOG._lock_bytes(descriptor)
+        finally:
+            CATALOG.os.open = original_open
         check(
             "CAT-STATE-018",
-            split_rejected and split_replaced,
-            "receipt-bound lock identity is rechecked after acquisition to prevent split-brain",
+            split_rejected
+            and split_replaced
+            and transitioned
+            and transition_observed == CATALOG.LOCK_INITIALIZED,
+            "post-acquisition replacement is rejected while a valid same-inode marker transition is accepted",
         )
 
         nested_home = new_home(root, "nested-json-home")

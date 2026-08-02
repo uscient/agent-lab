@@ -3,20 +3,103 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 agent_lab="$repo_root/scripts/agent-lab"
-work="$(mktemp -d)"
-trap 'find "$work" -type f -delete 2>/dev/null || true; find "$work" -type l -delete 2>/dev/null || true; find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || true' EXIT
+bounded_helper="$repo_root/tests/helpers/run-bounded.py"
+expected_count=14
+work=""
+failures=0
+infrastructure=0
 
-if [ ! -x "$agent_lab" ] || ! command -v jq >/dev/null 2>&1 || [ ! -d "$repo_root/.cache/dev/tools/cue" ]; then
-  printf 'INFRA catalog resolution prerequisites are unavailable\n' >&2
+cleanup_work() {
+  local failed=0
+  if [ -n "$work" ] && [ -e "$work" ]; then
+    find "$work" -type f -delete 2>/dev/null || failed=1
+    find "$work" -type l -delete 2>/dev/null || failed=1
+    find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || failed=1
+    [ ! -e "$work" ] || failed=1
+  fi
+  return "$failed"
+}
+
+finish() {
+  local assertions=0
+  if [ -n "${observed:-}" ] && [ -f "$observed" ]; then
+    assertions="$(wc -l < "$observed")"
+  fi
+  if ! cleanup_work; then
+    infrastructure=1
+  fi
+  trap - EXIT
+  printf 'SUMMARY assertions=%s expected=%s failures=%s infra=%s\n' \
+    "$assertions" "$expected_count" "$failures" "$infrastructure"
+  if [ "$infrastructure" -ne 0 ]; then
+    exit 125
+  fi
+  if [ "$failures" -ne 0 ]; then
+    exit 1
+  fi
+}
+
+if ! work="$(mktemp -d)"; then
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 fi
-
-failures=0
+trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 observed="$work/observed"
 : > "$observed"
+
+if [ ! -x "$agent_lab" ] || [ ! -f "$bounded_helper" ] || ! command -v jq >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 || [ ! -d "$repo_root/.cache/dev/tools/cue" ]; then
+  printf 'INFRA catalog resolution prerequisites are unavailable\n' >&2
+  infrastructure=1
+  finish
+fi
+if ! python3 -I -B "$bounded_helper" --self-test > "$work/bounded-self-test.out" 2> "$work/bounded-self-test.err"; then
+  printf 'INFRA bounded command helper self-test failed\n' >&2
+  infrastructure=1
+  finish
+fi
+
 pass() { printf 'PASS %s %s\n' "$1" "$2"; printf '%s\n' "$1" >> "$observed"; }
 fail() { printf 'FAIL %s %s\n' "$1" "$2"; printf '%s\n' "$1" >> "$observed"; failures=$((failures + 1)); }
-capture() { CAPTURE_RC=0; "$@" > "$work/stdout" 2> "$work/stderr" || CAPTURE_RC=$?; }
+run_bounded() {
+  local output="$1"
+  local errors="$2"
+  local expectation="$3"
+  local status="${output}.status"
+  local rc=0
+  local status_line=""
+  shift 3
+  find "$status" -delete 2>/dev/null || true
+  python3 -I -B "$bounded_helper" \
+    --timeout 5 --status "$status" --stdout "$output" --stderr "$errors" -- "$@" || rc=$?
+  if [ -f "$status" ]; then
+    status_line="$(cat "$status")"
+  fi
+  if [ "$status_line" != "child:$rc" ]; then
+    infrastructure=1
+    rc=125
+  else
+    case "$rc" in
+      0|1)
+        ;;
+      125)
+        [ "$expectation" = expected-125 ] || infrastructure=1
+        ;;
+      *)
+        infrastructure=1
+        ;;
+    esac
+  fi
+  return "$rc"
+}
+capture() {
+  local expectation="normal"
+  if [ "${1:-}" = expected-125 ]; then
+    expectation="expected-125"
+    shift
+  fi
+  CAPTURE_RC=0
+  run_bounded "$work/stdout" "$work/stderr" "$expectation" "$@" || CAPTURE_RC=$?
+}
 subject_a="registry.example/operator/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 subject_b="registry.example/operator/other@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
@@ -25,7 +108,8 @@ init_home() {
   capture "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed: %s\n' "$(tr '\n' ' ' < "$work/stderr")" >&2
-    exit 125
+    infrastructure=1
+    finish
   fi
   cp -a "$repo_root/.cache/dev/tools/cue/." "$home/cache/tools/cue/"
 }
@@ -34,7 +118,8 @@ copy_cedar() {
   local home="$1"
   if [ ! -d "$repo_root/.cache/dev/tools/cedar" ]; then
     printf 'INFRA pinned Cedar test cache is unavailable\n' >&2
-    exit 125
+    infrastructure=1
+    finish
   fi
   cp -a "$repo_root/.cache/dev/tools/cedar/." "$home/cache/tools/cedar/"
 }
@@ -84,7 +169,8 @@ init_home "$active_home"
 capture "$agent_lab" --home "$active_home" image add vendor.worker "$subject_a"
 if [ "$CAPTURE_RC" -ne 0 ]; then
   printf 'INFRA active local mapping setup failed\n' >&2
-  exit 125
+  infrastructure=1
+  finish
 fi
 entry_a="$(jq -r '.entryDigest' "$work/stdout")"
 artifact="$work/active-artifact"
@@ -181,7 +267,7 @@ history_home="$work/history-home"
 init_home "$history_home"
 capture "$agent_lab" --home "$history_home" image add vendor.worker "$subject_a"
 mv "$history_home/images/catalog/entries" "$work/removed-resolution-history"
-capture "$agent_lab" --home "$history_home" experiment check "$artifact"
+capture expected-125 "$agent_lab" --home "$history_home" experiment check "$artifact"
 if [ "$CAPTURE_RC" -eq 125 ] && [ ! -s "$work/stdout" ]; then
   pass RES-STATE-001 "local resolution verifies immutable entry history before binding"
 else
@@ -196,9 +282,9 @@ mv "$drift_home/images/catalog" "$drift_home/other-images/catalog"
 jq -cS '.paths.images="other-images"' "$drift_home/config.json" > "$work/drift-config.json"
 mv "$work/drift-config.json" "$drift_home/config.json"
 chmod 600 "$drift_home/config.json"
-capture "$agent_lab" --home "$drift_home" config check
+capture expected-125 "$agent_lab" --home "$drift_home" config check
 drift_config_rc="$CAPTURE_RC"
-capture "$agent_lab" --home "$drift_home" experiment check "$artifact"
+capture expected-125 "$agent_lab" --home "$drift_home" experiment check "$artifact"
 if [ "$drift_config_rc" -eq 125 ] && [ "$CAPTURE_RC" -eq 125 ] && [ ! -s "$work/stdout" ]; then
   pass RES-STATE-002 "receipt-breaking config drift cannot redirect local resolution"
 else
@@ -212,7 +298,7 @@ mv "$symlink_source/images/catalog" "$work/outside-resolution-catalog"
 symlink_home="$work/symlink-home"
 init_home "$symlink_home"
 ln -s "$work/outside-resolution-catalog" "$symlink_home/images/catalog"
-capture "$agent_lab" --home "$symlink_home" experiment check "$artifact"
+capture expected-125 "$agent_lab" --home "$symlink_home" experiment check "$artifact"
 if [ "$CAPTURE_RC" -eq 125 ] && [ ! -s "$work/stdout" ]; then
   pass RES-STATE-003 "local resolution refuses a symlinked catalog authority"
 else
@@ -285,6 +371,7 @@ cp "$repo_root/scripts/install-local" "$repo_root/scripts/install-local.py" "$ru
 chmod +x "$runtime_replica/scripts/install-local" "$runtime_replica/scripts/agent-lab"
 capture "$runtime_replica/scripts/install-local" --prefix "$installed_prefix"
 installed_install_rc="$CAPTURE_RC"
+installed_runtime_before="$(find "$installed_prefix" -printf '%P %y %m %s\n' 2>/dev/null | LC_ALL=C sort)"
 mv "$runtime_replica" "$work/runtime-source-unavailable"
 mkdir "$work/installed-unrelated"
 installed_rc=125
@@ -294,13 +381,18 @@ if [ "$installed_install_rc" -eq 0 ]; then
   capture "$installed_prefix/bin/agent-lab" --home "$installed_home" image add vendor.worker "$subject_a"
   installed_entry="$(jq -r '.entryDigest // empty' "$work/stdout" 2>/dev/null)"
   installed_rc=0
-  (cd "$work/installed-unrelated" && env -i PATH=/usr/bin:/bin \
-    "$installed_prefix/bin/agent-lab" --home "$installed_home" experiment check "$artifact") \
-    > "$work/installed-check.json" 2> "$work/installed-check.err" || installed_rc=$?
+  (cd "$work/installed-unrelated" && run_bounded \
+    "$work/installed-check.json" "$work/installed-check.err" normal \
+    env -i PATH=/usr/bin:/bin \
+    "$installed_prefix/bin/agent-lab" --home "$installed_home" experiment check "$artifact") || installed_rc=$?
+  [ "$installed_rc" -eq 0 ] || [ "$installed_rc" -eq 1 ] || infrastructure=1
 else
   installed_entry=""
 fi
+installed_runtime_after="$(find "$installed_prefix" -printf '%P %y %m %s\n' 2>/dev/null | LC_ALL=C sort)"
 if [ "$installed_install_rc" -eq 0 ] && [ "$installed_rc" -eq 0 ] &&
+   [ "$installed_runtime_before" = "$installed_runtime_after" ] &&
+   [ -z "$(find "$installed_prefix" -name __pycache__ -print -quit 2>/dev/null)" ] &&
    [ ! -s "$work/installed-check.err" ] && jq -e --arg entry "$installed_entry" --arg subject "$subject_a" '
      .plan.spec.members[0].resolvedImage == {
        entryDigest: $entry,
@@ -309,9 +401,9 @@ if [ "$installed_install_rc" -eq 0 ] && [ "$installed_rc" -eq 0 ] &&
        subject: $subject
      }
    ' "$work/installed-check.json" >/dev/null 2>&1; then
-  pass RES-INSTALL-001 "installed catalog commands and local resolution run without the source replica or checkout cwd"
+  pass RES-INSTALL-001 "installed catalog resolution is source-independent and leaves its release topology unchanged"
 else
-  fail RES-INSTALL-001 "installed catalog commands and local resolution run without the source replica or checkout cwd"
+  fail RES-INSTALL-001 "installed catalog resolution is source-independent and leaves its release topology unchanged"
 fi
 
 canary_home="$work/canary-home"
@@ -328,8 +420,9 @@ done
 calibrated="$(find "$canary_marks" -type f | wc -l)"
 find "$canary_marks" -type f -delete
 canary_rc=0
-env -i PATH="$canary_bin:/usr/bin:/bin" LANG=C LC_ALL=C CANARY_DIR="$canary_marks" \
-  "$agent_lab" --home "$canary_home" experiment check "$artifact" > "$work/canary.out" 2> "$work/canary.err" || canary_rc=$?
+run_bounded "$work/canary.out" "$work/canary.err" normal \
+  env -i PATH="$canary_bin:/usr/bin:/bin" LANG=C LC_ALL=C CANARY_DIR="$canary_marks" \
+  "$agent_lab" --home "$canary_home" experiment check "$artifact" || canary_rc=$?
 if [ "$calibrated" -eq 4 ] && [ "$canary_rc" -eq 0 ] && [ -z "$(find "$canary_marks" -type f -print -quit)" ]; then
   pass RES-NOEF-001 "calibrated forbidden-effect canaries remain silent during local resolution"
 else
@@ -343,7 +436,6 @@ printf '%s\n' \
   RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA catalog resolution assertion identity drift\n' >&2
-  exit 125
+  infrastructure=1
 fi
-printf 'SUMMARY assertions=14 expected=14 failures=%s infra=0\n' "$failures"
-[ "$failures" -eq 0 ]
+finish

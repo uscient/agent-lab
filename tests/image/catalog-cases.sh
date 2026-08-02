@@ -3,20 +3,98 @@ set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 agent_lab="$repo_root/scripts/agent-lab"
-work="$(mktemp -d)"
-trap 'find "$work" -type f -delete 2>/dev/null || true; find "$work" -type l -delete 2>/dev/null || true; find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || true' EXIT
+bounded_helper="$repo_root/tests/helpers/run-bounded.py"
+expected_count=18
+work=""
+failures=0
+infrastructure=0
 
-if [ ! -x "$agent_lab" ] || ! command -v jq >/dev/null 2>&1; then
-  printf 'INFRA catalog public-contract prerequisites are unavailable\n' >&2
+cleanup_work() {
+  local failed=0
+  if [ -n "$work" ] && [ -e "$work" ]; then
+    find "$work" -type f -delete 2>/dev/null || failed=1
+    find "$work" -type l -delete 2>/dev/null || failed=1
+    find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || failed=1
+    [ ! -e "$work" ] || failed=1
+  fi
+  return "$failed"
+}
+
+finish() {
+  local assertions=0
+  if [ -n "${observed:-}" ] && [ -f "$observed" ]; then
+    assertions="$(wc -l < "$observed")"
+  fi
+  if ! cleanup_work; then
+    infrastructure=1
+  fi
+  trap - EXIT
+  printf 'SUMMARY assertions=%s expected=%s failures=%s infra=%s\n' \
+    "$assertions" "$expected_count" "$failures" "$infrastructure"
+  if [ "$infrastructure" -ne 0 ]; then
+    exit 125
+  fi
+  if [ "$failures" -ne 0 ]; then
+    exit 1
+  fi
+}
+
+if ! work="$(mktemp -d)"; then
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 fi
-
-failures=0
+trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 observed="$work/observed"
 : > "$observed"
+
+if [ ! -x "$agent_lab" ] || [ ! -f "$bounded_helper" ] || ! command -v jq >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  printf 'INFRA catalog public-contract prerequisites are unavailable\n' >&2
+  infrastructure=1
+  finish
+fi
+if ! python3 -I -B "$bounded_helper" --self-test > "$work/bounded-self-test.out" 2> "$work/bounded-self-test.err"; then
+  printf 'INFRA bounded command helper self-test failed\n' >&2
+  infrastructure=1
+  finish
+fi
+
 pass() { printf 'PASS %s %s\n' "$1" "$2"; printf '%s\n' "$1" >> "$observed"; }
 fail() { printf 'FAIL %s %s\n' "$1" "$2"; printf '%s\n' "$1" >> "$observed"; failures=$((failures + 1)); }
-capture() { CAPTURE_RC=0; "$@" > "$work/stdout" 2> "$work/stderr" || CAPTURE_RC=$?; }
+run_bounded() {
+  local output="$1"
+  local errors="$2"
+  local expectation="$3"
+  local status="${output}.status"
+  local rc=0
+  local status_line=""
+  shift 3
+  find "$status" -delete 2>/dev/null || true
+  python3 -I -B "$bounded_helper" \
+    --timeout 5 --status "$status" --stdout "$output" --stderr "$errors" -- "$@" || rc=$?
+  if [ -f "$status" ]; then
+    status_line="$(cat "$status")"
+  fi
+  if [ "$status_line" != "child:$rc" ]; then
+    infrastructure=1
+    rc=125
+  else
+    case "$rc" in
+      0|1)
+        ;;
+      125)
+        [ "$expectation" = expected-125 ] || infrastructure=1
+        ;;
+      *)
+        infrastructure=1
+        ;;
+    esac
+  fi
+  return "$rc"
+}
+capture() {
+  CAPTURE_RC=0
+  run_bounded "$work/stdout" "$work/stderr" normal "$@" || CAPTURE_RC=$?
+}
 subject_a="registry.example/operator/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 subject_b="registry.example/operator/other@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
@@ -25,7 +103,8 @@ init_home() {
   capture "$agent_lab" --home "$home" init
   if [ "$CAPTURE_RC" -ne 0 ]; then
     printf 'INFRA temporary Agent Lab home initialization failed: %s\n' "$(tr '\n' ' ' < "$work/stderr")" >&2
-    exit 125
+    infrastructure=1
+    finish
   fi
 }
 
@@ -68,7 +147,8 @@ invalid_names=(
   $'vendor.im\nage'
 )
 invalid_names_ok=true
-before_invalid="$(capture "$agent_lab" --home "$grammar_home" image list --all; jq -r 'length' "$work/stdout" 2>/dev/null || printf invalid)"
+capture "$agent_lab" --home "$grammar_home" image list --all
+before_invalid="$(jq -r 'length' "$work/stdout" 2>/dev/null || printf invalid)"
 for name in "${invalid_names[@]}"; do
   capture "$agent_lab" --home "$grammar_home" image add "$name" "$subject_a"
   if [ "$CAPTURE_RC" -ne 1 ] || [ -s "$work/stdout" ]; then
@@ -257,8 +337,9 @@ done
 calibrated="$(find "$canary_marks" -type f | wc -l)"
 find "$canary_marks" -type f -delete
 canary_rc=0
-env -i PATH="$canary_bin:/usr/bin:/bin" LANG=C LC_ALL=C CANARY_DIR="$canary_marks" \
-  "$agent_lab" --home "$canary_home" image add noeffect.mapping "$subject_a" > "$work/canary.out" 2> "$work/canary.err" || canary_rc=$?
+run_bounded "$work/canary.out" "$work/canary.err" normal \
+  env -i PATH="$canary_bin:/usr/bin:/bin" LANG=C LC_ALL=C CANARY_DIR="$canary_marks" \
+  "$agent_lab" --home "$canary_home" image add noeffect.mapping "$subject_a" || canary_rc=$?
 if [ "$calibrated" -eq 4 ] && [ "$canary_rc" -eq 0 ] && [ -z "$(find "$canary_marks" -type f -print -quit)" ]; then
   pass CAT-NOEF-001 "calibrated Docker, Git, downloader, and network-tool canaries remain silent"
 else
@@ -267,12 +348,22 @@ fi
 
 concurrent_home="$work/concurrent-home"
 init_home "$concurrent_home"
-"$agent_lab" --home "$concurrent_home" image add race.first "$subject_a" > "$work/race-first-1.out" 2> "$work/race-first-1.err" &
+run_bounded "$work/race-first-1.out" "$work/race-first-1.err" normal \
+  "$agent_lab" --home "$concurrent_home" image add race.first "$subject_a" &
 pid_one=$!
-"$agent_lab" --home "$concurrent_home" image add race.first "$subject_a" > "$work/race-first-2.out" 2> "$work/race-first-2.err" &
+run_bounded "$work/race-first-2.out" "$work/race-first-2.err" normal \
+  "$agent_lab" --home "$concurrent_home" image add race.first "$subject_a" &
 pid_two=$!
 wait "$pid_one"; rc_one=$?
 wait "$pid_two"; rc_two=$?
+case "$rc_one:$rc_two" in
+  0:0)
+    ;;
+  *)
+    [ "$rc_one" -eq 0 ] || [ "$rc_one" -eq 1 ] || infrastructure=1
+    [ "$rc_two" -eq 0 ] || [ "$rc_two" -eq 1 ] || infrastructure=1
+    ;;
+esac
 first_outcomes="$(jq -r '.changed' "$work/race-first-1.out" "$work/race-first-2.out" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')"
 if [ "$rc_one" -eq 0 ] && [ "$rc_two" -eq 0 ] && [ "$first_outcomes" = "false true " ] &&
    [ "$(find "$concurrent_home/images/catalog/entries" -maxdepth 1 -type f | wc -l)" -eq 1 ] &&
@@ -284,12 +375,16 @@ fi
 
 capture "$agent_lab" --home "$concurrent_home" image inspect race.first
 race_entry="$(jq -r '.entryDigest // empty' "$work/stdout" 2>/dev/null)"
-"$agent_lab" --home "$concurrent_home" image add race.first "$subject_a" > "$work/race-add.out" 2> "$work/race-add.err" &
+run_bounded "$work/race-add.out" "$work/race-add.err" normal \
+  "$agent_lab" --home "$concurrent_home" image add race.first "$subject_a" &
 pid_add=$!
-"$agent_lab" --home "$concurrent_home" image remove race.first --expect "$race_entry" > "$work/race-remove.out" 2> "$work/race-remove.err" &
+run_bounded "$work/race-remove.out" "$work/race-remove.err" normal \
+  "$agent_lab" --home "$concurrent_home" image remove race.first --expect "$race_entry" &
 pid_remove=$!
 wait "$pid_add"; rc_add=$?
 wait "$pid_remove"; rc_remove=$?
+[ "$rc_add" -eq 0 ] || [ "$rc_add" -eq 1 ] || infrastructure=1
+[ "$rc_remove" -eq 0 ] || [ "$rc_remove" -eq 1 ] || infrastructure=1
 capture "$agent_lab" --home "$concurrent_home" image inspect race.first
 if [ "$rc_remove" -eq 0 ] && { [ "$rc_add" -eq 0 ] || [ "$rc_add" -eq 1 ]; } &&
    [ "$CAPTURE_RC" -eq 0 ] && jq -e '.state == "removed" and .generation == 2' "$work/stdout" >/dev/null 2>&1 &&
@@ -307,7 +402,6 @@ printf '%s\n' \
   CAT-READ-001 CAT-READ-002 CAT-NOEF-001 CAT-CONC-001 CAT-CONC-002 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA catalog public assertion identity drift\n' >&2
-  exit 125
+  infrastructure=1
 fi
-printf 'SUMMARY assertions=18 expected=18 failures=%s infra=0\n' "$failures"
-[ "$failures" -eq 0 ]
+finish

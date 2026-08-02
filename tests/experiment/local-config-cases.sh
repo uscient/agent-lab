@@ -2,8 +2,22 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-work="$(mktemp -d)"
-trap 'find "$work" -type f -delete 2>/dev/null || true; find "$work" -type l -delete 2>/dev/null || true; find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || true' EXIT
+work=""
+cleanup_work() {
+  local failed=0
+  if [ -n "$work" ] && [ -e "$work" ]; then
+    find "$work" -type f -delete 2>/dev/null || failed=1
+    find "$work" -type l -delete 2>/dev/null || failed=1
+    find "$work" -depth -type d -exec rmdir {} + 2>/dev/null || failed=1
+    [ ! -e "$work" ] || failed=1
+  fi
+  return "$failed"
+}
+if ! work="$(mktemp -d)"; then
+  printf 'SUMMARY assertions=0 expected=5 failures=0 infra=1\n'
+  exit 125
+fi
+trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 rc=0
 "$repo_root/scripts/agent-lab" --home "$work/home" init > "$work/out" 2> "$work/err" || rc=$?
 failures=0
@@ -133,5 +147,13 @@ else
   failures=$((failures + 1))
 fi
 
-printf 'SUMMARY assertions=5 expected=5 failures=%s infra=0\n' "$failures"
+infrastructure=0
+if ! cleanup_work; then
+  infrastructure=1
+fi
+trap - EXIT
+printf 'SUMMARY assertions=5 expected=5 failures=%s infra=%s\n' "$failures" "$infrastructure"
+if [ "$infrastructure" -ne 0 ]; then
+  exit 125
+fi
 [ "$failures" -eq 0 ]
