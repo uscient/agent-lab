@@ -306,6 +306,8 @@ def _git_provider_json(
     path: str,
     remaining: int,
     deadline: float,
+    *,
+    stable_not_found: bool,
 ) -> tuple[object, int]:
     if remaining <= 0:
         raise InfrastructureError("git provider GIT-ACQUIRE exhausted its response bound")
@@ -325,12 +327,6 @@ def _git_provider_json(
         raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
     if not isinstance(status, int) or isinstance(status, bool):
         raise InfrastructureError("git provider GIT-STATUS response is malformed")
-    if status in (404, 422):
-        _git_reject("GIT-NOTFOUND", "does not expose the requested public object")
-    if 300 <= status <= 399:
-        raise InfrastructureError("git provider GIT-REDIRECT response is not accepted")
-    if status != 200:
-        raise InfrastructureError("git provider GIT-STATUS did not establish a result")
     if not isinstance(raw_headers, tuple):
         raise InfrastructureError("git provider GIT-HEADER response is malformed")
     headers: dict[str, str] = {}
@@ -358,6 +354,14 @@ def _git_provider_json(
         or declared_length != len(body)
     ):
         raise InfrastructureError("git provider GIT-OUTPUT response exceeded its bound")
+    if status in (404, 422):
+        if stable_not_found:
+            _git_reject("GIT-NOTFOUND", "does not expose the requested public object")
+        raise InfrastructureError("git provider GIT-DRIFT bound object disappeared")
+    if 300 <= status <= 399:
+        raise InfrastructureError("git provider GIT-REDIRECT response is not accepted")
+    if status != 200:
+        raise InfrastructureError("git provider GIT-STATUS did not establish a result")
     try:
         value = strict_json(body, source="git provider response")
     except InvalidManifest as error:
@@ -879,7 +883,11 @@ def _read_git_snapshot_with_requester(
 
     commit_path = f"/repos/{owner}/{repository}/git/commits/{requested_commit}"
     commit_value, used = _git_provider_json(
-        requester, commit_path, MAX_ARCHIVE_BYTES - acquired, deadline
+        requester,
+        commit_path,
+        MAX_ARCHIVE_BYTES - acquired,
+        deadline,
+        stable_not_found=True,
     )
     acquired += used
     if not isinstance(commit_value, dict) or commit_value.get("sha") != requested_commit:
@@ -893,7 +901,11 @@ def _read_git_snapshot_with_requester(
 
     tree_path = f"/repos/{owner}/{repository}/git/trees/{tree_id}"
     tree_value, used = _git_provider_json(
-        requester, tree_path, MAX_ARCHIVE_BYTES - acquired, deadline
+        requester,
+        tree_path,
+        MAX_ARCHIVE_BYTES - acquired,
+        deadline,
+        stable_not_found=False,
     )
     acquired += used
     if (
@@ -931,7 +943,11 @@ def _read_git_snapshot_with_requester(
 
     blob_path = f"/repos/{owner}/{repository}/git/blobs/{blob_id}"
     blob_value, used = _git_provider_json(
-        requester, blob_path, MAX_ARCHIVE_BYTES - acquired, deadline
+        requester,
+        blob_path,
+        MAX_ARCHIVE_BYTES - acquired,
+        deadline,
+        stable_not_found=False,
     )
     acquired += used
     if (
