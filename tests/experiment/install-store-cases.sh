@@ -6,7 +6,7 @@ agent_lab="$repo_root/scripts/agent-lab"
 bounded_helper="$repo_root/tests/helpers/run-bounded.py"
 fixture="$repo_root/tests/experiment/fixtures/directories/minimal"
 runtime_manifest="$repo_root/packaging/agent-lab-local.manifest"
-expected_count=12
+expected_count=13
 work=""
 failures=0
 infrastructure=0
@@ -579,11 +579,166 @@ else
   fail INST-LOCAL-001 "removed local selector blocks retry while retained installation remains inspectable"
 fi
 
+installed_source="$work/installed-runtime-source"
+installed_unavailable="$work/installed-runtime-source-unavailable"
+installed_prefix="$work/installed-prefix"
+installed_home="$work/installed-home"
+installed_candidate="$work/installed-candidate"
+installed_tools="$work/installed-pinned-tools"
+installed_unrelated="$work/installed-unrelated"
+installed_fixture_ok=1
+mkdir -p \
+  "$installed_source/packaging" \
+  "$installed_source/scripts" \
+  "$installed_candidate" \
+  "$installed_tools/cue" \
+  "$installed_tools/cedar" \
+  "$installed_unrelated" || installed_fixture_ok=0
+while IFS= read -r runtime_name; do
+  if [ -z "$runtime_name" ] || [ ! -f "$repo_root/$runtime_name" ]; then
+    installed_fixture_ok=0
+    continue
+  fi
+  mkdir -p "$installed_source/$(dirname -- "$runtime_name")" || installed_fixture_ok=0
+  cp "$repo_root/$runtime_name" "$installed_source/$runtime_name" || installed_fixture_ok=0
+done < "$runtime_manifest"
+cp "$runtime_manifest" "$installed_source/packaging/agent-lab-local.manifest" \
+  || installed_fixture_ok=0
+cp "$repo_root/scripts/install-local" "$repo_root/scripts/install-local.py" \
+  "$installed_source/scripts/" || installed_fixture_ok=0
+cp "$fixture/experiment.cue" "$installed_candidate/experiment.cue" \
+  || installed_fixture_ok=0
+cp -a "$repo_root/.cache/dev/tools/cue/." "$installed_tools/cue/" \
+  || installed_fixture_ok=0
+cp -a "$repo_root/.cache/dev/tools/cedar/." "$installed_tools/cedar/" \
+  || installed_fixture_ok=0
+chmod +x "$installed_source/scripts/install-local" "$installed_source/scripts/agent-lab" \
+  || installed_fixture_ok=0
+
+installed_bundle_rc=125
+installed_init_rc=125
+installed_first_rc=125
+installed_inspect_rc=125
+installed_retry_rc=125
+installed_prefix_before="unavailable"
+installed_prefix_after="unavailable"
+installed_home_after_first="unavailable"
+installed_home_after_inspect="unavailable"
+installed_home_after_retry="unavailable"
+installed_bundle_out="$work/installed-bundle.out"
+installed_bundle_err="$work/installed-bundle.err"
+installed_init_err="$work/installed-init.err"
+installed_first_out="$work/installed-first.out"
+installed_first_err="$work/installed-first.err"
+installed_inspect_out="$work/installed-inspect.out"
+installed_inspect_err="$work/installed-inspect.err"
+installed_retry_out="$work/installed-retry.out"
+installed_retry_err="$work/installed-retry.err"
+: > "$installed_bundle_out"
+: > "$installed_bundle_err"
+: > "$installed_init_err"
+: > "$installed_first_out"
+: > "$installed_first_err"
+: > "$installed_inspect_out"
+: > "$installed_inspect_err"
+: > "$installed_retry_out"
+: > "$installed_retry_err"
+
+capture_installed() {
+  local label="$1"
+  shift
+  capture "$label" env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    /bin/sh -c 'cd "$1" || exit 125; shift; exec "$@"' \
+    agent-lab-installed "$installed_unrelated" \
+    "$installed_prefix/bin/agent-lab" --home "$installed_home" "$@"
+}
+
+if [ "$installed_fixture_ok" -eq 1 ]; then
+  capture installed-bundle env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    "$installed_source/scripts/install-local" --prefix "$installed_prefix"
+  installed_bundle_rc="$CAPTURE_RC"
+  installed_bundle_out="$CAPTURE_OUT"
+  installed_bundle_err="$CAPTURE_ERR"
+  installed_prefix_before="$(state_receipt "$installed_prefix")" || infrastructure=1
+  if ! mv "$installed_source" "$installed_unavailable"; then
+    installed_fixture_ok=0
+    infrastructure=1
+  fi
+
+  capture_installed installed-init init
+  installed_init_rc="$CAPTURE_RC"
+  installed_init_err="$CAPTURE_ERR"
+  if [ "$installed_init_rc" -eq 0 ]; then
+    cp -a "$installed_tools/cue/." "$installed_home/cache/tools/cue/" \
+      || installed_fixture_ok=0
+    cp -a "$installed_tools/cedar/." "$installed_home/cache/tools/cedar/" \
+      || installed_fixture_ok=0
+    if [ "$installed_fixture_ok" -ne 1 ]; then
+      infrastructure=1
+    fi
+  fi
+
+  capture_installed installed-first experiment install "$installed_candidate"
+  installed_first_rc="$CAPTURE_RC"
+  installed_first_out="$CAPTURE_OUT"
+  installed_first_err="$CAPTURE_ERR"
+  installed_home_after_first="$(state_receipt "$installed_home")" || infrastructure=1
+
+  capture_installed installed-inspect experiment inspect first-experiment
+  installed_inspect_rc="$CAPTURE_RC"
+  installed_inspect_out="$CAPTURE_OUT"
+  installed_inspect_err="$CAPTURE_ERR"
+  installed_home_after_inspect="$(state_receipt "$installed_home")" || infrastructure=1
+
+  capture_installed installed-retry experiment install "$installed_candidate"
+  installed_retry_rc="$CAPTURE_RC"
+  installed_retry_out="$CAPTURE_OUT"
+  installed_retry_err="$CAPTURE_ERR"
+  installed_home_after_retry="$(state_receipt "$installed_home")" || infrastructure=1
+  installed_prefix_after="$(state_receipt "$installed_prefix")" || infrastructure=1
+else
+  infrastructure=1
+fi
+
+installed_key="$(jq -r '.installationKey // empty' "$installed_first_out" 2>/dev/null)"
+installed_receipt="$(jq -r '.receiptDigest // empty' "$installed_first_out" 2>/dev/null)"
+installed_target="$(readlink -f "$installed_prefix/bin/agent-lab" 2>/dev/null || true)"
+if [ "$installed_fixture_ok" -eq 1 ] \
+   && [ "$installed_bundle_rc" -eq 0 ] && [ ! -s "$installed_bundle_err" ] \
+   && grep -Eq '^installed:[0-9a-f]{64}$' "$installed_bundle_out" \
+   && [ "$installed_init_rc" -eq 0 ] && [ ! -s "$installed_init_err" ] \
+   && [ "$installed_first_rc" -eq 0 ] && [ ! -s "$installed_first_err" ] \
+   && jq -e '.changed == true and .name == "first-experiment"' \
+     "$installed_first_out" >/dev/null 2>&1 \
+   && [ "$installed_inspect_rc" -eq 0 ] && [ ! -s "$installed_inspect_err" ] \
+   && jq -e --arg key "$installed_key" --arg receipt "$installed_receipt" \
+     '.state == "installed" and .name == "first-experiment" and
+      .installationKey == $key and .receiptDigest == $receipt' \
+     "$installed_inspect_out" >/dev/null 2>&1 \
+   && [ "$installed_retry_rc" -eq 0 ] && [ ! -s "$installed_retry_err" ] \
+   && jq -e --arg key "$installed_key" --arg receipt "$installed_receipt" \
+     '.changed == false and .name == "first-experiment" and
+      .installationKey == $key and .receiptDigest == $receipt' \
+     "$installed_retry_out" >/dev/null 2>&1 \
+   && [ "$installed_home_after_first" = "$installed_home_after_inspect" ] \
+   && [ "$installed_home_after_first" = "$installed_home_after_retry" ] \
+   && [ "$installed_prefix_before" = "$installed_prefix_after" ] \
+   && [ ! -e "$installed_source" ] && [ -d "$installed_unavailable" ] \
+   && [ -z "$(find "$installed_prefix" -name __pycache__ -print -quit 2>/dev/null)" ] \
+   && case "$installed_target" in
+        "$installed_prefix"/lib/agent-lab/releases/*/scripts/agent-lab) true ;;
+        *) false ;;
+      esac; then
+  pass INST-RUNTIME-001 "installed runtime remains source-independent through install, inspect, and exact retry"
+else
+  fail INST-RUNTIME-001 "installed runtime remains source-independent through install, inspect, and exact retry"
+fi
+
 expected="$work/expected"
 printf '%s\n' \
   INST-HOME-001 INST-UNKNOWN-001 INST-NAME-001 INST-PERMIT-001 INST-RECEIPT-001 \
   INST-INSPECT-001 INST-RETRY-001 INST-CONFLICT-001 INST-DENY-001 \
-  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 > "$expected"
+  INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 INST-RUNTIME-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA install-store assertion identity drift\n' >&2
   infrastructure=1
