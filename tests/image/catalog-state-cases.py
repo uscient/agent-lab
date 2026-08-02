@@ -63,6 +63,7 @@ def load_catalog_module():
 CATALOG = load_catalog_module()
 FAILURES = 0
 OBSERVED: list[str] = []
+CLI_CALLS = 0
 
 
 def check(assertion: str, condition: bool, message: str, detail: str = "") -> None:
@@ -77,6 +78,8 @@ def check(assertion: str, condition: bool, message: str, detail: str = "") -> No
 
 
 def cli(home: Path, *arguments: str, timeout: float = 5.0) -> subprocess.CompletedProcess[bytes]:
+    global CLI_CALLS
+    CLI_CALLS += 1
     environment = {
         "PATH": "/usr/bin:/bin",
         "LANG": "C",
@@ -1048,6 +1051,7 @@ def main() -> int:
             "catalog staging cleanup.after_fsync",
         )
         matrix_failures: list[str] = []
+        matrix_cli_start = CLI_CALLS
         for index, point in enumerate(bootstrap_points):
             home = new_home(root, f"bootstrap-crash-{index:02d}")
             child_rc = hard_exit_add(home, "vendor.worker", SUBJECT, point)
@@ -1112,6 +1116,12 @@ def main() -> int:
                     f"later:{point}:child={child_rc}:before={before_retry.returncode}:"
                     f"retry={retry.returncode}:final={final.returncode}"
                 )
+        matrix_cli_calls = CLI_CALLS - matrix_cli_start
+        expected_matrix_cli_calls = 2 * (len(bootstrap_points) + len(later_points))
+        if matrix_cli_calls != expected_matrix_cli_calls:
+            matrix_failures.append(
+                f"cli-calls:{matrix_cli_calls}:expected={expected_matrix_cli_calls}"
+            )
         check(
             "CAT-CRASH-006",
             not matrix_failures,
