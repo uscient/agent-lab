@@ -271,6 +271,49 @@ else
   fail RES-AUTH-001 "fresh authorization binds the selected-entry plan digest"
 fi
 
+installed_prefix="$work/installed-prefix"
+installed_home="$work/installed-home"
+runtime_replica="$work/runtime-replica"
+runtime_manifest="$repo_root/packaging/agent-lab-local.manifest"
+mkdir -p "$runtime_replica/packaging" "$runtime_replica/scripts"
+while IFS= read -r runtime_name; do
+  mkdir -p "$runtime_replica/$(dirname -- "$runtime_name")"
+  cp "$repo_root/$runtime_name" "$runtime_replica/$runtime_name"
+done < "$runtime_manifest"
+cp "$runtime_manifest" "$runtime_replica/packaging/agent-lab-local.manifest"
+cp "$repo_root/scripts/install-local" "$repo_root/scripts/install-local.py" "$runtime_replica/scripts/"
+chmod +x "$runtime_replica/scripts/install-local" "$runtime_replica/scripts/agent-lab"
+capture "$runtime_replica/scripts/install-local" --prefix "$installed_prefix"
+installed_install_rc="$CAPTURE_RC"
+mv "$runtime_replica" "$work/runtime-source-unavailable"
+mkdir "$work/installed-unrelated"
+installed_rc=125
+if [ "$installed_install_rc" -eq 0 ]; then
+  capture "$installed_prefix/bin/agent-lab" --home "$installed_home" init
+  cp -a "$repo_root/.cache/dev/tools/cue/." "$installed_home/cache/tools/cue/"
+  capture "$installed_prefix/bin/agent-lab" --home "$installed_home" image add vendor.worker "$subject_a"
+  installed_entry="$(jq -r '.entryDigest // empty' "$work/stdout" 2>/dev/null)"
+  installed_rc=0
+  (cd "$work/installed-unrelated" && env -i PATH=/usr/bin:/bin \
+    "$installed_prefix/bin/agent-lab" --home "$installed_home" experiment check "$artifact") \
+    > "$work/installed-check.json" 2> "$work/installed-check.err" || installed_rc=$?
+else
+  installed_entry=""
+fi
+if [ "$installed_install_rc" -eq 0 ] && [ "$installed_rc" -eq 0 ] &&
+   [ ! -s "$work/installed-check.err" ] && jq -e --arg entry "$installed_entry" --arg subject "$subject_a" '
+     .plan.spec.members[0].resolvedImage == {
+       entryDigest: $entry,
+       generation: 1,
+       origin: "local",
+       subject: $subject
+     }
+   ' "$work/installed-check.json" >/dev/null 2>&1; then
+  pass RES-INSTALL-001 "installed catalog commands and local resolution run without the source replica or checkout cwd"
+else
+  fail RES-INSTALL-001 "installed catalog commands and local resolution run without the source replica or checkout cwd"
+fi
+
 canary_home="$work/canary-home"
 init_home "$canary_home"
 capture "$agent_lab" --home "$canary_home" image add vendor.worker "$subject_a"
@@ -297,10 +340,10 @@ expected="$work/expected"
 printf '%s\n' \
   RES-ENTRY-001 RES-SNAP-001 RES-SNAP-002 RES-ENTRY-002 RES-ENTRY-003 \
   RES-ISOLATE-001 RES-STATE-001 RES-STATE-002 RES-STATE-003 RES-INPUT-001 \
-  RES-SNAP-003 RES-AUTH-001 RES-NOEF-001 > "$expected"
+  RES-SNAP-003 RES-AUTH-001 RES-INSTALL-001 RES-NOEF-001 > "$expected"
 if ! cmp -s "$expected" "$observed"; then
   printf 'INFRA catalog resolution assertion identity drift\n' >&2
   exit 125
 fi
-printf 'SUMMARY assertions=13 expected=13 failures=%s infra=0\n' "$failures"
+printf 'SUMMARY assertions=14 expected=14 failures=%s infra=0\n' "$failures"
 [ "$failures" -eq 0 ]
