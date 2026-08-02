@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import stat
 import struct
@@ -31,9 +32,20 @@ GIT_PROVIDER_AUTHORITY = "api.github.com"
 GIT_PROVIDER_METHOD = "github-git-data-v3"
 GIT_PROVIDER_HEADERS = (
     ("Accept", "application/vnd.github+json"),
+    ("Accept-Encoding", "identity"),
     ("User-Agent", "agent-lab/v0alpha1"),
     ("X-GitHub-Api-Version", "2022-11-28"),
 )
+GIT_PROVIDER_CA_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+)
+GIT_PROVIDER_MAX_HEADER_BYTES = 32_768
+GIT_WORKER_MAX_OUTPUT_BYTES = ((MAX_ARCHIVE_BYTES + 2) // 3) * 4 + 65_536
+GIT_WORKER_MAX_ERROR_BYTES = 4_096
+GIT_WORKER_MEMORY_BYTES = 268_435_456
+GIT_WORKER_FRAME = b"agent-lab.git-provider.v1\0"
+GIT_WORKER_GRACE_SECONDS = 0.25
 GIT_SHA1 = re.compile(r"[0-9a-f]{40}", re.ASCII)
 GITHUB_SOURCE_URL = re.compile(
     r"https://github\.com/"
@@ -316,7 +328,7 @@ def _git_provider_json(
     if status in (404, 422):
         _git_reject("GIT-NOTFOUND", "does not expose the requested public object")
     if 300 <= status <= 399:
-        _git_reject("GIT-REDIRECT", "redirects are not accepted")
+        raise InfrastructureError("git provider GIT-REDIRECT response is not accepted")
     if status != 200:
         raise InfrastructureError("git provider GIT-STATUS did not establish a result")
     if not isinstance(raw_headers, tuple):
@@ -353,19 +365,515 @@ def _git_provider_json(
     return value, len(body)
 
 
-def read_git_snapshot(
+def _git_system_ca_pem() -> str:
+    for raw_path in GIT_PROVIDER_CA_FILES:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(raw_path, flags)
+        except OSError:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or not 1 <= metadata.st_size <= 10_485_760
+            ):
+                continue
+            chunks: list[bytes] = []
+            remaining = metadata.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(65_536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            if remaining != 0 or len(data) != metadata.st_size:
+                continue
+            try:
+                return data.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+        finally:
+            os.close(descriptor)
+    raise InfrastructureError("git provider GIT-TLS system trust is unavailable")
+
+
+def _github_api_request(
+    authority: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...],
+    maximum: int,
+    deadline: float,
+) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
+    """Perform one fixed-authority HTTPS request inside the isolated worker."""
+
+    if (
+        authority != GIT_PROVIDER_AUTHORITY
+        or headers != GIT_PROVIDER_HEADERS
+        or not path.startswith("/repos/")
+        or not 0 < maximum <= MAX_ARCHIVE_BYTES
+    ):
+        raise InfrastructureError("git provider GIT-AUTHORITY request is malformed")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+    try:
+        import http.client
+        import ssl
+
+        http.client._MAXLINE = 8_192
+        http.client._MAXHEADERS = 32
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_verify_locations(cadata=_git_system_ca_pem())
+        connection = http.client.HTTPSConnection(
+            authority,
+            port=443,
+            timeout=remaining,
+            context=context,
+        )
+        response = None
+        try:
+            connection.request("GET", path, headers=dict(headers))
+            response = connection.getresponse()
+            raw_headers = response.getheaders()
+            if len(raw_headers) > 32:
+                raise InfrastructureError("git provider GIT-HEADER count exceeded its bound")
+            header_bytes = 0
+            selected: dict[str, str] = {}
+            for name, value in raw_headers:
+                try:
+                    encoded_name = name.encode("ascii")
+                    encoded_value = value.encode("ascii")
+                except UnicodeEncodeError as error:
+                    raise InfrastructureError(
+                        "git provider GIT-HEADER response is malformed"
+                    ) from error
+                header_bytes += len(encoded_name) + len(encoded_value) + 4
+                lowered = name.lower()
+                if lowered in {
+                    "content-encoding",
+                    "content-length",
+                    "content-type",
+                    "transfer-encoding",
+                }:
+                    if lowered in selected:
+                        raise InfrastructureError(
+                            "git provider GIT-HEADER response is ambiguous"
+                        )
+                    selected[lowered] = value
+            if header_bytes > GIT_PROVIDER_MAX_HEADER_BYTES:
+                raise InfrastructureError("git provider GIT-HEADER bytes exceeded their bound")
+            status = response.status
+            if status != 200:
+                return (
+                    status,
+                    (
+                        ("content-length", "0"),
+                        ("content-type", "application/json; charset=utf-8"),
+                    ),
+                    b"",
+                )
+            if "transfer-encoding" in selected or selected.get(
+                "content-encoding", "identity"
+            ) != "identity":
+                raise InfrastructureError("git provider GIT-HEADER encoding is unsupported")
+            if selected.get("content-type") != "application/json; charset=utf-8":
+                raise InfrastructureError("git provider GIT-HEADER content type is uncertain")
+            declared = selected.get("content-length", "")
+            if (
+                not declared.isascii()
+                or not declared.isdigit()
+                or (len(declared) > 1 and declared.startswith("0"))
+            ):
+                raise InfrastructureError("git provider GIT-HEADER content length is invalid")
+            declared_length = int(declared)
+            if declared_length > maximum:
+                raise InfrastructureError("git provider GIT-OUTPUT response exceeded its bound")
+            output = bytearray()
+            while len(output) < declared_length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+                if connection.sock is not None:
+                    connection.sock.settimeout(remaining)
+                chunk = response.read(min(65_536, declared_length - len(output)))
+                if not chunk:
+                    raise InfrastructureError("git provider GIT-OUTPUT response was truncated")
+                output.extend(chunk)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
+            if response.read(1) != b"":
+                raise InfrastructureError("git provider GIT-OUTPUT response exceeded its length")
+            return (
+                status,
+                (
+                    ("content-length", str(len(output))),
+                    ("content-type", "application/json; charset=utf-8"),
+                ),
+                bytes(output),
+            )
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
+    except InfrastructureError:
+        raise
+    except Exception as error:
+        raise InfrastructureError("git provider GIT-TRANSPORT request failed") from error
+
+
+def _git_worker_group_alive(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _git_worker_terminate(pid: int, *, reaped: bool) -> bool:
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, signum)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + GIT_WORKER_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if not reaped:
+                try:
+                    waited, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    reaped = True
+                else:
+                    reaped = waited == pid
+            if reaped and not _git_worker_group_alive(pid):
+                return True
+            time.sleep(0.01)
+    if not reaped:
+        try:
+            os.waitpid(pid, 0)
+            reaped = True
+        except ChildProcessError:
+            reaped = True
+        except OSError:
+            pass
+    return reaped and not _git_worker_group_alive(pid)
+
+
+def _git_worker_write(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("worker pipe made no progress")
+        view = view[written:]
+
+
+def _git_worker_child(
+    control_read: int,
+    stdout_write: int,
+    stderr_write: int,
+    authority: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...],
+    maximum: int,
+    deadline: float,
+) -> NoReturn:
+    exit_code = 125
+    try:
+        os.setsid()
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+            signal.signal(signum, signal.SIG_DFL)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, set())
+        except (AttributeError, OSError, ValueError):
+            pass
+        null_descriptor = os.open("/dev/null", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        os.dup2(null_descriptor, 0)
+        os.dup2(stdout_write, 1)
+        os.dup2(stderr_write, 2)
+        os.dup2(control_read, 3)
+        import resource
+
+        maximum_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        if maximum_fd == resource.RLIM_INFINITY:
+            maximum_fd = 1_048_576
+        os.closerange(4, int(maximum_fd))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (GIT_WORKER_MEMORY_BYTES, GIT_WORKER_MEMORY_BYTES),
+        )
+        resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+        resource.setrlimit(resource.RLIMIT_CPU, (4, 4))
+        os.environ.clear()
+        os.environ.update(
+            {
+                "HOME": "/nonexistent",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            }
+        )
+        os.chdir("/")
+        os.umask(0o077)
+        try:
+            status, result_headers, body = _github_api_request(
+                authority, path, headers, maximum, deadline
+            )
+            value: dict[str, object] = {
+                "body": base64.b64encode(body).decode("ascii"),
+                "headers": [list(item) for item in result_headers],
+                "kind": "result",
+                "status": status,
+            }
+            exit_code = 0
+        except InvalidManifest:
+            value = {"kind": "reject"}
+            exit_code = 1
+        except InfrastructureError:
+            value = {"kind": "infra"}
+            exit_code = 125
+        except BaseException:
+            value = {"kind": "infra"}
+            exit_code = 125
+        payload = json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        if len(payload) > GIT_WORKER_MAX_OUTPUT_BYTES:
+            payload = b'{"kind":"infra"}'
+            exit_code = 125
+        frame = GIT_WORKER_FRAME + len(payload).to_bytes(8, "big") + payload
+        _git_worker_write(1, frame)
+        acknowledgement = os.read(3, 1)
+        if acknowledgement != b"1":
+            exit_code = 125
+    except BaseException:
+        exit_code = 125
+    os._exit(exit_code)
+
+
+def _github_worker_request(
+    authority: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...],
+    maximum: int,
+    deadline: float,
+) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
+    if time.monotonic() >= deadline:
+        raise InfrastructureError("git provider GIT-TIMEOUT deadline expired")
+    control_read, control_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+    stdout_read, stdout_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+    stderr_read, stderr_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+    pid = -1
+    reaped = False
+    acknowledged = False
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    errors = bytearray()
+    process_status: int | None = None
+    failure: str | None = None
+    try:
+        pid = os.fork()
+        if pid == 0:
+            os.close(control_write)
+            os.close(stdout_read)
+            os.close(stderr_read)
+            _git_worker_child(
+                control_read,
+                stdout_write,
+                stderr_write,
+                authority,
+                path,
+                headers,
+                maximum,
+                deadline,
+            )
+        os.close(control_read)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        control_read = stdout_write = stderr_write = -1
+        os.set_blocking(stdout_read, False)
+        os.set_blocking(stderr_read, False)
+        selector.register(stdout_read, selectors.EVENT_READ, "stdout")
+        selector.register(stderr_read, selectors.EVENT_READ, "stderr")
+        expected_frame: int | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "git provider GIT-TIMEOUT deadline expired"
+                break
+            for key, _ in selector.select(min(0.05, remaining)):
+                descriptor = int(key.fd)
+                try:
+                    chunk = os.read(descriptor, 65_536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(descriptor)
+                    continue
+                if key.data == "stdout":
+                    output.extend(chunk)
+                    if len(output) > len(GIT_WORKER_FRAME) + 8 + GIT_WORKER_MAX_OUTPUT_BYTES:
+                        failure = "git provider GIT-OUTPUT worker output exceeded its bound"
+                        break
+                    header_size = len(GIT_WORKER_FRAME) + 8
+                    if expected_frame is None and len(output) >= header_size:
+                        if not output.startswith(GIT_WORKER_FRAME):
+                            failure = "git provider GIT-WORKER frame is malformed"
+                            break
+                        payload_size = int.from_bytes(
+                            output[len(GIT_WORKER_FRAME) : header_size], "big"
+                        )
+                        if payload_size > GIT_WORKER_MAX_OUTPUT_BYTES:
+                            failure = "git provider GIT-OUTPUT worker frame exceeded its bound"
+                            break
+                        expected_frame = header_size + payload_size
+                    if expected_frame is not None and len(output) > expected_frame:
+                        failure = "git provider GIT-WORKER frame has trailing data"
+                        break
+                else:
+                    errors.extend(chunk)
+                    if len(errors) > GIT_WORKER_MAX_ERROR_BYTES:
+                        failure = "git provider GIT-OUTPUT worker error exceeded its bound"
+                        break
+            if failure is not None:
+                break
+            if expected_frame is not None and len(output) == expected_frame and not acknowledged:
+                if errors:
+                    failure = "git provider GIT-WORKER emitted unexpected diagnostics"
+                    break
+                _git_worker_write(control_write, b"1")
+                os.close(control_write)
+                control_write = -1
+                acknowledged = True
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = pid
+                status = 125 << 8
+            if waited == pid:
+                reaped = True
+                process_status = status
+            if reaped and acknowledged and _git_worker_group_alive(pid):
+                failure = "git provider GIT-WORKER left a residual process group"
+                break
+            if reaped and not selector.get_map():
+                break
+            if reaped and not acknowledged:
+                failure = "git provider GIT-WORKER exited before a complete frame"
+                break
+        if failure is None and not reaped:
+            remaining = max(0.0, deadline - time.monotonic())
+            wait_deadline = time.monotonic() + min(GIT_WORKER_GRACE_SECONDS, remaining)
+            while time.monotonic() < wait_deadline:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+                if waited == pid:
+                    reaped = True
+                    process_status = status
+                    break
+                time.sleep(0.01)
+            if not reaped:
+                failure = "git provider GIT-WORKER did not exit after its result"
+        if failure is None and _git_worker_group_alive(pid):
+            failure = "git provider GIT-WORKER left a residual process group"
+        if failure is not None:
+            raise InfrastructureError(failure)
+        if process_status is None or not os.WIFEXITED(process_status):
+            raise InfrastructureError("git provider GIT-WORKER exit status is uncertain")
+        returncode = os.WEXITSTATUS(process_status)
+        header_size = len(GIT_WORKER_FRAME) + 8
+        if len(output) < header_size:
+            raise InfrastructureError("git provider GIT-WORKER frame is incomplete")
+        payload = bytes(output[header_size:])
+        try:
+            value = strict_json(payload, source="git provider worker frame")
+        except InvalidManifest as error:
+            raise InfrastructureError("git provider GIT-WORKER frame is malformed") from error
+        if value == {"kind": "reject"} and returncode == 1:
+            _git_reject("GIT-PROVIDER", "request was rejected")
+        if value == {"kind": "infra"} and returncode == 125:
+            raise InfrastructureError("git provider GIT-WORKER request was uncertain")
+        if (
+            returncode != 0
+            or not isinstance(value, dict)
+            or set(value) != {"body", "headers", "kind", "status"}
+            or value.get("kind") != "result"
+            or not isinstance(value.get("status"), int)
+            or isinstance(value.get("status"), bool)
+            or not isinstance(value.get("headers"), list)
+            or not isinstance(value.get("body"), str)
+        ):
+            raise InfrastructureError("git provider GIT-WORKER result is malformed")
+        result_headers: list[tuple[str, str]] = []
+        for item in value["headers"]:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(part, str) for part in item)
+            ):
+                raise InfrastructureError("git provider GIT-WORKER headers are malformed")
+            result_headers.append((item[0], item[1]))
+        encoded_body = value["body"]
+        assert isinstance(encoded_body, str)
+        if not encoded_body.isascii() or len(encoded_body) > ((maximum + 2) // 3) * 4:
+            raise InfrastructureError("git provider GIT-OUTPUT worker body exceeded its bound")
+        try:
+            body = base64.b64decode(encoded_body, validate=True)
+        except (ValueError, base64.binascii.Error) as error:
+            raise InfrastructureError("git provider GIT-WORKER body is malformed") from error
+        if len(body) > maximum:
+            raise InfrastructureError("git provider GIT-OUTPUT worker body exceeded its bound")
+        return int(value["status"]), tuple(result_headers), body
+    except InfrastructureError:
+        raise
+    except (OSError, ValueError) as error:
+        raise InfrastructureError("git provider GIT-WORKER could not establish a result") from error
+    finally:
+        selector.close()
+        for descriptor in (
+            control_read,
+            control_write,
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+        ):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if pid > 0 and (not reaped or _git_worker_group_alive(pid)):
+            if not _git_worker_terminate(pid, reaped=reaped):
+                raise InfrastructureError("git provider GIT-WORKER cleanup is uncertain")
+
+
+def _read_git_snapshot_with_requester(
     url: str,
     commit: str,
-    *,
-    requester: GitRequester | None = None,
+    requester: GitRequester,
 ) -> SourceSnapshot:
     """Acquire one exact public GitHub commit through the bounded Git Data API."""
 
     if sys.platform != "linux":
         raise InfrastructureError("git source GIT-PLATFORM requires Linux")
     canonical, owner, repository, requested_commit = _parse_git_source(url, commit)
-    if requester is None:
-        raise InfrastructureError("git provider GIT-TRANSPORT runner is unavailable")
     deadline = time.monotonic() + GIT_ACQUISITION_TIMEOUT_SECONDS
     acquired = 0
 
@@ -480,6 +988,24 @@ def read_git_snapshot(
             "tree": f"sha1:{tree_id}",
             "url": canonical,
         },
+    )
+
+
+def read_git_snapshot(
+    url: str,
+    commit: str,
+    *,
+    requester: GitRequester | None = None,
+) -> SourceSnapshot:
+    """Acquire one exact public GitHub commit through the bounded Git Data API."""
+
+    if sys.platform != "linux":
+        raise InfrastructureError("git source GIT-PLATFORM requires Linux")
+    canonical, _, _, requested_commit = _parse_git_source(url, commit)
+    if requester is not None:
+        return _read_git_snapshot_with_requester(canonical, requested_commit, requester)
+    return _read_git_snapshot_with_requester(
+        canonical, requested_commit, _github_worker_request
     )
 
 

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import sys
 import tempfile
 
@@ -479,6 +480,7 @@ def main() -> int:
 
                 expected_headers = (
                     ("Accept", "application/vnd.github+json"),
+                    ("Accept-Encoding", "identity"),
                     ("User-Agent", "agent-lab/v0alpha1"),
                     ("X-GitHub-Api-Version", "2022-11-28"),
                 )
@@ -676,8 +678,10 @@ def main() -> int:
                     )
                 )
 
-                read_descriptor, write_descriptor = os.pipe()
-                os.set_blocking(read_descriptor, False)
+                residual_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                residual_listener.bind(("127.0.0.1", 0))
+                residual_listener.settimeout(1.0)
+                residual_address = residual_listener.getsockname()
                 residual_spawned = False
                 residual_pid = None
                 residual_calls = 0
@@ -688,9 +692,12 @@ def main() -> int:
                     if residual_calls == 1:
                         child = os.fork()
                         if child == 0:
-                            os.close(read_descriptor)
                             try:
-                                os.write(write_descriptor, f"{os.getpid()}\n".encode("ascii"))
+                                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                                    sender.sendto(
+                                        f"{os.getpid()}\n".encode("ascii"),
+                                        residual_address,
+                                    )
                                 while True:
                                     signal.pause()
                             finally:
@@ -706,17 +713,16 @@ def main() -> int:
                     except experiment.InfrastructureError as error:
                         residual_outcome = str(error)
                 finally:
-                    os.close(write_descriptor)
                     if original_worker_requester is None:
                         delattr(experiment, "_github_api_request")
                     else:
                         experiment._github_api_request = original_worker_requester
                 try:
-                    residual_record = os.read(read_descriptor, 64).decode("ascii").strip()
-                except BlockingIOError:
+                    residual_record = residual_listener.recv(64).decode("ascii").strip()
+                except TimeoutError:
                     residual_record = ""
                 finally:
-                    os.close(read_descriptor)
+                    residual_listener.close()
                 if residual_record.isdigit():
                     residual_spawned = True
                     residual_pid = int(residual_record)
