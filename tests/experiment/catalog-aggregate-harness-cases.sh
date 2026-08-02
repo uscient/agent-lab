@@ -148,7 +148,7 @@ write_python_fixture() {
       printf '    time.sleep(0.01)\n'
       printf 'if os.environ.get("AGENT_LAB_CATALOG_AGG_SIGNAL_MODE") == "cooperative":\n'
       printf '    descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
-      printf '    (control / "python-descendant.pid").write_text(str(descendant.pid), encoding="ascii")\n'
+      printf '    (control / "python-descendant.pid").write_text(str(descendant.pid) + "\\n", encoding="ascii")\n'
       printf '    (control / "python-signal.ready").touch()\n'
       printf '    descendant.wait()\n'
     fi
