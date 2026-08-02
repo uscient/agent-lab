@@ -340,6 +340,17 @@ def main() -> int:
             u32(data, central + 38, 0x20),
         ),
     )
+    fixtures["vfat-archive-file.zip"] = mutate(
+        stored,
+        lambda data, _local, central, _eocd: (
+            u16(
+                data,
+                central + 4,
+                (14 << 8) | (struct.unpack_from("<H", data, central + 4)[0] & 0x00FF),
+            ),
+            u32(data, central + 38, 0x20),
+        ),
+    )
     fixtures["eocd-count-mismatch.zip"] = mutate(
         stored,
         lambda data, _local, _central, eocd: u16(data, eocd + 10, 2),
