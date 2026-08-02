@@ -624,6 +624,10 @@ def main(argv: list[str]) -> int:
                 return 125
         print("tools:ready")
         return 0
+    if argv[:3] == ["experiment", "check", "--zip"] and len(argv) == 4:
+        os.environ["AGENT_LAB_HOME"] = str(home)
+        os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
+        return experiment_module().main(["experiment.py", "check-zip", argv[3]])
     if argv[:2] == ["experiment", "check"] and len(argv) == 3:
         os.environ["AGENT_LAB_HOME"] = str(home)
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))

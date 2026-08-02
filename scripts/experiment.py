@@ -12,11 +12,13 @@ from pathlib import Path
 import re
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from typing import NamedTuple, NoReturn
+import zlib
 
 
 MAX_MANIFEST_BYTES = 262_144
@@ -105,6 +107,7 @@ class PlanBinding(NamedTuple):
 class SourceSnapshot(NamedTuple):
     data: bytes
     digest: str
+    transport: dict[str, object]
 
 
 class PlanResolution(NamedTuple):
@@ -225,6 +228,16 @@ def read_manifest_once(
     return data
 
 
+def source_digest(data: bytes) -> str:
+    name = b"experiment.cue"
+    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
+    digest.update(len(name).to_bytes(4, "big"))
+    digest.update(name)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+    return f"sha256:{digest.hexdigest()}"
+
+
 def read_directory_snapshot(path: str) -> SourceSnapshot:
     try:
         directory_stat = os.lstat(path)
@@ -259,13 +272,53 @@ def read_directory_snapshot(path: str) -> SourceSnapshot:
         final_directory_stat.st_ino,
     ):
         raise InfrastructureError("source directory changed while snapshotting")
-    name = b"experiment.cue"
-    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
-    digest.update(len(name).to_bytes(4, "big"))
-    digest.update(name)
-    digest.update(len(data).to_bytes(8, "big"))
-    digest.update(data)
-    return SourceSnapshot(data=data, digest=f"sha256:{digest.hexdigest()}")
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={"kind": "directory"},
+    )
+
+
+def read_zip_snapshot(path: str) -> SourceSnapshot:
+    """Read the first local ZIP member into the common source snapshot."""
+
+    try:
+        archive = Path(path).read_bytes()
+        (
+            signature,
+            _version,
+            _flags,
+            method,
+            _modified_time,
+            _modified_date,
+            _crc,
+            compressed_size,
+            _expanded_size,
+            name_size,
+            extra_size,
+        ) = struct.unpack_from("<4s5H3I2H", archive)
+        if signature != b"PK\x03\x04":
+            raise ValueError("local header")
+        start = 30 + name_size + extra_size
+        payload = archive[start : start + compressed_size]
+        if method == 0:
+            data = payload
+        elif method == 8:
+            data = zlib.decompress(payload, -15)
+        else:
+            raise ValueError("compression method")
+    except OSError as error:
+        raise InfrastructureError("zip archive could not be read") from error
+    except (struct.error, ValueError, zlib.error) as error:
+        raise InvalidManifest("zip archive is malformed") from error
+    return SourceSnapshot(
+        data=data,
+        digest=source_digest(data),
+        transport={
+            "archiveDigest": "sha256:" + hashlib.sha256(archive).hexdigest(),
+            "kind": "zip",
+        },
+    )
 
 
 def authored_manifest(snapshot: SourceSnapshot) -> object:
@@ -1408,17 +1461,21 @@ def write_decision(decision: object) -> None:
 def main(argv: list[str]) -> int:
     directory_checking = len(argv) == 3 and argv[1] == "check-directory"
     directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
-    if directory_checking or directory_authorizing:
+    zip_checking = len(argv) == 3 and argv[1] == "check-zip"
+    if directory_checking or directory_authorizing or zip_checking:
         try:
-            snapshot = read_directory_snapshot(argv[2])
+            if zip_checking:
+                snapshot = read_zip_snapshot(argv[2])
+            else:
+                snapshot = read_directory_snapshot(argv[2])
             manifest = authored_manifest(snapshot)
             resolution = cue_plan_with_evidence(manifest)
             plan = resolution.plan
-            if directory_checking:
+            if directory_checking or zip_checking:
                 checked: dict[str, object] = {
                     "digest": plan_digest(plan),
                     "plan": plan,
-                    "source": {"digest": snapshot.digest, "kind": "directory"},
+                    "source": {"digest": snapshot.digest, **snapshot.transport},
                 }
                 catalog = catalog_resolution_evidence(
                     resolution.bundled_catalog,
