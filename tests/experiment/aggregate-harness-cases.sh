@@ -471,7 +471,8 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
 
   combined_executions="$work/combined-executions"
   LC_ALL=C sort "$local_executions" "$install_executions" > "$combined_executions"
-  if cmp -s <(LC_ALL=C sort "$expected_local_executions") \
+  if [ "$local_route_rc" -eq 0 ] && [ "$install_route_rc" -eq 0 ] &&
+     cmp -s <(LC_ALL=C sort "$expected_local_executions") \
        <(LC_ALL=C sort "$local_executions") &&
      cmp -s <(LC_ALL=C sort "$expected_install_executions") \
        <(LC_ALL=C sort "$install_executions") &&
@@ -527,6 +528,7 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
     END { if (changes != 1) exit 1 }
   ' "$replica_lifecycle" > "$tail_subcase_mutant" || tail_subcase_write_rc=$?
   chmod +x "$tail_subcase_mutant"
+  reset_fixtures
   tail_subcase_executions="$work/tail-subcase-executions"
   : > "$tail_subcase_executions"
   tail_subcase_rc=0
@@ -545,6 +547,7 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
     END { if (changes != 1) exit 1 }
   ' "$replica_lifecycle" > "$tail_id_mutant" || tail_id_write_rc=$?
   chmod +x "$tail_id_mutant"
+  reset_fixtures
   tail_id_executions="$work/tail-id-executions"
   : > "$tail_id_executions"
   tail_id_rc=0
