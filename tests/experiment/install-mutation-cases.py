@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_MANIFEST = REPO_ROOT / "packaging" / "agent-lab-local.manifest"
 COMMAND_TIMEOUT_SECONDS = 5
 SOURCE_DOMAIN = b"agent-lab.experiment-tree.v1\0"
+PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
 SUBJECT = "registry.example/team/worker@sha256:" + "a" * 64
 AUTHORIZATION_DIGEST = "sha256:" + "c" * 64
 CONTRACT_DIGEST = "sha256:" + "d" * 64
@@ -64,6 +65,7 @@ class Snapshot(NamedTuple):
 
 class Resolution(NamedTuple):
     plan: dict[str, object]
+    bundled_catalog: dict[str, object] | None
     local_catalog: dict[str, object] | None
 
 
@@ -165,7 +167,7 @@ def decision_for(
     snapshot_digest: str,
     verdict: str,
 ) -> dict[str, object]:
-    plan_digest = digest(canonical(plan))
+    plan_digest = digest(PLAN_DOMAIN + canonical(plan))
     requested_name = plan["metadata"]["requestedName"]  # type: ignore[index]
     return {
         "action": "experiment.install",
@@ -225,7 +227,7 @@ class FixtureExperiment:
         if not isinstance(manifest, bytes) or manifest not in self.fixtures:
             raise FixtureInvalidManifest("fixture manifest is unknown")
         fixture = self.fixtures[manifest]
-        return Resolution(fixture.plan, fixture.local_catalog)
+        return Resolution(fixture.plan, None, fixture.local_catalog)
 
     def authorize_plan(
         self,
@@ -237,6 +239,14 @@ class FixtureExperiment:
         if self.after_authorize is not None:
             self.after_authorize()
         return decision, 0 if self.verdict == "permit" else 1
+
+    def verify_trusted_inputs(
+        self,
+        plan: dict[str, object],
+        decision: dict[str, object],
+    ) -> None:
+        if not isinstance(plan, dict) or not isinstance(decision, dict):
+            raise FixtureInfrastructure("fixture trusted inputs are malformed")
 
 
 def sha256_bytes(data: bytes) -> str:

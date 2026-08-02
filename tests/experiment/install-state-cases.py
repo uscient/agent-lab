@@ -29,6 +29,7 @@ CUE_TOOLS = REPO_ROOT / ".cache" / "dev" / "tools" / "cue"
 CEDAR_TOOLS = REPO_ROOT / ".cache" / "dev" / "tools" / "cedar"
 SUBJECT = "registry.example/team/worker@sha256:" + "a" * 64
 OTHER_SUBJECT = "registry.example/team/worker@sha256:" + "b" * 64
+PLAN_DOMAIN = b"agent-lab.experiment-plan.v1\0"
 FAULT_POINTS = (
     "experiment artifact.after_write",
     "experiment receipt.after_fsync",
@@ -45,6 +46,7 @@ class FixtureSnapshot(NamedTuple):
 
 class FixtureResolution(NamedTuple):
     plan: dict[str, object]
+    bundled_catalog: dict[str, object] | None
     local_catalog: dict[str, object] | None
 
 
@@ -86,10 +88,12 @@ class FaultFixtureExperiment:
                 ]
             },
         }
-        plan_digest = "sha256:" + hashlib.sha256(canonical_json(plan)).hexdigest()
+        plan_digest = "sha256:" + hashlib.sha256(
+            PLAN_DOMAIN + canonical_json(plan)
+        ).hexdigest()
         self.source_data = source_data
         self.snapshot = FixtureSnapshot(source_data, source_digest)
-        self.resolution = FixtureResolution(plan, None)
+        self.resolution = FixtureResolution(plan, None, None)
         self.decision: dict[str, object] = {
             "action": "experiment.install",
             "apiVersion": "agent-lab.authorization/v0alpha1",
@@ -140,6 +144,14 @@ class FaultFixtureExperiment:
         if plan != self.resolution.plan or source_digest != self.snapshot.digest:
             raise FixtureInfrastructure("fault fixture authorization binding changed")
         return self.decision, 0
+
+    def verify_trusted_inputs(
+        self,
+        plan: dict[str, object],
+        decision: dict[str, object],
+    ) -> None:
+        if plan != self.resolution.plan or decision != self.decision:
+            raise FixtureInfrastructure("fault fixture trusted inputs changed")
 
 
 def canonical_json(value: object) -> bytes:
@@ -1494,7 +1506,7 @@ def main() -> int:
         if isinstance(initial_check_value, dict):
             catalog_value = initial_check_value.get("catalog")
             if isinstance(catalog_value, dict):
-                initial_catalog = catalog_value.get("local")
+                initial_catalog = catalog_value
         provenance_rc: int | None = None
         provenance_value: dict[str, object] | None = None
         provenance_error: BaseException | None = None
