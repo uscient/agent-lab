@@ -15,7 +15,20 @@ import sys
 import tempfile
 
 
-EXPECTED = ("GIT-CLI-001", "GIT-USAGE-001", "GIT-FIXTURE-001")
+EXPECTED = (
+    "GIT-CLI-001",
+    "GIT-USAGE-001",
+    "GIT-URL-001",
+    "GIT-OID-001",
+    "GIT-PLAT-001",
+    "GIT-FIXTURE-001",
+    "GIT-PIN-001",
+    "GIT-COMMIT-001",
+    "GIT-ROOT-001",
+    "GIT-TYPE-001",
+    "GIT-BLOB-001",
+    "GIT-DRIFT-001",
+)
 URL = "https://github.com/uscient/experiment-fixture.git"
 COMMIT = "1cffa1a28f96d2f2cb898b1bad70d281e359a5b5"
 TREE = "64564b8e82ec9581c32cb4951ed802b544e2e0c0"
@@ -175,6 +188,115 @@ def main() -> int:
                     return fixture_responses[path]
 
                 experiment = load_module(repo / "scripts/experiment.py", "git_intake_experiment")
+
+                def acquire(
+                    responses: dict[str, tuple[int, tuple[tuple[str, str], ...], bytes]],
+                    *,
+                    source_url: str = URL,
+                    source_commit: str = COMMIT,
+                ):
+                    calls: list[tuple[str, str, tuple[tuple[str, str], ...], int]] = []
+
+                    def fixture_requester(authority, path, headers, maximum, _deadline):
+                        calls.append((authority, path, tuple(headers), maximum))
+                        return responses[path]
+
+                    try:
+                        value = experiment.read_git_snapshot(
+                            source_url,
+                            source_commit,
+                            requester=fixture_requester,
+                        )
+                        return "ok", value, calls
+                    except experiment.InvalidManifest as error:
+                        return "reject", str(error), calls
+                    except experiment.InfrastructureError as error:
+                        return "infra", str(error), calls
+
+                unused_request_calls: list[str] = []
+
+                def unused_requester(_authority, path, _headers, _maximum, _deadline):
+                    unused_request_calls.append(path)
+                    raise AssertionError("invalid input reached acquisition")
+
+                invalid_urls = (
+                    "http://github.com/uscient/experiment-fixture.git",
+                    "https://example.com/uscient/experiment-fixture.git",
+                    "https://user@github.com/uscient/experiment-fixture.git",
+                    "https://github.com:443/uscient/experiment-fixture.git",
+                    "https://github.com/uscient/experiment-fixture.git?ref=main",
+                    "https://github.com/uscient/experiment-fixture.git#main",
+                    "https://github.com/uscient/experiment-fixture",
+                    "https://github.com/uscient/%65xperiment-fixture.git",
+                    "https://github.com/uscient/experiment-fixture.git/extra",
+                    "https://github.com/uscient/experiment-fixture.git\n",
+                )
+                url_rejections = []
+                for invalid_url in invalid_urls:
+                    try:
+                        experiment.read_git_snapshot(
+                            invalid_url, COMMIT, requester=unused_requester
+                        )
+                    except experiment.InvalidManifest as error:
+                        url_rejections.append("GIT-URL" in str(error))
+                    except experiment.InfrastructureError:
+                        url_rejections.append(False)
+                results.append(
+                    (
+                        "GIT-URL-001",
+                        all(url_rejections) and unused_request_calls == [],
+                        "only normalized unauthenticated GitHub HTTPS URLs are accepted",
+                    )
+                )
+
+                invalid_oids = (
+                    "main",
+                    "refs/heads/main",
+                    "1" * 7,
+                    "1" * 39,
+                    "1" * 41,
+                    "A" * 40,
+                    "g" * 40,
+                    "-" * 40,
+                )
+                oid_rejections = []
+                for invalid_oid in invalid_oids:
+                    try:
+                        experiment.read_git_snapshot(
+                            URL, invalid_oid, requester=unused_requester
+                        )
+                    except experiment.InvalidManifest as error:
+                        oid_rejections.append("GIT-OID" in str(error))
+                    except experiment.InfrastructureError:
+                        oid_rejections.append(False)
+                results.append(
+                    (
+                        "GIT-OID-001",
+                        all(oid_rejections) and unused_request_calls == [],
+                        "mutable refs and non-full object IDs are rejected before acquisition",
+                    )
+                )
+
+                original_platform = experiment.sys.platform
+                experiment.sys.platform = "darwin"
+                try:
+                    platform_outcome = None
+                    try:
+                        experiment.read_git_snapshot(URL, COMMIT, requester=unused_requester)
+                    except experiment.InfrastructureError as error:
+                        platform_outcome = str(error)
+                finally:
+                    experiment.sys.platform = original_platform
+                results.append(
+                    (
+                        "GIT-PLAT-001",
+                        platform_outcome is not None
+                        and "GIT-PLATFORM" in platform_outcome
+                        and unused_request_calls == [],
+                        "unsupported hosts refuse before acquisition",
+                    )
+                )
+
                 try:
                     snapshot = experiment.read_git_snapshot(
                         URL, COMMIT, requester=requester
@@ -211,6 +333,136 @@ def main() -> int:
                         and [call[1] for call in request_calls]
                         == list(fixture_responses),
                         "independent pinned Git fixture normalizes to one closed snapshot",
+                    )
+                )
+
+                results.append(
+                    (
+                        "GIT-PIN-001",
+                        [call[1] for call in request_calls]
+                        == [
+                            f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                            f"/repos/uscient/experiment-fixture/git/trees/{TREE}",
+                            f"/repos/uscient/experiment-fixture/git/blobs/{BLOB}",
+                        ]
+                        and all("heads" not in call[1] and "tags" not in call[1] for call in request_calls),
+                        "acquisition follows only the exact pinned object chain",
+                    )
+                )
+
+                mismatched_commit = dict(fixture_responses)
+                mismatched_commit[next(iter(fixture_responses))] = response(
+                    {"sha": "0" * 40, "tree": {"sha": TREE}}
+                )
+                commit_outcome = acquire(mismatched_commit)
+                results.append(
+                    (
+                        "GIT-COMMIT-001",
+                        commit_outcome[0] == "infra"
+                        and "GIT-COMMIT" in commit_outcome[1],
+                        "provider commit identity must equal the exact request",
+                    )
+                )
+
+                extra_tree = dict(tree_body)
+                extra_tree["tree"] = list(tree_body["tree"]) + [
+                    {
+                        "mode": "100644",
+                        "path": "extra",
+                        "sha": BLOB,
+                        "size": len(source),
+                        "type": "blob",
+                    }
+                ]
+                root_responses = dict(fixture_responses)
+                root_responses[f"/repos/uscient/experiment-fixture/git/trees/{TREE}"] = response(
+                    extra_tree
+                )
+                root_outcome = acquire(root_responses)
+                results.append(
+                    (
+                        "GIT-ROOT-001",
+                        root_outcome[0] == "reject" and "GIT-ROOT" in root_outcome[1],
+                        "extra root entries fail closed",
+                    )
+                )
+
+                type_outcomes = []
+                for path, mode, kind in (
+                    ("experiment.cue", "100755", "blob"),
+                    ("experiment.cue", "120000", "blob"),
+                    ("experiment.cue", "160000", "commit"),
+                    ("experiment.cue/nested", "100644", "blob"),
+                    ("experiment.cue", "040000", "tree"),
+                ):
+                    changed_tree = dict(tree_body)
+                    changed_tree["tree"] = [
+                        {
+                            "mode": mode,
+                            "path": path,
+                            "sha": BLOB,
+                            "size": len(source),
+                            "type": kind,
+                        }
+                    ]
+                    changed_responses = dict(fixture_responses)
+                    changed_responses[
+                        f"/repos/uscient/experiment-fixture/git/trees/{TREE}"
+                    ] = response(changed_tree)
+                    type_outcomes.append(acquire(changed_responses))
+                results.append(
+                    (
+                        "GIT-TYPE-001",
+                        all(
+                            outcome[0] == "reject" and "GIT-TYPE" in outcome[1]
+                            for outcome in type_outcomes
+                        ),
+                        "non-regular root modes and nested paths fail closed",
+                    )
+                )
+
+                encoded_source = blob_body["content"]
+                assert isinstance(encoded_source, str)
+                wrapped_blob = dict(blob_body)
+                wrapped_blob["content"] = "\n".join(
+                    encoded_source[index : index + 60]
+                    for index in range(0, len(encoded_source), 60)
+                ) + "\n"
+                wrapped_responses = dict(fixture_responses)
+                wrapped_responses[f"/repos/uscient/experiment-fixture/git/blobs/{BLOB}"] = response(
+                    wrapped_blob
+                )
+                wrapped_outcome = acquire(wrapped_responses)
+                corrupt_blob = dict(blob_body)
+                corrupt_blob["content"] = base64.b64encode(source + b"x").decode("ascii")
+                corrupt_responses = dict(fixture_responses)
+                corrupt_responses[f"/repos/uscient/experiment-fixture/git/blobs/{BLOB}"] = response(
+                    corrupt_blob
+                )
+                corrupt_outcome = acquire(corrupt_responses)
+                results.append(
+                    (
+                        "GIT-BLOB-001",
+                        wrapped_outcome[0] == "ok"
+                        and wrapped_outcome[1].data == source
+                        and corrupt_outcome[0] == "infra"
+                        and "GIT-BLOB" in corrupt_outcome[1],
+                        "documented base64 wrapping is accepted but object drift is not",
+                    )
+                )
+
+                drift_tree = dict(tree_body)
+                drift_tree["sha"] = "0" * 40
+                drift_responses = dict(fixture_responses)
+                drift_responses[f"/repos/uscient/experiment-fixture/git/trees/{TREE}"] = response(
+                    drift_tree
+                )
+                drift_outcome = acquire(drift_responses)
+                results.append(
+                    (
+                        "GIT-DRIFT-001",
+                        drift_outcome[0] == "infra" and "GIT-TREE" in drift_outcome[1],
+                        "changed object output is infrastructure uncertainty",
                     )
                 )
             finally:
