@@ -638,10 +638,54 @@ def main() -> int:
                     drift_tree
                 )
                 drift_outcome = acquire(drift_responses)
+
+                bound_drift_source = source.replace(b'"serve"', b'"shell"', 1)
+                bound_drift_blob = git_oid("blob", bound_drift_source)
+                bound_drift_blob_path = (
+                    f"/repos/uscient/experiment-fixture/git/blobs/{bound_drift_blob}"
+                )
+                bound_drift_tree = dict(tree_body)
+                bound_drift_tree["tree"] = [
+                    {
+                        "mode": "100644",
+                        "path": "experiment.cue",
+                        "sha": bound_drift_blob,
+                        "size": len(bound_drift_source),
+                        "type": "blob",
+                    }
+                ]
+                bound_drift_responses = dict(fixture_responses)
+                bound_drift_responses[
+                    f"/repos/uscient/experiment-fixture/git/trees/{TREE}"
+                ] = response(bound_drift_tree)
+                bound_drift_responses[bound_drift_blob_path] = response(
+                    {
+                        "content": base64.b64encode(bound_drift_source).decode("ascii"),
+                        "encoding": "base64",
+                        "sha": bound_drift_blob,
+                        "size": len(bound_drift_source),
+                    }
+                )
+                bound_drift_outcome = acquire(bound_drift_responses)
+                bound_drift_paths = [call[1] for call in bound_drift_outcome[2]]
                 results.append(
                     (
                         "GIT-DRIFT-001",
-                        drift_outcome[0] == "infra" and "GIT-TREE" in drift_outcome[1],
+                        drift_outcome[0] == "infra"
+                        and "GIT-TREE" in drift_outcome[1]
+                        and bound_drift_source != source
+                        and len(bound_drift_source) == len(source)
+                        and bound_drift_blob != BLOB
+                        and bound_drift_tree["sha"] == TREE
+                        and bound_drift_outcome[0] == "infra"
+                        and bound_drift_outcome[1]
+                        == "git provider GIT-TREE object identity is inconsistent"
+                        and bound_drift_paths
+                        == [
+                            f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}",
+                            f"/repos/uscient/experiment-fixture/git/trees/{TREE}",
+                        ]
+                        and bound_drift_blob_path not in bound_drift_paths,
                         "changed object output is infrastructure uncertainty",
                     )
                 )
