@@ -1499,10 +1499,12 @@ def test_output_limits(work: Path) -> None:
     )
 
 
-def residual_flood_fixture(work: Path) -> tuple[Path, Path, Path, Path]:
+def residual_flood_fixture(work: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
     work.mkdir(parents=True, exist_ok=True)
     completion = work / "descendant-flood-completed"
     group_file = work / "residual-flood.group"
+    started = work / "residual-flood.started"
+    arm = work / "residual-flood.arm"
     ready = work / "residual-flood.ready"
     flood = write_script(
         work,
@@ -1523,13 +1525,15 @@ PY
     : > "$FLOOD_COMPLETION"
     exit 0
   }
-  sleep "$FLOOD_ARM_DELAY"
+  trap '' TERM
+  : > "$FLOOD_STARTED"
+  while [ ! -f "$FLOOD_ARM" ]; do sleep 0.002; done
   trap flood TERM
   : > "$FLOOD_READY"
   while :; do sleep 1; done
 ) &
 for ((attempt = 0; attempt < 500; attempt++)); do
-  if [ -f "$FLOOD_READY" ]; then
+  if [ -f "$FLOOD_STARTED" ]; then
     exit 0
   fi
   sleep 0.002
@@ -1545,12 +1549,14 @@ exit 125
         ),
         completion,
         group_file,
+        started,
+        arm,
         ready,
     )
 
 
 def test_residual_cleanup_output_limit(work: Path) -> None:
-    manifest, completion, group_file, ready = residual_flood_fixture(work)
+    manifest, completion, group_file, started, arm, ready = residual_flood_fixture(work)
     small_helper = transformed_helper(
         work,
         "residual-output-limit",
@@ -1576,10 +1582,11 @@ def test_residual_cleanup_output_limit(work: Path) -> None:
         1,
         helper=small_helper,
         extra_env={
-            "FLOOD_ARM_DELAY": "0.2",
+            "FLOOD_ARM": str(arm),
             "FLOOD_COMPLETION": str(completion),
             "GROUP_FILE": str(group_file),
             "FLOOD_READY": str(ready),
+            "FLOOD_STARTED": str(started),
         },
     )
     check(result.rc == 125, "residual descendant output overflow returns infrastructure")
@@ -1923,16 +1930,17 @@ def test_sensitivity_mutants(work: Path) -> None:
     if residual_mutant is not None:
         fixture_work = work / "mutant-residual-output"
         fixture_work.mkdir(parents=True, exist_ok=True)
-        manifest, completion, group_file, ready = residual_flood_fixture(fixture_work)
+        manifest, completion, group_file, started, arm, ready = residual_flood_fixture(fixture_work)
         result = run_gate(
             manifest,
             1,
             helper=residual_mutant,
             extra_env={
-                "FLOOD_ARM_DELAY": "0.2",
+                "FLOOD_ARM": str(arm),
                 "FLOOD_COMPLETION": str(completion),
                 "GROUP_FILE": str(group_file),
                 "FLOOD_READY": str(ready),
+                "FLOOD_STARTED": str(started),
             },
         )
         check(
