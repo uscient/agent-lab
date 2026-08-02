@@ -445,7 +445,12 @@ for signal_index in "${!signal_names[@]}"; do
   AGENT_LAB_CATALOG_AGG_CONTROL="$signal_control" \
   AGENT_LAB_CATALOG_AGG_SIGNAL_MODE=cooperative \
   TMPDIR="$signal_tmp" \
-    bash "$replica_aggregate" > "$work/signal-$signal_index.out" 2>&1 &
+    python3 -I -B -c \
+      'import os, signal, sys
+for value in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+    signal.signal(value, signal.SIG_DFL)
+os.execvpe("bash", ["bash", sys.argv[1]], os.environ)' \
+      "$replica_aggregate" > "$work/signal-$signal_index.out" 2>&1 &
   signal_pid=$!
   signal_setup=0
   bash_lane=""
@@ -477,7 +482,7 @@ for signal_index in "${!signal_names[@]}"; do
     fi
   done
   if [ "$signal_setup" -ne 1 ] ||
-     [ "$signal_rc" -ne "$((128 + signal_numbers[$signal_index]))" ] ||
+     [ "$signal_rc" -ne "$((128 + signal_numbers[signal_index]))" ] ||
      [ "$signal_pids_gone" -ne 1 ] ||
      grep -Fxq 'EXPERIMENT LOCAL IMAGE CATALOG PASS' "$work/signal-$signal_index.out" ||
      ! cmp -s <(LC_ALL=C sort "$expected_signal_executions") \

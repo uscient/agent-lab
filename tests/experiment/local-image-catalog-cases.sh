@@ -23,11 +23,21 @@ collect_descendants() {
   local parent_pid="$1"
   local children=""
   local child
+  local observed
   if [ -r "/proc/$parent_pid/task/$parent_pid/children" ]; then
     IFS= read -r children < "/proc/$parent_pid/task/$parent_pid/children" || true
   fi
   for child in $children; do
     if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    for observed in "${signal_descendants[@]}"; do
+      if [ "$observed" = "$child" ]; then
+        child=""
+        break
+      fi
+    done
+    if [ -z "$child" ]; then
       continue
     fi
     signal_descendants[${#signal_descendants[@]}]="$child"
@@ -36,26 +46,27 @@ collect_descendants() {
 }
 
 catalog_signal() {
-  local signal_name="$1"
-  local signal_number="$2"
-  local lane_pid
+  local signal_number="$1"
+  local before
   local index
   trap '' HUP INT QUIT TERM
   trap - EXIT
   signal_descendants=()
-  if [[ "$current_lane_pid" =~ ^[0-9]+$ ]]; then
-    signal_descendants[${#signal_descendants[@]}]="$current_lane_pid"
-    collect_descendants "$current_lane_pid"
-  fi
-  for lane_pid in "${lane_pids[@]}"; do
-    if [[ ! "$lane_pid" =~ ^[0-9]+$ ]]; then
-      continue
+  for _ in 1 2 3 4 5 6 7 8; do
+    before="${#signal_descendants[@]}"
+    collect_descendants "$$"
+    for ((index = before; index < ${#signal_descendants[@]}; index++)); do
+      kill -STOP -- "${signal_descendants[index]}" 2>/dev/null || true
+    done
+    if [ "${#signal_descendants[@]}" -eq "$before" ]; then
+      break
     fi
-    signal_descendants[${#signal_descendants[@]}]="$lane_pid"
-    collect_descendants "$lane_pid"
   done
   for ((index = ${#signal_descendants[@]} - 1; index >= 0; index--)); do
-    kill "-$signal_name" -- "${signal_descendants[index]}" 2>/dev/null || true
+    kill -TERM -- "${signal_descendants[index]}" 2>/dev/null || true
+  done
+  for ((index = ${#signal_descendants[@]} - 1; index >= 0; index--)); do
+    kill -CONT -- "${signal_descendants[index]}" 2>/dev/null || true
   done
   exit $((128 + signal_number))
 }
@@ -65,10 +76,10 @@ if ! work="$(mktemp -d)"; then
   exit 125
 fi
 trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
-trap 'catalog_signal HUP 1' HUP
-trap 'catalog_signal INT 2' INT
-trap 'catalog_signal QUIT 3' QUIT
-trap 'catalog_signal TERM 15' TERM
+trap 'catalog_signal 1' HUP
+trap 'catalog_signal 2' INT
+trap 'catalog_signal 3' QUIT
+trap 'catalog_signal 15' TERM
 
 subcases=(
   "$repo_root/tests/image/catalog-cases.sh"
