@@ -46,11 +46,13 @@ in-place home-layout migration.
 After initialization and tool provisioning, install or inspect an Experiment with the same local
 program bundle:
 
-```bash
-agent-lab --home /absolute/private/home experiment install ./my-experiment
-agent-lab --home /absolute/private/home experiment install --zip ./my-experiment.zip
-agent-lab --home /absolute/private/home experiment install --git https://github.com/owner/repository.git --commit <40 lowercase hex>
-agent-lab --home /absolute/private/home experiment inspect NAME
+The following block is syntax notation; replace the uppercase placeholders before use:
+
+```text
+agent-lab --home ABSOLUTE_HOME experiment install SOURCE_DIRECTORY
+agent-lab --home ABSOLUTE_HOME experiment install --zip ARCHIVE
+agent-lab --home ABSOLUTE_HOME experiment install --git https://github.com/OWNER/REPOSITORY.git --commit COMMIT_ID
+agent-lab --home ABSOLUTE_HOME experiment inspect EXPERIMENT_NAME
 ```
 
 The configured experiments component is private `0700` state. Each successful first install

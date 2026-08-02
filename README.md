@@ -112,6 +112,21 @@ injected into workloads run by Agent Lab.
 See [Architecture](docs/architecture.md) for the complete data flow, state model, configuration
 authority, and control-plane/data-plane split.
 
+## Experiments
+
+Agent Lab also has a separate v0alpha1 onboarding path for Experiments. An Experiment is authored as
+one declarative `experiment.cue` file and can enter from a closed directory, a bounded ZIP archive,
+or an exact commit in a supported public GitHub repository. Agent Lab snapshots the source,
+validates it with the pinned CUE contract, resolves every image selector to an immutable subject,
+freshly evaluates the install policy with Cedar, and, only on a permit, can retain the resulting
+evidence in a private local Agent Lab home.
+
+This path stops at onboarding evidence. It does not run Experiment content, invoke Docker, acquire
+image bytes, claim image admission, or create a workload network. Start with the
+[Experiments guide](docs/experiments.md); use [Local installation](docs/installation.md) to prepare
+the CLI and private home, and [Local image names](docs/images.md) for operator-managed image
+mappings.
+
 ## Controlled configuration
 
 The workload path exposes four primary adaptation seams, a persistence switch, and bounded
@@ -149,9 +164,10 @@ See [Development and verification](docs/development.md) and [CI gate mapping](do
 
 ## Documentation
 
-Use the [documentation map](docs/README.md) for the complete index. The three main paths are:
+Use the [documentation map](docs/README.md) for the complete index. The four main paths are:
 
 - [Operate Agent Lab](docs/operations.md)
+- [Author, check, and install Experiments](docs/experiments.md)
 - [Understand the architecture and security model](docs/architecture.md)
 - [Develop and verify the repository](docs/development.md)
 
@@ -169,6 +185,8 @@ Formal hard stops and guarantees remain in [SECURITY.md](SECURITY.md) and
   audit before relying on the same boundary.
 - Browser automation, cloud infrastructure, and production deployment are outside the current
   guarantee.
+- Experiment onboarding retains checked and authorized local evidence only. Experiment execution,
+  image acquisition and admission, start/stop, and stored-artifact uninstall are not implemented.
 
 Do not weaken containment to work around a failed command. A refusal or exit status 125 is evidence
 to diagnose, not permission to bypass the control.

@@ -1,12 +1,15 @@
 # Local image names
 
-Agent Lab can assign one operator-local name to an already immutable OCI subject:
+Agent Lab can assign one operator-local name to an already immutable OCI subject. The following
+block is syntax notation; replace uppercase placeholders and either supply the optional home prefix
+or omit it consistently:
 
-```bash
-agent-lab [--home ABSOLUTE_HOME] image add VENDOR.IMAGE DIGEST_REF
-agent-lab [--home ABSOLUTE_HOME] image inspect VENDOR.IMAGE
-agent-lab [--home ABSOLUTE_HOME] image list [--all]
-agent-lab [--home ABSOLUTE_HOME] image remove VENDOR.IMAGE --expect ENTRY_DIGEST
+```text
+agent-lab --home ABSOLUTE_HOME image add VENDOR.IMAGE DIGEST_REF
+agent-lab --home ABSOLUTE_HOME image inspect VENDOR.IMAGE
+agent-lab --home ABSOLUTE_HOME image list
+agent-lab --home ABSOLUTE_HOME image list --all
+agent-lab --home ABSOLUTE_HOME image remove VENDOR.IMAGE --expect ENTRY_DIGEST
 ```
 
 This catalog is shared by every Experiment using the same initialized Agent Lab home. It stores
