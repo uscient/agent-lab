@@ -40,6 +40,6 @@ suite wrapper-context-runtime tests/docker/wrapper-context.sh SUMMARY failures=0
 suite network-boundary tests/docker/network-boundary.sh SUMMARY failures=0
 suite dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
 suite runtime-inspect-differential tests/docker/runtime-inspect-differential.sh SUMMARY failures=0
-suite runtime-hardening tests/docker/runtime-hardening.sh SUMMARY failures=0
+suite runtime-hardening tests/docker/runtime-hardening.sh RUNTIME HARDENING SUMMARY failures=0
 suite secret-nondisclosure tests/docker/secret-nondisclosure.sh SUMMARY failures=0
 suite serena-runtime tests/docker/serena-runtime.sh SERENA RUNTIME SUMMARY failures=0
