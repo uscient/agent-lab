@@ -8,9 +8,10 @@ subcases=(
   "$repo_root/tests/experiment/local-image-catalog-cases.sh"
   "$repo_root/tests/experiment/install-store-cases.sh"
   "$repo_root/tests/experiment/install-state-cases.py"
+  "$repo_root/tests/experiment/install-integrity-cases.py"
   "$repo_root/tests/experiment/install-mutation-cases.py"
 )
-expected_count=121
+expected_count=133
 work=""
 
 cleanup_work() {
@@ -57,7 +58,10 @@ printf '%s\n' \
   INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 INST-RUNTIME-001 \
   IST-STATE-001 IST-LOCK-001 IST-STATE-002 IST-BOUND-001 IST-STATE-003 \
   IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001 \
-  IST-PROV-001 \
+  IST-PROV-001 IST-PREFLIGHT-001 IST-SNAPSHOT-001 IST-CONFIG-001 IST-READ-001 \
+  IST-FAULT-001 \
+  IIN-CLEAN-001 IIN-CONTRACT-001 IIN-BUNDLE-001 IIN-LOCK-001 \
+  IIN-SNAPSHOT-001 IIN-PREFLIGHT-001 IIN-PLAN-001 \
   M-STORE-AUTH-001 M-STORE-SOURCE-001 M-STORE-ATOM-001 M-STORE-RETRY-001 \
   M-STORE-DUR-001 M-STORE-LAYOUT-001 M-STORE-KEY-001 M-STORE-VERIFY-001 \
   M-STORE-LIVE-001 M-STORE-UNCERT-001 M-STORE-STAGE-001 > "$expected"

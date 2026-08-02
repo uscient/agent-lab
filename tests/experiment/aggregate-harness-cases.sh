@@ -56,6 +56,9 @@ expected_ids=(
   INST-FORGE-001 INST-NOEF-001 INST-LOCAL-001 INST-RUNTIME-001
   IST-STATE-001 IST-LOCK-001 IST-STATE-002 IST-BOUND-001 IST-STATE-003
   IST-CONC-001 IST-CONC-002 IST-CRASH-001 IST-LIVE-001 IST-PLAT-001 IST-PROV-001
+  IST-PREFLIGHT-001 IST-SNAPSHOT-001 IST-CONFIG-001 IST-READ-001 IST-FAULT-001
+  IIN-CLEAN-001 IIN-CONTRACT-001 IIN-BUNDLE-001 IIN-LOCK-001
+  IIN-SNAPSHOT-001 IIN-PREFLIGHT-001 IIN-PLAN-001
   M-STORE-AUTH-001 M-STORE-SOURCE-001 M-STORE-ATOM-001 M-STORE-RETRY-001
   M-STORE-DUR-001 M-STORE-LAYOUT-001 M-STORE-KEY-001 M-STORE-VERIFY-001
   M-STORE-LIVE-001 M-STORE-UNCERT-001 M-STORE-STAGE-001
@@ -64,8 +67,9 @@ installer_ids=("${expected_ids[@]:0:5}")
 config_ids=("${expected_ids[@]:5:5}")
 catalog_ids=("${expected_ids[@]:10:76}")
 install_ids=("${expected_ids[@]:86:13}")
-state_ids=("${expected_ids[@]:99:11}")
-mutation_ids=("${expected_ids[@]:110:11}")
+state_ids=("${expected_ids[@]:99:16}")
+integrity_ids=("${expected_ids[@]:115:7}")
+mutation_ids=("${expected_ids[@]:122:11}")
 
 write_fixture() {
   local path="$1"
@@ -126,18 +130,20 @@ pass_records() {
 
 reset_fixtures() {
   local installer_records=() config_records=() catalog_records=()
-  local install_records=() state_records=() mutation_records=()
+  local install_records=() state_records=() integrity_records=() mutation_records=()
   mapfile -t installer_records < <(pass_records "${installer_ids[@]}")
   mapfile -t config_records < <(pass_records "${config_ids[@]}")
   mapfile -t catalog_records < <(pass_records "${catalog_ids[@]}")
   mapfile -t install_records < <(pass_records "${install_ids[@]}")
   mapfile -t state_records < <(pass_records "${state_ids[@]}")
+  mapfile -t integrity_records < <(pass_records "${integrity_ids[@]}")
   mapfile -t mutation_records < <(pass_records "${mutation_ids[@]}")
   write_fixture "$replica/tests/install/local-install-cases.sh" 0 "${installer_records[@]}"
   write_fixture "$replica/tests/experiment/local-config-cases.sh" 0 "${config_records[@]}"
   write_fixture "$replica/tests/experiment/local-image-catalog-cases.sh" 0 "${catalog_records[@]}"
   write_fixture "$replica/tests/experiment/install-store-cases.sh" 0 "${install_records[@]}"
   write_python_fixture "$replica/tests/experiment/install-state-cases.py" 0 "${state_records[@]}"
+  write_python_fixture "$replica/tests/experiment/install-integrity-cases.py" 0 "${integrity_records[@]}"
   write_python_fixture "$replica/tests/experiment/install-mutation-cases.py" 0 "${mutation_records[@]}"
 }
 
@@ -165,6 +171,7 @@ printf '%s\n' \
   local-image-catalog-cases.sh \
   install-store-cases.sh \
   install-state-cases.py \
+  install-integrity-cases.py \
   install-mutation-cases.py > "$expected_executions"
 : > "$baseline_executions"
 baseline_rc=0
@@ -194,6 +201,7 @@ printf '%s\n' \
   local-image-catalog-cases.sh \
   install-store-cases.sh \
   install-state-cases.py \
+  install-integrity-cases.py \
   install-mutation-cases.py > "$mutant_expected"
 
 if [ "$baseline_rc" -eq 0 ] &&
@@ -213,10 +221,10 @@ success_output="$work/success.out"
 success_rc=0
 run_replica "$success_output" env || success_rc=$?
 if [ "$success_rc" -eq 0 ] &&
-   [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 121 ] &&
-   [ "$(grep -Fxc 'SUMMARY assertions=121 expected=121 failures=0 infra=0' "$success_output")" -eq 1 ] &&
+   [ "$(grep -Ec '^(PASS|FAIL) [A-Z0-9-]+ ' "$success_output")" -eq 133 ] &&
+   [ "$(grep -Fxc 'SUMMARY assertions=133 expected=133 failures=0 infra=0' "$success_output")" -eq 1 ] &&
    [ "$(tail -n 1 "$success_output")" = 'EXPERIMENT LOCAL LIFECYCLE PASS' ] &&
-   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=121 expected=121 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
+   awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=133 expected=133 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output"; then
   pass AGG-002 "success forwards only assertions then one summary and marker"
 else
   fail AGG-002 "success forwards only assertions then one summary and marker"
@@ -265,7 +273,7 @@ write_fixture "$replica/tests/install/local-install-cases.sh" 1 "${failed_record
 assertion_rc=0
 run_replica "$work/assertion.out" env || assertion_rc=$?
 if [ "$assertion_rc" -eq 1 ] &&
-   grep -Fxq 'SUMMARY assertions=121 expected=121 failures=1 infra=0' "$work/assertion.out" &&
+   grep -Fxq 'SUMMARY assertions=133 expected=133 failures=1 infra=0' "$work/assertion.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/assertion.out"; then
   pass AGG-006 "subcase assertion failure maps to one"
 else
@@ -298,7 +306,7 @@ chmod +x "$shim/rmdir"
 cleanup_rc=0
 run_replica "$work/cleanup.out" env PATH="$shim:$PATH" || cleanup_rc=$?
 if [ "$cleanup_rc" -eq 125 ] &&
-   grep -Fxq 'SUMMARY assertions=121 expected=121 failures=0 infra=1' "$work/cleanup.out" &&
+   grep -Fxq 'SUMMARY assertions=133 expected=133 failures=0 infra=1' "$work/cleanup.out" &&
    ! grep -Fxq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/cleanup.out"; then
   pass AGG-008 "cleanup uncertainty maps to one hundred twenty-five before the marker"
 else
