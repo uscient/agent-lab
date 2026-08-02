@@ -389,7 +389,7 @@ def main() -> int:
                 (
                     "    if (\n"
                     "        create_system not in (0, 3, 10, 14)\n"
-                    "        or dos_attributes & 0x18\n"
+                    "        or dos_attributes & 0x458\n"
                     "        or (create_system == 3 and unix_type not in (0, stat.S_IFREG))\n"
                     "    ):\n"
                 ),

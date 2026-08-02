@@ -501,7 +501,7 @@ def read_zip_snapshot(path: str) -> SourceSnapshot:
     dos_attributes = external_attributes & 0xFFFF
     if (
         create_system not in (0, 3, 10, 14)
-        or dos_attributes & 0x18
+        or dos_attributes & 0x458
         or (create_system == 3 and unix_type not in (0, stat.S_IFREG))
     ):
         _zip_reject("ZIP-TYPE", "member is not a regular file")
