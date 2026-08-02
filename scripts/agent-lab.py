@@ -506,9 +506,14 @@ def image_command(home: Path, argv: list[str]) -> int:
 
 
 def experiment_command(home: Path, argv: list[str]) -> int:
-    if argv == ["install", "--zip"]:
+    if argv in (["install", "--zip"], ["install", "--git"]):
         return 2
-    if argv[:1] == ["install"] and len(argv) == 2:
+    if argv[:2] == ["install", "--git"]:
+        if len(argv) != 5 or argv[3] != "--commit":
+            return 2
+        operation = "install"
+        source_kind = "git"
+    elif argv[:1] == ["install"] and len(argv) == 2:
         operation = "install"
         source_kind = "directory"
     elif argv[:2] == ["install", "--zip"] and len(argv) == 3:
@@ -548,7 +553,9 @@ def experiment_command(home: Path, argv: list[str]) -> int:
 
     try:
         if operation == "install":
-            if source_kind == "zip":
+            if source_kind == "git":
+                result = store.install_git(home, argv[2], argv[4])
+            elif source_kind == "zip":
                 result = store.install_zip(home, Path(argv[2]))
             else:
                 result = store.install_directory(home, Path(argv[1]))
@@ -637,6 +644,9 @@ def main(argv: list[str]) -> int:
     if argv[:3] == ["experiment", "check", "--git"]:
         if len(argv) != 6 or argv[4] != "--commit":
             return 2
+        if sys.platform != "linux":
+            print("INFRA Agent Lab Git Experiment intake requires Linux", file=sys.stderr)
+            return 125
         os.environ["AGENT_LAB_HOME"] = str(home)
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
         return experiment_module().main(
@@ -645,6 +655,9 @@ def main(argv: list[str]) -> int:
     if argv[:4] == ["experiment", "authorize", "install", "--git"]:
         if len(argv) != 7 or argv[5] != "--commit":
             return 2
+        if sys.platform != "linux":
+            print("INFRA Agent Lab Git Experiment intake requires Linux", file=sys.stderr)
+            return 125
         os.environ["AGENT_LAB_HOME"] = str(home)
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
         os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(home / "cache/tools/cedar"))
