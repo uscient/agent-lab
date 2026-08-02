@@ -29,12 +29,28 @@ def prefix_from(argv: list[str]) -> Path:
     return path
 
 
+def reject_unsafe_existing_path(path: Path) -> None:
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("unsafe prefix component")
+
+
 def main(argv: list[str]) -> int:
     try:
         prefix = prefix_from(argv)
     except ValueError as error:
         print(error, file=sys.stderr)
         return 2
+    try:
+        reject_unsafe_existing_path(prefix)
+    except OSError:
+        return fail("prefix contains an unsafe existing component", 125)
     root = Path(__file__).resolve().parent.parent
     manifest_path = root / "packaging/agent-lab-local.manifest"
     try:
