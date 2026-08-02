@@ -178,10 +178,102 @@ def current_snapshot(home: Path) -> tuple[Path, dict[str, object], str]:
     return path, value, snapshot_digest
 
 
+def stable_record(path: Path, maximum: int = 65536) -> bytes | None:
+    descriptor = -1
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        return None
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or before.st_size < 0
+            or before.st_size > maximum
+        ):
+            return None
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | no_follow
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        opened = os.fstat(descriptor)
+        signature = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_nlink,
+            opened.st_uid,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if signature != (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_uid,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            return None
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > maximum:
+                return None
+        after_descriptor = os.fstat(descriptor)
+        after_path = path.lstat()
+        after_signature = (
+            after_descriptor.st_dev,
+            after_descriptor.st_ino,
+            after_descriptor.st_mode,
+            after_descriptor.st_nlink,
+            after_descriptor.st_uid,
+            after_descriptor.st_size,
+            after_descriptor.st_mtime_ns,
+            after_descriptor.st_ctime_ns,
+        )
+        path_signature = (
+            after_path.st_dev,
+            after_path.st_ino,
+            after_path.st_mode,
+            after_path.st_nlink,
+            after_path.st_uid,
+            after_path.st_size,
+            after_path.st_mtime_ns,
+            after_path.st_ctime_ns,
+        )
+        if after_signature != signature or path_signature != signature or observed != opened.st_size:
+            return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def stored_active_names(home: Path) -> list[str] | None:
     try:
         root = home / "images" / "catalog"
-        pointer_raw = (root / "current.json").read_bytes()
+        pointer_raw = stable_record(root / "current.json")
+        if pointer_raw is None:
+            return None
         pointer = json.loads(pointer_raw)
         if (
             not isinstance(pointer, dict)
@@ -198,7 +290,9 @@ def stored_active_names(home: Path) -> list[str] | None:
             or any(character not in "0123456789abcdef" for character in snapshot_digest[7:])
         ):
             return None
-        snapshot_raw = (root / "snapshots" / f"{snapshot_digest[7:]}.json").read_bytes()
+        snapshot_raw = stable_record(root / "snapshots" / f"{snapshot_digest[7:]}.json")
+        if snapshot_raw is None:
+            return None
         snapshot = json.loads(snapshot_raw)
         if (
             not isinstance(snapshot, dict)
@@ -231,7 +325,9 @@ def stored_active_names(home: Path) -> list[str] | None:
                 or any(character not in "0123456789abcdef" for character in entry_digest[7:])
             ):
                 return None
-            entry_raw = (root / "entries" / f"{entry_digest[7:]}.json").read_bytes()
+            entry_raw = stable_record(root / "entries" / f"{entry_digest[7:]}.json")
+            if entry_raw is None:
+                return None
             entry = json.loads(entry_raw)
             if (
                 not isinstance(entry, dict)
