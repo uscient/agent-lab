@@ -634,6 +634,23 @@ def main(argv: list[str]) -> int:
                 return 125
         print("tools:ready")
         return 0
+    if argv[:3] == ["experiment", "check", "--git"]:
+        if len(argv) != 6 or argv[4] != "--commit":
+            return 2
+        os.environ["AGENT_LAB_HOME"] = str(home)
+        os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
+        return experiment_module().main(
+            ["experiment.py", "check-git", argv[3], argv[5]]
+        )
+    if argv[:4] == ["experiment", "authorize", "install", "--git"]:
+        if len(argv) != 7 or argv[5] != "--commit":
+            return 2
+        os.environ["AGENT_LAB_HOME"] = str(home)
+        os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
+        os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(home / "cache/tools/cedar"))
+        return experiment_module().main(
+            ["experiment.py", "authorize-git", argv[4], argv[6]]
+        )
     if argv in (
         ["experiment", "check", "--zip"],
         ["experiment", "authorize", "install", "--zip"],
