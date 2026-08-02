@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -19,6 +20,9 @@ from typing import NamedTuple, NoReturn
 
 MAX_MANIFEST_BYTES = 262_144
 SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
+BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
+BUNDLED_ENTRY_DOMAIN = b"agent-lab.experiment-image-entry.v1\0"
+CATALOG_NAME_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 MAX_CUE_OUTPUT_BYTES = 1_048_576
 MAX_CONTRACT_FILE_BYTES = 1_048_576
 MAX_HELPER_BYTES = 1_048_576
@@ -548,7 +552,6 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
                 "command": member.get("command", []),
                 "name": member["name"],
                 "requestedSelector": selector,
-                "resolvedImage": {"origin": "direct", "subject": selector["digestRef"]},
                 "resourceClass": member.get("resourceClass", "small"),
             })
         members.sort(key=lambda member: str(member["name"]))
@@ -566,6 +569,74 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
         "metadata": {"requestedName": name},
         "spec": {"members": members},
     }
+
+
+def valid_catalog_name(value: object) -> bool:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 63:
+        return False
+    parts = value.split(".")
+    return (
+        len(parts) == 2
+        and all(1 <= len(part.encode("ascii", "ignore")) <= 31 for part in parts)
+        and all(part.isascii() and CATALOG_NAME_COMPONENT.fullmatch(part) for part in parts)
+    )
+
+
+def digest_record(domain: bytes, value: object) -> str:
+    return "sha256:" + hashlib.sha256(domain + canonical_json(value)).hexdigest()
+
+
+def bundled_catalog(repo_root: Path) -> tuple[dict[str, object], str]:
+    path = repo_root / "catalog/experiment-images/v0alpha1.json"
+    data = stable_file_bytes(path, MAX_CONTRACT_FILE_BYTES, "bundled image catalog")
+    value = strict_json(data, source="bundled image catalog")
+    if not isinstance(value, dict) or set(value) != {"apiVersion", "entries"}:
+        raise InfrastructureError("bundled image catalog has an unexpected shape")
+    if value["apiVersion"] != "agent-lab.experiment-images/v0alpha1" or not isinstance(value["entries"], list):
+        raise InfrastructureError("bundled image catalog has an unknown schema")
+    return value, digest_record(BUNDLED_CATALOG_DOMAIN, value)
+
+
+def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, object] | None = None) -> dict[str, object]:
+    if catalog is None:
+        catalog, _ = bundled_catalog(repo_root)
+    entries = catalog.get("entries")
+    if not isinstance(entries, list):
+        raise InfrastructureError("bundled image catalog entries are malformed")
+    by_name: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
+            raise InfrastructureError("bundled image catalog entry is malformed")
+        name, subject = entry["name"], entry["subject"]
+        if not valid_catalog_name(name) or not isinstance(subject, str) or "@sha256:" not in subject:
+            raise InfrastructureError("bundled image catalog entry is invalid")
+        assert isinstance(name, str)
+        if not name.startswith("agent-lab.") or name in by_name:
+            raise InfrastructureError("bundled image catalog namespace is invalid")
+        by_name[name] = entry
+    resolved = json.loads(canonical_json(plan))
+    members = resolved["spec"]["members"]
+    for member in members:
+        selector = member["requestedSelector"]
+        if set(selector) == {"digestRef"}:
+            member["resolvedImage"] = {"origin": "direct", "subject": selector["digestRef"]}
+            continue
+        if set(selector) != {"catalogName"} or not valid_catalog_name(selector["catalogName"]):
+            raise InvalidManifest("contains an invalid image selector")
+        name = selector["catalogName"]
+        if not name.startswith("agent-lab."):
+            raise InvalidManifest("local image name is not configured")
+        entry = by_name.get(name)
+        if entry is None:
+            raise InvalidManifest("references an unknown bundled image name")
+        entry_digest = digest_record(BUNDLED_ENTRY_DOMAIN, entry)
+        member["resolvedImage"] = {
+            "entryDigest": entry_digest,
+            "generation": 1,
+            "origin": "agent-lab",
+            "subject": entry["subject"],
+        }
+    return resolved
 
 
 def invoke_cue(
@@ -678,7 +749,7 @@ def cue_plan(manifest: object) -> object:
             plan = parse_cue_plan(completed)
             if plan != expected_plan(manifest, contract_digest):
                 raise InfrastructureError("pinned CUE plan violates its exact postcondition")
-            return plan
+            return resolve_plan(plan, repo_root)
     except OSError as error:
         raise InfrastructureError("private validation snapshot could not be managed") from error
 
