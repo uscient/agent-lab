@@ -503,19 +503,43 @@ def main() -> int:
                 }
                 prior_inherited = {name: os.environ.get(name) for name in inherited_names}
                 os.environ.update(inherited_names)
+                original_worker_requester = getattr(experiment, "_github_api_request", None)
+
+                def credential_requester(authority, path, headers, maximum, deadline):
+                    if os.environ != {
+                        "HOME": "/nonexistent",
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin",
+                    } or os.getcwd() != "/":
+                        raise RuntimeError("worker authority was not isolated")
+                    descriptors = {int(item) for item in os.listdir("/proc/self/fd")}
+                    if any(descriptor > 4 for descriptor in descriptors):
+                        raise RuntimeError("worker inherited an unrelated descriptor")
+                    return fixture_responses[path]
+
+                experiment._github_api_request = credential_requester
                 try:
-                    credential_outcome = acquire(fixture_responses)
+                    try:
+                        credential_snapshot = experiment.read_git_snapshot(URL, COMMIT)
+                    except (experiment.InvalidManifest, experiment.InfrastructureError):
+                        credential_snapshot = None
                 finally:
+                    if original_worker_requester is None:
+                        delattr(experiment, "_github_api_request")
+                    else:
+                        experiment._github_api_request = original_worker_requester
                     for name, value in prior_inherited.items():
                         if value is None:
                             os.environ.pop(name, None)
                         else:
                             os.environ[name] = value
-                credential_text = repr(credential_outcome)
+                credential_text = repr(credential_snapshot)
                 results.append(
                     (
                         "GIT-CREDENTIAL-001",
-                        credential_outcome[0] == "ok"
+                        credential_snapshot is not None
+                        and credential_snapshot.data == source
                         and "credential.invalid" not in credential_text
                         and "caller-ca" not in credential_text
                         and "askpass" not in credential_text,
@@ -653,9 +677,51 @@ def main() -> int:
                 )
 
                 original_worker_requester = getattr(experiment, "_github_api_request", None)
+                worker_parent_pid = os.getpid()
+                large_source = b"//" + (b"x" * (262_144 - 3)) + b"\n"
+                large_blob = git_oid("blob", large_source)
+                large_tree = git_oid(
+                    "tree", b"100644 experiment.cue\0" + bytes.fromhex(large_blob)
+                )
+                large_responses = {
+                    f"/repos/uscient/experiment-fixture/git/commits/{COMMIT}": response(
+                        {"sha": COMMIT, "tree": {"sha": large_tree}}
+                    ),
+                    f"/repos/uscient/experiment-fixture/git/trees/{large_tree}": response(
+                        {
+                            "sha": large_tree,
+                            "tree": [
+                                {
+                                    "mode": "100644",
+                                    "path": "experiment.cue",
+                                    "sha": large_blob,
+                                    "size": len(large_source),
+                                    "type": "blob",
+                                }
+                            ],
+                            "truncated": False,
+                        }
+                    ),
+                    f"/repos/uscient/experiment-fixture/git/blobs/{large_blob}": response(
+                        {
+                            "content": base64.b64encode(large_source).decode("ascii"),
+                            "encoding": "base64",
+                            "sha": large_blob,
+                            "size": len(large_source),
+                        }
+                    ),
+                }
 
                 def worker_requester(authority, path, headers, maximum, deadline):
-                    return fixture_responses[path]
+                    worker_pid = os.getpid()
+                    if (
+                        worker_pid == worker_parent_pid
+                        or os.getpgrp() != worker_pid
+                        or os.getsid(0) != worker_pid
+                        or os.getcwd() != "/"
+                    ):
+                        raise RuntimeError("provider worker session is not isolated")
+                    return large_responses[path]
 
                 experiment._github_api_request = worker_requester
                 try:
@@ -672,9 +738,11 @@ def main() -> int:
                     (
                         "GIT-PGROUP-001",
                         worker_snapshot is not None
-                        and worker_snapshot.data == source
-                        and worker_snapshot.digest == SOURCE_DIGEST,
-                        "the fixed provider runs in the bounded worker path",
+                        and worker_snapshot.data == large_source
+                        and len(large_responses[
+                            f"/repos/uscient/experiment-fixture/git/blobs/{large_blob}"
+                        ][2]) > 65_536,
+                        "the fixed provider drains a large response in its own session",
                     )
                 )
 
@@ -767,11 +835,38 @@ def main() -> int:
                     b"{",
                 )
                 taxonomy_outcomes.append((200, acquire(malformed_responses)[0]))
+                tree_missing = dict(fixture_responses)
+                tree_missing[f"/repos/uscient/experiment-fixture/git/trees/{TREE}"] = (
+                    404,
+                    (
+                        ("content-length", "2"),
+                        ("content-type", "application/json; charset=utf-8"),
+                    ),
+                    b"{}",
+                )
+                taxonomy_outcomes.append(("tree-404", acquire(tree_missing)[0]))
+                blob_missing = dict(fixture_responses)
+                blob_missing[f"/repos/uscient/experiment-fixture/git/blobs/{BLOB}"] = (
+                    422,
+                    (
+                        ("content-length", "2"),
+                        ("content-type", "application/json; charset=utf-8"),
+                    ),
+                    b"{}",
+                )
+                taxonomy_outcomes.append(("blob-422", acquire(blob_missing)[0]))
                 results.append(
                     (
                         "GIT-TAXONOMY-001",
                         taxonomy_outcomes
-                        == [(404, "reject"), (403, "infra"), (500, "infra"), (200, "infra")],
+                        == [
+                            (404, "reject"),
+                            (403, "infra"),
+                            (500, "infra"),
+                            (200, "infra"),
+                            ("tree-404", "infra"),
+                            ("blob-422", "infra"),
+                        ],
                         "stable absence is rejection while provider uncertainty is infrastructure",
                     )
                 )
