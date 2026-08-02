@@ -136,6 +136,39 @@ def add(home: Path, name: str = "vendor.worker", subject: str = SUBJECT) -> dict
     return value
 
 
+def matrix_home(root: Path, name: str) -> tuple[Path, str | None]:
+    home = root / name
+    output = io.StringIO()
+    errors = io.StringIO()
+    error: BaseException | None = None
+    returncode: int | None = None
+    try:
+        with redirect_stdout(output), redirect_stderr(errors):
+            returncode = MODULE.main(["--home", str(home), "init"])
+    except BaseException as caught:  # Setup faults must remain matrix failures.
+        error = caught
+    if returncode != 0 or error is not None or errors.getvalue():
+        return home, (
+            f"init={returncode}:error={type(error).__name__ if error else 'none'}:"
+            f"stderr={errors.getvalue()!r}"
+        )
+    return home, None
+
+
+def matrix_add(home: Path, name: str, subject: str) -> str | None:
+    returncode, output, errors, error = module_image(home, "add", name, subject)
+    try:
+        value = json.loads(output) if returncode == 0 and error is None else None
+    except json.JSONDecodeError:
+        value = None
+    if errors or not isinstance(value, dict) or value.get("changed") is not True:
+        return (
+            f"add={returncode}:error={type(error).__name__ if error else 'none'}:"
+            f"stderr={errors!r}:value={value!r}"
+        )
+    return None
+
+
 def current_snapshot(home: Path) -> tuple[Path, dict[str, object], str]:
     root = home / "images" / "catalog"
     pointer = json.loads((root / "current.json").read_bytes())
@@ -143,6 +176,111 @@ def current_snapshot(home: Path) -> tuple[Path, dict[str, object], str]:
     path = root / "snapshots" / f"{snapshot_digest[7:]}.json"
     value = json.loads(path.read_bytes())
     return path, value, snapshot_digest
+
+
+def stored_active_names(home: Path) -> list[str] | None:
+    try:
+        root = home / "images" / "catalog"
+        pointer_raw = (root / "current.json").read_bytes()
+        pointer = json.loads(pointer_raw)
+        if (
+            not isinstance(pointer, dict)
+            or set(pointer) != {"apiVersion", "snapshotDigest"}
+            or pointer.get("apiVersion") != "agent-lab.local-image-current/v0alpha1"
+            or pointer_raw != canonical(pointer) + b"\n"
+        ):
+            return None
+        snapshot_digest = pointer.get("snapshotDigest")
+        if (
+            not isinstance(snapshot_digest, str)
+            or not snapshot_digest.startswith("sha256:")
+            or len(snapshot_digest) != 71
+            or any(character not in "0123456789abcdef" for character in snapshot_digest[7:])
+        ):
+            return None
+        snapshot_raw = (root / "snapshots" / f"{snapshot_digest[7:]}.json").read_bytes()
+        snapshot = json.loads(snapshot_raw)
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot)
+            != {"apiVersion", "previousSnapshotDigest", "records", "revision"}
+            or snapshot.get("apiVersion") != "agent-lab.local-image-snapshot/v0alpha1"
+            or snapshot_raw != canonical(snapshot) + b"\n"
+            or digest(SNAPSHOT_DOMAIN, snapshot) != snapshot_digest
+            or not isinstance(snapshot.get("revision"), int)
+            or isinstance(snapshot.get("revision"), bool)
+            or int(snapshot["revision"]) < 1
+        ):
+            return None
+        records = snapshot.get("records")
+        if not isinstance(records, dict):
+            return None
+        active: list[str] = []
+        for name, projection in records.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(projection, dict)
+                or set(projection) != {"entryDigest", "generation", "state"}
+            ):
+                return None
+            entry_digest = projection.get("entryDigest")
+            if (
+                not isinstance(entry_digest, str)
+                or not entry_digest.startswith("sha256:")
+                or len(entry_digest) != 71
+                or any(character not in "0123456789abcdef" for character in entry_digest[7:])
+            ):
+                return None
+            entry_raw = (root / "entries" / f"{entry_digest[7:]}.json").read_bytes()
+            entry = json.loads(entry_raw)
+            if (
+                not isinstance(entry, dict)
+                or set(entry)
+                != {
+                    "apiVersion",
+                    "generation",
+                    "name",
+                    "previousEntryDigest",
+                    "state",
+                    "subject",
+                    "subjectDigest",
+                }
+                or entry.get("apiVersion") != "agent-lab.local-image-entry/v0alpha1"
+                or entry_raw != canonical(entry) + b"\n"
+                or digest(ENTRY_DOMAIN, entry) != entry_digest
+                or entry.get("name") != name
+                or entry.get("generation") != projection.get("generation")
+                or entry.get("state") != projection.get("state")
+                or not isinstance(entry.get("generation"), int)
+                or isinstance(entry.get("generation"), bool)
+                or int(entry["generation"]) < 1
+                or entry.get("state") not in ("active", "removed")
+                or not isinstance(entry.get("subject"), str)
+                or entry.get("subjectDigest") != str(entry["subject"]).rsplit("@", 1)[-1]
+            ):
+                return None
+            if entry.get("state") == "active":
+                active.append(name)
+        return sorted(active, key=lambda item: item.encode("ascii"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def stored_oracle_sensitivity(home: Path, expected: list[str]) -> bool:
+    try:
+        snapshot_path, snapshot, _snapshot_digest = current_snapshot(home)
+        original = snapshot_path.read_bytes()
+        mutated = dict(snapshot)
+        revision = mutated.get("revision")
+        if not isinstance(revision, int) or isinstance(revision, bool):
+            return False
+        mutated["revision"] = revision + 1
+        snapshot_path.write_bytes(canonical(mutated) + b"\n")
+        rejected = stored_active_names(home) is None
+        snapshot_path.write_bytes(original)
+        return rejected and stored_active_names(home) == expected
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def fingerprint(root: Path) -> tuple[tuple[str, str, int, int, str], ...]:
@@ -1051,19 +1189,24 @@ def main() -> int:
             "catalog staging cleanup.after_fsync",
         )
         matrix_failures: list[str] = []
+        matrix_oracle_home: Path | None = None
         matrix_cli_start = CLI_CALLS
         for index, point in enumerate(bootstrap_points):
-            home = new_home(root, f"bootstrap-crash-{index:02d}")
+            home, setup_error = matrix_home(root, f"bootstrap-crash-{index:02d}")
+            if setup_error is not None:
+                matrix_failures.append(f"bootstrap:{point}:setup:{setup_error}")
+                continue
             child_rc = hard_exit_add(home, "vendor.worker", SUBJECT, point)
             before_retry = cli(home, "image", "list")
             retry = cli(home, "image", "add", "vendor.worker", SUBJECT)
-            final = cli(home, "image", "list")
             try:
                 before_records = json.loads(before_retry.stdout) if before_retry.returncode == 0 else None
                 retry_value = json.loads(retry.stdout) if retry.returncode == 0 else None
-                final_records = json.loads(final.stdout) if final.returncode == 0 else None
             except json.JSONDecodeError:
-                before_records = retry_value = final_records = None
+                before_records = retry_value = None
+            final_names = stored_active_names(home)
+            if final_names == ["vendor.worker"]:
+                matrix_oracle_home = home
             if not (
                 child_rc == 99
                 and before_retry.returncode == 0
@@ -1072,33 +1215,36 @@ def main() -> int:
                 and retry.returncode == 0
                 and isinstance(retry_value, dict)
                 and retry_value.get("changed") in (True, False)
-                and final.returncode == 0
-                and isinstance(final_records, list)
-                and [record.get("name") for record in final_records] == ["vendor.worker"]
+                and final_names == ["vendor.worker"]
                 and not tuple((home / "images" / ".staging").iterdir())
             ):
                 matrix_failures.append(
                     f"bootstrap:{point}:child={child_rc}:before={before_retry.returncode}:"
-                    f"retry={retry.returncode}:final={final.returncode}"
+                    f"retry={retry.returncode}:final={final_names!r}"
                 )
         for index, point in enumerate(later_points):
-            home = new_home(root, f"later-crash-{index:02d}")
-            add(home)
+            home, setup_error = matrix_home(root, f"later-crash-{index:02d}")
+            if setup_error is None:
+                setup_error = matrix_add(home, "vendor.worker", SUBJECT)
+            if setup_error is not None:
+                matrix_failures.append(f"later:{point}:setup:{setup_error}")
+                continue
             child_rc = hard_exit_add(home, "vendor.second", OTHER_SUBJECT, point)
             before_retry = cli(home, "image", "list")
             retry = cli(home, "image", "add", "vendor.second", OTHER_SUBJECT)
-            final = cli(home, "image", "list")
             try:
                 before_records = json.loads(before_retry.stdout) if before_retry.returncode == 0 else None
                 retry_value = json.loads(retry.stdout) if retry.returncode == 0 else None
-                final_records = json.loads(final.stdout) if final.returncode == 0 else None
             except json.JSONDecodeError:
-                before_records = retry_value = final_records = None
+                before_records = retry_value = None
             before_names = (
                 [record.get("name") for record in before_records]
                 if isinstance(before_records, list)
                 else None
             )
+            final_names = stored_active_names(home)
+            if final_names == ["vendor.second", "vendor.worker"]:
+                matrix_oracle_home = home
             if not (
                 child_rc == 99
                 and before_retry.returncode == 0
@@ -1106,15 +1252,12 @@ def main() -> int:
                 and retry.returncode == 0
                 and isinstance(retry_value, dict)
                 and retry_value.get("changed") in (True, False)
-                and final.returncode == 0
-                and isinstance(final_records, list)
-                and [record.get("name") for record in final_records]
-                == ["vendor.second", "vendor.worker"]
+                and final_names == ["vendor.second", "vendor.worker"]
                 and not tuple((home / "images" / ".staging").iterdir())
             ):
                 matrix_failures.append(
                     f"later:{point}:child={child_rc}:before={before_retry.returncode}:"
-                    f"retry={retry.returncode}:final={final.returncode}"
+                    f"retry={retry.returncode}:final={final_names!r}"
                 )
         matrix_cli_calls = CLI_CALLS - matrix_cli_start
         expected_matrix_cli_calls = 2 * (len(bootstrap_points) + len(later_points))
@@ -1122,6 +1265,10 @@ def main() -> int:
             matrix_failures.append(
                 f"cli-calls:{matrix_cli_calls}:expected={expected_matrix_cli_calls}"
             )
+        if matrix_oracle_home is None or not stored_oracle_sensitivity(
+            matrix_oracle_home, ["vendor.second", "vendor.worker"]
+        ):
+            matrix_failures.append("stored-oracle-sensitivity")
         check(
             "CAT-CRASH-006",
             not matrix_failures,
