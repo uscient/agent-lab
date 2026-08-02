@@ -2015,7 +2015,7 @@ def main() -> int:
                     and not any(event[3] for event in request_order_events)
                 )
 
-                mask_failure_marker = Path(raw_home) / "mask-clear-requester-reached"
+                mask_failure_marker = Path(raw_home) / "signal-state-requester-reached"
                 mask_parent_pid = os.getpid()
                 original_pthread_sigmask = experiment.signal.pthread_sigmask
                 original_worker_requester = experiment._github_api_request
