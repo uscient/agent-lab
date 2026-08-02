@@ -11,6 +11,7 @@ when
   principal.source == "fixed-local-cli" &&
   context.bindingVersion == "v0alpha1" &&
   resource.planDigest == context.planDigest &&
+  resource.sourceDigest == context.sourceDigest &&
   resource.contractDigest == context.contractDigest &&
   resource.contractVersion == "v0alpha1"
 };

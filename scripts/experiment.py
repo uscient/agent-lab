@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -18,6 +19,10 @@ from typing import NamedTuple, NoReturn
 
 
 MAX_MANIFEST_BYTES = 262_144
+SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
+BUNDLED_CATALOG_DOMAIN = b"agent-lab.experiment-image-catalog.v1\0"
+BUNDLED_ENTRY_DOMAIN = b"agent-lab.experiment-image-entry.v1\0"
+CATALOG_NAME_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 MAX_CUE_OUTPUT_BYTES = 1_048_576
 MAX_CONTRACT_FILE_BYTES = 1_048_576
 MAX_HELPER_BYTES = 1_048_576
@@ -63,7 +68,9 @@ PROBE_MANIFEST = {
         "members": [
             {
                 "name": "probe",
-                "image": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "image": {
+                    "digestRef": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
             }
         ]
     },
@@ -91,6 +98,12 @@ class PlanBinding(NamedTuple):
     requested_name: str
     member_count: int
     resource_classes: tuple[str, ...]
+    source_digest: str
+
+
+class SourceSnapshot(NamedTuple):
+    data: bytes
+    digest: str
 
 
 def fail(message: str) -> NoReturn:
@@ -194,6 +207,93 @@ def read_manifest_once(path: str) -> bytes:
     if before != after or len(data) != final_stat.st_size:
         raise InfrastructureError("manifest changed while it was read")
     return data
+
+
+def read_directory_snapshot(path: str) -> SourceSnapshot:
+    try:
+        directory_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be inspected") from error
+    if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        raise InvalidManifest("source must be one directory")
+    try:
+        before = os.listdir(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be listed") from error
+    if before != ["experiment.cue"]:
+        raise InvalidManifest("directory must contain only experiment.cue")
+    authored_path = os.path.join(path, "experiment.cue")
+    try:
+        authored_stat = os.lstat(authored_path)
+    except OSError as error:
+        raise InfrastructureError("authored file cannot be inspected") from error
+    if authored_stat.st_nlink != 1:
+        raise InvalidManifest("experiment.cue must have one link")
+    authored_mode = stat.S_IMODE(authored_stat.st_mode)
+    if authored_mode & 0o111 or authored_mode & 0o022:
+        raise InvalidManifest("experiment.cue has a suspicious mode")
+    data = read_manifest_once(authored_path)
+    try:
+        after = os.listdir(path)
+        final_directory_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be verified") from error
+    if after != before or (directory_stat.st_dev, directory_stat.st_ino) != (
+        final_directory_stat.st_dev,
+        final_directory_stat.st_ino,
+    ):
+        raise InfrastructureError("source directory changed while snapshotting")
+    name = b"experiment.cue"
+    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
+    digest.update(len(name).to_bytes(4, "big"))
+    digest.update(name)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+    return SourceSnapshot(data=data, digest=f"sha256:{digest.hexdigest()}")
+
+
+def authored_manifest(snapshot: SourceSnapshot) -> object:
+    repo_root = Path(__file__).resolve().parent.parent
+    cue_helper = repo_root / "scripts/dev/cue-tool.py"
+    module = b'module: "agent-lab.local/experiment-snapshot"\nlanguage: version: "v0.9.0"\n'
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-lab-source-", dir="/tmp") as directory:
+            root = Path(directory)
+            write_private_file(root, "cue.mod/module.cue", module)
+            write_private_file(root, "experiment.cue", snapshot.data)
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    str(cue_helper),
+                    "-C",
+                    str(root),
+                    "export",
+                    "-E",
+                    "experiment.cue",
+                    "-e",
+                    "experiment",
+                    "--out",
+                    "json",
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=cue_environment(repo_root),
+                timeout=CUE_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InfrastructureError("authored CUE evaluation could not complete") from error
+    if completed.returncode == 1:
+        raise InvalidManifest("authored CUE value is invalid or incomplete")
+    if completed.returncode != 0 or completed.stderr or not completed.stdout:
+        raise InfrastructureError("pinned CUE could not export authored Experiment")
+    if len(completed.stdout) > MAX_CUE_OUTPUT_BYTES:
+        raise InfrastructureError("authored CUE output exceeded its bound")
+    manifest = strict_json(completed.stdout, source="authored CUE export")
+    if not isinstance(manifest, dict):
+        raise InvalidManifest("experiment must export one object")
+    return manifest
 
 
 def strict_json(data: bytes, *, source: str) -> object:
@@ -443,15 +543,17 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
                 or not set(member) <= {"name", "image", "command", "resourceClass"}
             ):
                 raise KeyError("member field drift")
-        members = [
-            {
+        members = []
+        for member in raw_members:
+            selector = member["image"]
+            if not isinstance(selector, dict) or set(selector) != {"digestRef"}:
+                raise KeyError("unresolved selector")
+            members.append({
                 "command": member.get("command", []),
-                "image": member["image"],
                 "name": member["name"],
+                "requestedSelector": selector,
                 "resourceClass": member.get("resourceClass", "small"),
-            }
-            for member in raw_members
-        ]
+            })
         members.sort(key=lambda member: str(member["name"]))
         name = metadata["name"]
     except (AssertionError, KeyError, TypeError) as error:
@@ -467,6 +569,74 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
         "metadata": {"requestedName": name},
         "spec": {"members": members},
     }
+
+
+def valid_catalog_name(value: object) -> bool:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 63:
+        return False
+    parts = value.split(".")
+    return (
+        len(parts) == 2
+        and all(1 <= len(part.encode("ascii", "ignore")) <= 31 for part in parts)
+        and all(part.isascii() and CATALOG_NAME_COMPONENT.fullmatch(part) for part in parts)
+    )
+
+
+def digest_record(domain: bytes, value: object) -> str:
+    return "sha256:" + hashlib.sha256(domain + canonical_json(value)).hexdigest()
+
+
+def bundled_catalog(repo_root: Path) -> tuple[dict[str, object], str]:
+    path = repo_root / "catalog/experiment-images/v0alpha1.json"
+    data = stable_file_bytes(path, MAX_CONTRACT_FILE_BYTES, "bundled image catalog")
+    value = strict_json(data, source="bundled image catalog")
+    if not isinstance(value, dict) or set(value) != {"apiVersion", "entries"}:
+        raise InfrastructureError("bundled image catalog has an unexpected shape")
+    if value["apiVersion"] != "agent-lab.experiment-images/v0alpha1" or not isinstance(value["entries"], list):
+        raise InfrastructureError("bundled image catalog has an unknown schema")
+    return value, digest_record(BUNDLED_CATALOG_DOMAIN, value)
+
+
+def resolve_plan(plan: dict[str, object], repo_root: Path, catalog: dict[str, object] | None = None) -> dict[str, object]:
+    if catalog is None:
+        catalog, _ = bundled_catalog(repo_root)
+    entries = catalog.get("entries")
+    if not isinstance(entries, list):
+        raise InfrastructureError("bundled image catalog entries are malformed")
+    by_name: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"name", "subject"}:
+            raise InfrastructureError("bundled image catalog entry is malformed")
+        name, subject = entry["name"], entry["subject"]
+        if not valid_catalog_name(name) or not isinstance(subject, str) or "@sha256:" not in subject:
+            raise InfrastructureError("bundled image catalog entry is invalid")
+        assert isinstance(name, str)
+        if not name.startswith("agent-lab.") or name in by_name:
+            raise InfrastructureError("bundled image catalog namespace is invalid")
+        by_name[name] = entry
+    resolved = json.loads(canonical_json(plan))
+    members = resolved["spec"]["members"]
+    for member in members:
+        selector = member["requestedSelector"]
+        if set(selector) == {"digestRef"}:
+            member["resolvedImage"] = {"origin": "direct", "subject": selector["digestRef"]}
+            continue
+        if set(selector) != {"catalogName"} or not valid_catalog_name(selector["catalogName"]):
+            raise InvalidManifest("contains an invalid image selector")
+        name = selector["catalogName"]
+        if not name.startswith("agent-lab."):
+            raise InvalidManifest("local image name is not configured")
+        entry = by_name.get(name)
+        if entry is None:
+            raise InvalidManifest("references an unknown bundled image name")
+        entry_digest = digest_record(BUNDLED_ENTRY_DOMAIN, entry)
+        member["resolvedImage"] = {
+            "entryDigest": entry_digest,
+            "generation": 1,
+            "origin": "agent-lab",
+            "subject": entry["subject"],
+        }
+    return resolved
 
 
 def invoke_cue(
@@ -579,7 +749,7 @@ def cue_plan(manifest: object) -> object:
             plan = parse_cue_plan(completed)
             if plan != expected_plan(manifest, contract_digest):
                 raise InfrastructureError("pinned CUE plan violates its exact postcondition")
-            return plan
+            return resolve_plan(plan, repo_root)
     except OSError as error:
         raise InfrastructureError("private validation snapshot could not be managed") from error
 
@@ -593,7 +763,7 @@ def is_sha256(value: object) -> bool:
     )
 
 
-def plan_binding(plan: object) -> PlanBinding:
+def plan_binding(plan: object, source_digest: str) -> PlanBinding:
     """Derive the only facts the v0alpha1 policy is allowed to see."""
     try:
         if not isinstance(plan, dict) or set(plan) != {
@@ -635,8 +805,9 @@ def plan_binding(plan: object) -> PlanBinding:
         for member in members:
             if not isinstance(member, dict) or set(member) != {
                 "command",
-                "image",
                 "name",
+                "requestedSelector",
+                "resolvedImage",
                 "resourceClass",
             }:
                 raise ValueError("plan member")
@@ -659,6 +830,7 @@ def plan_binding(plan: object) -> PlanBinding:
         requested_name=requested_name,
         member_count=len(members),
         resource_classes=tuple(sorted(resource_classes)),
+        source_digest=source_digest,
     )
 
 
@@ -684,6 +856,7 @@ def cedar_documents(
             "uid": resource_uid,
             "attrs": {
                 "planDigest": binding.plan_digest,
+                "sourceDigest": binding.source_digest,
                 "contractDigest": binding.contract_digest,
                 "contractVersion": binding.contract_version,
                 "requestedName": binding.requested_name,
@@ -702,6 +875,7 @@ def cedar_documents(
         "context": {
             "bindingVersion": "v0alpha1",
             "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
             "contractDigest": binding.contract_digest,
         },
     }
@@ -961,9 +1135,9 @@ def evaluate_cedar(
         raise InfrastructureError("private authorization snapshot could not be managed") from error
 
 
-def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
+def authorize_plan(plan: object, source_digest: str) -> tuple[dict[str, object], int]:
     repo_root = Path(__file__).resolve().parent.parent
-    binding = plan_binding(plan)
+    binding = plan_binding(plan, source_digest)
     request, entities = cedar_documents(binding)
     authorization_digest, snapshot = authorization_snapshot(repo_root)
     verdict = evaluate_cedar(snapshot, request, entities, repo_root)
@@ -976,6 +1150,7 @@ def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
             "authorizationDigest": authorization_digest,
             "contractDigest": binding.contract_digest,
             "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
         },
         "kind": "ExperimentAuthorizationDecision",
         "principal": {
@@ -1020,6 +1195,29 @@ def write_decision(decision: object) -> None:
 
 
 def main(argv: list[str]) -> int:
+    directory_checking = len(argv) == 3 and argv[1] == "check-directory"
+    directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
+    if directory_checking or directory_authorizing:
+        try:
+            snapshot = read_directory_snapshot(argv[2])
+            manifest = authored_manifest(snapshot)
+            plan = cue_plan(manifest)
+            if directory_checking:
+                plan_bytes = canonical_json(plan)
+                checked = {
+                    "digest": f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}",
+                    "plan": plan,
+                    "source": {"digest": snapshot.digest, "kind": "directory"},
+                }
+                sys.stdout.buffer.write(canonical_json(checked) + b"\n")
+                return 0
+            decision, result = authorize_plan(plan, snapshot.digest)
+            write_decision(decision)
+            return result
+        except InvalidManifest as error:
+            fail(str(error))
+        except InfrastructureError as error:
+            infra(str(error))
     checking = len(argv) == 3 and argv[1] == "check"
     authorizing = (
         len(argv) == 4 and argv[1] == "authorize" and argv[2] == "install"
@@ -1040,7 +1238,7 @@ def main(argv: list[str]) -> int:
         if checking:
             write_envelope(plan)
             return 0
-        decision, result = authorize_plan(plan)
+        decision, result = authorize_plan(plan, "sha256:" + "0" * 64)
         write_decision(decision)
         return result
     except InvalidManifest as error:
