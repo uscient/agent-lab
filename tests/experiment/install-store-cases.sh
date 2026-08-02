@@ -258,7 +258,8 @@ receipt = json.loads(receipt_bytes)
 for raw, value in ((plan_bytes, plan), (decision_bytes, decision), (provenance_bytes, provenance), (receipt_bytes, receipt)):
     assert raw == canonical(value) + b"\n"
 assert decision["verdict"] == "permit"
-assert decision["binding"]["planDigest"] == digest(canonical(plan))
+plan_digest = identity_digest(b"agent-lab.experiment-plan.v1\0", plan)
+assert decision["binding"]["planDigest"] == plan_digest
 assert isinstance(provenance, dict) and isinstance(provenance.get("apiVersion"), str)
 assert not any(item.startswith("/") for item in strings(provenance))
 
@@ -302,7 +303,7 @@ records = {
         "schema": decision["apiVersion"],
     },
     "records/plan.json": {
-        "digest": digest(plan_bytes),
+        "digest": plan_digest,
         "schema": plan["apiVersion"],
     },
     "records/provenance.json": {
@@ -320,7 +321,7 @@ assert receipt == {
     "records": records,
 }
 receipt_digest = identity_digest(b"agent-lab.experiment-install-receipt.v1\0", receipt)
-assert len({decision_digest, provenance_digest, receipt_digest}) == 3
+assert len({plan_digest, decision_digest, provenance_digest, receipt_digest}) == 4
 
 result_bytes = result_path.read_bytes()
 result = json.loads(result_bytes)
