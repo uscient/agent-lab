@@ -39,6 +39,7 @@ MAX_STAGE_ENTRIES = 16
 MAX_STAGE_BYTES = 4_194_304
 MAX_AUTHORITY_BYTES = 65_536
 MAX_ARTIFACT_BYTES = 262_144
+MAX_ARCHIVE_BYTES = 1_048_576
 MAX_RECORD_BYTES = 1_048_576
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 EXPERIMENT_NAME = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -778,6 +779,7 @@ def _candidate(
         _infra("source snapshot is malformed")
     if source_digest != _source_digest(source_data):
         _infra("source snapshot digest is inconsistent")
+    source_transport = _source_transport(snapshot)
     _validate_catalog_evidence(selected, catalog_evidence)
     identity = _installation_identity(source_digest, plan, decision, selected)
     installation_key = digest(INSTALL_KEY_DOMAIN + canonical(identity))
@@ -799,7 +801,7 @@ def _candidate(
             "format": "agent-lab.experiment-tree/v1",
             "kind": "directory",
         },
-        "transport": {"kind": "local-directory"},
+        "transport": source_transport,
     }
     provenance_bytes = canonical(provenance) + b"\n"
     files = {
@@ -843,6 +845,42 @@ def _candidate(
     receipt_bytes = canonical(receipt) + b"\n"
     files["records/install.json"] = receipt_bytes
     return files, receipt, installation_key, digest(RECEIPT_DOMAIN + canonical(receipt))
+
+
+def _source_transport(snapshot: object) -> dict[str, object]:
+    transport = getattr(snapshot, "transport", None)
+    if transport is None or transport == {"kind": "directory"}:
+        return {"kind": "local-directory"}
+    if (
+        not isinstance(transport, dict)
+        or set(transport) != {"archiveBytes", "archiveDigest", "kind"}
+        or transport.get("kind") != "zip"
+        or not isinstance(transport.get("archiveBytes"), int)
+        or isinstance(transport.get("archiveBytes"), bool)
+        or not 1 <= int(transport["archiveBytes"]) <= MAX_ARCHIVE_BYTES
+        or SHA256.fullmatch(str(transport.get("archiveDigest"))) is None
+    ):
+        _infra("source transport provenance is malformed")
+    return {
+        "archiveBytes": transport["archiveBytes"],
+        "archiveDigest": transport["archiveDigest"],
+        "kind": "zip",
+    }
+
+
+def _validate_transport_provenance(transport: object) -> None:
+    if transport == {"kind": "local-directory"}:
+        return
+    if (
+        not isinstance(transport, dict)
+        or set(transport) != {"archiveBytes", "archiveDigest", "kind"}
+        or transport.get("kind") != "zip"
+        or not isinstance(transport.get("archiveBytes"), int)
+        or isinstance(transport.get("archiveBytes"), bool)
+        or not 1 <= int(transport["archiveBytes"]) <= MAX_ARCHIVE_BYTES
+        or SHA256.fullmatch(str(transport.get("archiveDigest"))) is None
+    ):
+        _infra("installed source transport provenance is invalid")
 
 
 def _directory_names(path: Path, purpose: str, maximum: int) -> tuple[str, ...]:
@@ -1026,9 +1064,9 @@ def _verify_envelope(
                 "format": "agent-lab.experiment-tree/v1",
                 "kind": "directory",
             }
-            or provenance.get("transport") != {"kind": "local-directory"}
         ):
             raise ValueError("provenance")
+        _validate_transport_provenance(provenance.get("transport"))
         catalog = provenance.get("catalog")
         _validate_catalog_evidence(selected, catalog)
         installation_key = digest(INSTALL_KEY_DOMAIN + canonical(identity))
@@ -1939,23 +1977,23 @@ def _held_catalog_context(
         _infra("held local image catalog cannot be acquired", error)
 
 
-def install_directory(
+def _install_source(
     home: Path,
     source: Path,
+    reader_name: str,
     *,
     fault: FaultHook | None = None,
 ) -> dict[str, object]:
-    """Freshly validate/authorize one directory and publish its envelope once."""
+    """Freshly validate/authorize one held source and publish its envelope once."""
 
-    if sys.platform != "linux":
-        _infra("effectful Experiment installation requires Linux")
     authority = _load_home(Path(home))
     experiment = _experiment_module()
     prior_home = os.environ.get("AGENT_LAB_HOME")
     os.environ["AGENT_LAB_HOME"] = str(authority.home)
     try:
         try:
-            snapshot = experiment.read_directory_snapshot(str(source))
+            reader = getattr(experiment, reader_name)
+            snapshot = reader(str(source))
             manifest = experiment.authored_manifest(snapshot)
             resolution = experiment.cue_plan_with_evidence(manifest)
             plan = resolution.plan
@@ -2060,6 +2098,32 @@ def install_directory(
         raise StoreInfrastructure(str(error)) from error
     except (AttributeError, OSError, RuntimeError) as error:
         _infra("Experiment store operation could not establish a result", error)
+
+
+def install_directory(
+    home: Path,
+    source: Path,
+    *,
+    fault: FaultHook | None = None,
+) -> dict[str, object]:
+    """Freshly validate/authorize one directory and publish its envelope once."""
+
+    if sys.platform != "linux":
+        _infra("effectful Experiment installation requires Linux")
+    return _install_source(home, source, "read_directory_snapshot", fault=fault)
+
+
+def install_zip(
+    home: Path,
+    source: Path,
+    *,
+    fault: FaultHook | None = None,
+) -> dict[str, object]:
+    """Freshly validate/authorize one ZIP snapshot and publish its envelope once."""
+
+    if sys.platform != "linux":
+        _infra("effectful Experiment installation requires Linux")
+    return _install_source(home, source, "read_zip_snapshot", fault=fault)
 
 
 def inspect_install(home: Path, name: str) -> dict[str, object]:

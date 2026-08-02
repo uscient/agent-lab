@@ -1715,9 +1715,10 @@ def main(argv: list[str]) -> int:
     directory_checking = len(argv) == 3 and argv[1] == "check-directory"
     directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
     zip_checking = len(argv) == 3 and argv[1] == "check-zip"
-    if directory_checking or directory_authorizing or zip_checking:
+    zip_authorizing = len(argv) == 3 and argv[1] == "authorize-zip"
+    if directory_checking or directory_authorizing or zip_checking or zip_authorizing:
         try:
-            if zip_checking:
+            if zip_checking or zip_authorizing:
                 snapshot = read_zip_snapshot(argv[2])
             else:
                 snapshot = read_directory_snapshot(argv[2])
