@@ -69,9 +69,10 @@ See [Development](development.md) and [development-agent configuration](agent-co
 
 ## Experiment request preflight
 
-`scripts/experiment check [--] MANIFEST` validates the closed `agent-lab/v0alpha1` request with the
+`scripts/agent-lab experiment check DIRECTORY` snapshots and validates the closed authored
+`agent-lab/v0alpha1` request with the
 repository-pinned CUE contract and emits one canonical, digest-bound `RequestedExperimentPlan`.
-`scripts/experiment authorize install [--] MANIFEST` reads the manifest once, derives that same plan
+`scripts/agent-lab experiment authorize install DIRECTORY` reads the snapshot once, derives that same plan
 in-process, and asks the repository-pinned Cedar policy whether the fixed local compatibility
 principal may submit the exact plan digest.
 
@@ -236,7 +237,7 @@ For formal assumptions and limits, read [Security](../SECURITY.md) and the
 | Squid and test service | `compose.egress.yaml`, `gateway/squid/` |
 | workload container | `compose.agent.yaml` and HOME overlays |
 | workload orchestration | `scripts/agent` |
-| Experiment request planning and authorization | `scripts/experiment`, `contracts/experiment/`, `authorization/experiment/` |
+| Experiment request planning and authorization | `scripts/agent-lab`, `scripts/experiment.py`, `contracts/experiment/`, `authorization/experiment/` |
 | config parsing and validation | `scripts/lib/config.sh` |
 | project and secret guards | `scripts/lib/guard.sh` |
 | recipe publication | `scripts/lib/allowlist.sh` |
