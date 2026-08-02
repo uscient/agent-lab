@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import stat
 import sys
 
 SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
@@ -82,13 +83,24 @@ def init_home(home: Path, argv: list[str]) -> int:
 
 
 def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
+    config_path = home / "config.json"
+    receipt_path = home / "home.json"
     try:
-        raw = (home / "config.json").read_bytes()
+        config_metadata = config_path.lstat()
+        receipt_metadata = receipt_path.lstat()
     except FileNotFoundError:
-        return None
+        if not config_path.exists() and not receipt_path.exists():
+            return None
+        raise RuntimeError("home receipt and configuration are incomplete")
+    for metadata in (config_metadata, receipt_metadata):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RuntimeError("home authority files are unsafe")
     try:
+        raw = config_path.read_bytes()
+        receipt_raw = receipt_path.read_bytes()
         value = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
+        receipt = json.loads(receipt_raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         raise RuntimeError("configuration is malformed")
     if not isinstance(value, dict) or set(value) != {"apiVersion", "paths"} or value["apiVersion"] != "agent-lab.config/v0alpha1":
         raise RuntimeError("configuration is not closed")
@@ -97,7 +109,19 @@ def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
         raise RuntimeError("configuration paths are not closed")
     if len(set(paths.values())) != 4 or any(not isinstance(item, str) or not SAFE_COMPONENT.fullmatch(item) for item in paths.values()):
         raise RuntimeError("configuration paths are unsafe")
-    return value, canonical(value) + b"\n"
+    canonical_config = canonical(value) + b"\n"
+    if raw != canonical_config:
+        raise RuntimeError("configuration is not canonical")
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"apiVersion", "configDigest", "paths"}
+        or receipt["apiVersion"] != "agent-lab.home/v0alpha1"
+        or receipt["paths"] != paths
+        or receipt["configDigest"] != "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+        or receipt_raw != canonical(receipt) + b"\n"
+    ):
+        raise RuntimeError("configuration does not match the initialized home receipt")
+    return value, canonical_config
 
 
 def experiment_module():
