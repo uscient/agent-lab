@@ -226,7 +226,8 @@ expect_all_reject ZIP-COUNT-001 ZIP-COUNT "the archive has exactly one member" \
   duplicate-encoding.zip normalized-collision.zip slash-backslash-collision.zip
 
 expect_all_reject ZIP-TYPE-001 ZIP-TYPE "the sole member is a regular file" \
-  directory-type.zip symlink-type.zip fifo-type.zip dos-volume-label.zip
+  directory-type.zip symlink-type.zip fifo-type.zip dos-volume-label.zip \
+  ntfs-device.zip ntfs-reparse.zip
 
 expect_all_reject ZIP-META-001 ZIP-META "member and archive metadata are closed" \
   extra-field.zip file-comment.zip archive-comment.zip
