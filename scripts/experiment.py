@@ -700,10 +700,8 @@ def parse_cue_plan(completed: subprocess.CompletedProcess[bytes]) -> dict[str, o
 def cue_plan(manifest: object) -> object:
     repo_root = Path(__file__).resolve().parent.parent
     contract_root = repo_root / "contracts" / "experiment" / "v0alpha1"
-    cue_tool = repo_root / "scripts" / "dev" / "cue-tool"
     cue_helper = repo_root / "scripts" / "dev" / "cue-tool.py"
     required = (
-        cue_tool,
         cue_helper,
         contract_root / "schema.cue",
         contract_root / "plan.cue",

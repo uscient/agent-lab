@@ -32,6 +32,10 @@ Experiment content. `authorize install` freshly checks the same held source and 
 evidence bound to its source, plan, contract, and authorization identities. The decision is not an
 installation capability.
 
+The same commands work from a local installation after `agent-lab init` and explicit
+`agent-lab tools provision`. Installed execution verifies and uses its release bundle and the
+effective home's pinned tool cache; it does not depend on a source checkout.
+
 Each member selects either an exact digest-pinned OCI reference with `digestRef` or a shared name
 with `catalogName`. Shared names have exactly two bounded lowercase components, `<vendor>.<image>`.
 The `agent-lab.*` namespace belongs to the release-owned bundled catalog; the catalog is initially

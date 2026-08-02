@@ -103,15 +103,17 @@ else
   fail "CodeQL workflow keeps its stable check name"
 fi
 
-if [ "$(grep -Fxc '    branches: [dev, master, main]' "$ci")" -eq 2 ]; then
-  pass "CI runs for pushes and pull requests on every integration branch"
+if [ "$(grep -Fxc '    branches: [dev, master, main]' "$ci")" -eq 1 ] &&
+   [ "$(grep -Fxc "    branches: [dev, master, main, 'work/**']" "$ci")" -eq 1 ]; then
+  pass "CI runs for protected pushes and workstream pull requests"
 else
-  fail "CI runs for pushes and pull requests on every integration branch"
+  fail "CI runs for protected pushes and workstream pull requests"
 fi
-if [ "$(grep -Fxc '    branches: [dev, master, main]' "$codeql")" -eq 2 ]; then
-  pass "CodeQL runs for pushes and pull requests on every integration branch"
+if [ "$(grep -Fxc '    branches: [dev, master, main]' "$codeql")" -eq 1 ] &&
+   [ "$(grep -Fxc "    branches: [dev, master, main, 'work/**']" "$codeql")" -eq 1 ]; then
+  pass "CodeQL runs for protected pushes and workstream pull requests"
 else
-  fail "CodeQL runs for pushes and pull requests on every integration branch"
+  fail "CodeQL runs for protected pushes and workstream pull requests"
 fi
 if grep -Fxq '  merge_group:' "$ci" &&
    grep -Fxq '  merge_group:' "$codeql"; then
