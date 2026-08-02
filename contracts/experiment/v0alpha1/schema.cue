@@ -8,8 +8,13 @@ import (
 #Name: string & strings.MaxRunes(63) &
 	=~"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 
-#Image: string & strings.MinRunes(1) & strings.MaxRunes(255) &
+#DigestRef: string & strings.MinRunes(1) & strings.MaxRunes(255) &
 	=~"^([a-z0-9]+([.-][a-z0-9]+)*(:(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$"
+
+#CatalogName: string & strings.MaxRunes(63) &
+	=~"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+
+#Image: close({digestRef: #DigestRef}) | close({catalogName: #CatalogName})
 
 #Argument: string & strings.MaxRunes(1024) & !~"[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]"
 

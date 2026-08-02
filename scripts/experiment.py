@@ -18,6 +18,7 @@ from typing import NamedTuple, NoReturn
 
 
 MAX_MANIFEST_BYTES = 262_144
+SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
 MAX_CUE_OUTPUT_BYTES = 1_048_576
 MAX_CONTRACT_FILE_BYTES = 1_048_576
 MAX_HELPER_BYTES = 1_048_576
@@ -63,7 +64,9 @@ PROBE_MANIFEST = {
         "members": [
             {
                 "name": "probe",
-                "image": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "image": {
+                    "digestRef": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
             }
         ]
     },
@@ -91,6 +94,12 @@ class PlanBinding(NamedTuple):
     requested_name: str
     member_count: int
     resource_classes: tuple[str, ...]
+    source_digest: str
+
+
+class SourceSnapshot(NamedTuple):
+    data: bytes
+    digest: str
 
 
 def fail(message: str) -> NoReturn:
@@ -194,6 +203,83 @@ def read_manifest_once(path: str) -> bytes:
     if before != after or len(data) != final_stat.st_size:
         raise InfrastructureError("manifest changed while it was read")
     return data
+
+
+def read_directory_snapshot(path: str) -> SourceSnapshot:
+    try:
+        directory_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be inspected") from error
+    if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        raise InvalidManifest("source must be one directory")
+    try:
+        before = os.listdir(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be listed") from error
+    if before != ["experiment.cue"]:
+        raise InvalidManifest("directory must contain only experiment.cue")
+    data = read_manifest_once(os.path.join(path, "experiment.cue"))
+    try:
+        after = os.listdir(path)
+        final_directory_stat = os.lstat(path)
+    except OSError as error:
+        raise InfrastructureError("source directory cannot be verified") from error
+    if after != before or (directory_stat.st_dev, directory_stat.st_ino) != (
+        final_directory_stat.st_dev,
+        final_directory_stat.st_ino,
+    ):
+        raise InfrastructureError("source directory changed while snapshotting")
+    name = b"experiment.cue"
+    digest = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
+    digest.update(len(name).to_bytes(4, "big"))
+    digest.update(name)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+    return SourceSnapshot(data=data, digest=f"sha256:{digest.hexdigest()}")
+
+
+def authored_manifest(snapshot: SourceSnapshot) -> object:
+    repo_root = Path(__file__).resolve().parent.parent
+    cue_helper = repo_root / "scripts/dev/cue-tool.py"
+    module = b'module: "agent-lab.local/experiment-snapshot"\nlanguage: version: "v0.9.0"\n'
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-lab-source-", dir="/tmp") as directory:
+            root = Path(directory)
+            write_private_file(root, "cue.mod/module.cue", module)
+            write_private_file(root, "experiment.cue", snapshot.data)
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-I",
+                    str(cue_helper),
+                    "-C",
+                    str(root),
+                    "export",
+                    "-E",
+                    "experiment.cue",
+                    "-e",
+                    "experiment",
+                    "--out",
+                    "json",
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=cue_environment(repo_root),
+                timeout=CUE_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InfrastructureError("authored CUE evaluation could not complete") from error
+    if completed.returncode == 1:
+        raise InvalidManifest("authored CUE value is invalid or incomplete")
+    if completed.returncode != 0 or completed.stderr or not completed.stdout:
+        raise InfrastructureError("pinned CUE could not export authored Experiment")
+    if len(completed.stdout) > MAX_CUE_OUTPUT_BYTES:
+        raise InfrastructureError("authored CUE output exceeded its bound")
+    manifest = strict_json(completed.stdout, source="authored CUE export")
+    if not isinstance(manifest, dict):
+        raise InvalidManifest("experiment must export one object")
+    return manifest
 
 
 def strict_json(data: bytes, *, source: str) -> object:
@@ -443,15 +529,18 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
                 or not set(member) <= {"name", "image", "command", "resourceClass"}
             ):
                 raise KeyError("member field drift")
-        members = [
-            {
+        members = []
+        for member in raw_members:
+            selector = member["image"]
+            if not isinstance(selector, dict) or set(selector) != {"digestRef"}:
+                raise KeyError("unresolved selector")
+            members.append({
                 "command": member.get("command", []),
-                "image": member["image"],
                 "name": member["name"],
+                "requestedSelector": selector,
+                "resolvedImage": {"origin": "direct", "subject": selector["digestRef"]},
                 "resourceClass": member.get("resourceClass", "small"),
-            }
-            for member in raw_members
-        ]
+            })
         members.sort(key=lambda member: str(member["name"]))
         name = metadata["name"]
     except (AssertionError, KeyError, TypeError) as error:
@@ -593,7 +682,7 @@ def is_sha256(value: object) -> bool:
     )
 
 
-def plan_binding(plan: object) -> PlanBinding:
+def plan_binding(plan: object, source_digest: str) -> PlanBinding:
     """Derive the only facts the v0alpha1 policy is allowed to see."""
     try:
         if not isinstance(plan, dict) or set(plan) != {
@@ -635,8 +724,9 @@ def plan_binding(plan: object) -> PlanBinding:
         for member in members:
             if not isinstance(member, dict) or set(member) != {
                 "command",
-                "image",
                 "name",
+                "requestedSelector",
+                "resolvedImage",
                 "resourceClass",
             }:
                 raise ValueError("plan member")
@@ -659,6 +749,7 @@ def plan_binding(plan: object) -> PlanBinding:
         requested_name=requested_name,
         member_count=len(members),
         resource_classes=tuple(sorted(resource_classes)),
+        source_digest=source_digest,
     )
 
 
@@ -684,6 +775,7 @@ def cedar_documents(
             "uid": resource_uid,
             "attrs": {
                 "planDigest": binding.plan_digest,
+                "sourceDigest": binding.source_digest,
                 "contractDigest": binding.contract_digest,
                 "contractVersion": binding.contract_version,
                 "requestedName": binding.requested_name,
@@ -702,6 +794,7 @@ def cedar_documents(
         "context": {
             "bindingVersion": "v0alpha1",
             "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
             "contractDigest": binding.contract_digest,
         },
     }
@@ -961,9 +1054,9 @@ def evaluate_cedar(
         raise InfrastructureError("private authorization snapshot could not be managed") from error
 
 
-def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
+def authorize_plan(plan: object, source_digest: str) -> tuple[dict[str, object], int]:
     repo_root = Path(__file__).resolve().parent.parent
-    binding = plan_binding(plan)
+    binding = plan_binding(plan, source_digest)
     request, entities = cedar_documents(binding)
     authorization_digest, snapshot = authorization_snapshot(repo_root)
     verdict = evaluate_cedar(snapshot, request, entities, repo_root)
@@ -976,6 +1069,7 @@ def authorize_plan(plan: object) -> tuple[dict[str, object], int]:
             "authorizationDigest": authorization_digest,
             "contractDigest": binding.contract_digest,
             "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
         },
         "kind": "ExperimentAuthorizationDecision",
         "principal": {
@@ -1020,6 +1114,29 @@ def write_decision(decision: object) -> None:
 
 
 def main(argv: list[str]) -> int:
+    directory_checking = len(argv) == 3 and argv[1] == "check-directory"
+    directory_authorizing = len(argv) == 3 and argv[1] == "authorize-directory"
+    if directory_checking or directory_authorizing:
+        try:
+            snapshot = read_directory_snapshot(argv[2])
+            manifest = authored_manifest(snapshot)
+            plan = cue_plan(manifest)
+            if directory_checking:
+                plan_bytes = canonical_json(plan)
+                checked = {
+                    "digest": f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}",
+                    "plan": plan,
+                    "source": {"digest": snapshot.digest, "kind": "directory"},
+                }
+                sys.stdout.buffer.write(canonical_json(checked) + b"\n")
+                return 0
+            decision, result = authorize_plan(plan, snapshot.digest)
+            write_decision(decision)
+            return result
+        except InvalidManifest as error:
+            fail(str(error))
+        except InfrastructureError as error:
+            infra(str(error))
     checking = len(argv) == 3 and argv[1] == "check"
     authorizing = (
         len(argv) == 4 and argv[1] == "authorize" and argv[2] == "install"
@@ -1040,7 +1157,7 @@ def main(argv: list[str]) -> int:
         if checking:
             write_envelope(plan)
             return 0
-        decision, result = authorize_plan(plan)
+        decision, result = authorize_plan(plan, "sha256:" + "0" * 64)
         write_decision(decision)
         return result
     except InvalidManifest as error:
