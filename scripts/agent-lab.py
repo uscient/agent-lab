@@ -71,8 +71,8 @@ def lock_record(path: Path, relative: str, schema: str) -> dict[str, object]:
     }
 
 
-def verify_lock(home: Path, state_component: str, key: str, record: object) -> None:
-    filename, schema, appended = LOCK_SPECS[key]
+def validate_lock_receipt(state_component: str, key: str, record: object) -> None:
+    filename, schema, _ = LOCK_SPECS[key]
     relative = f"{state_component}/locks/{filename}"
     if (
         not isinstance(record, dict)
@@ -85,6 +85,13 @@ def verify_lock(home: Path, state_component: str, key: str, record: object) -> N
         or record.get("schema") != schema
     ):
         raise RuntimeError("home lock receipt is not closed")
+
+
+def verify_lock(home: Path, state_component: str, key: str, record: object) -> None:
+    filename, schema, appended = LOCK_SPECS[key]
+    relative = f"{state_component}/locks/{filename}"
+    validate_lock_receipt(state_component, key, record)
+    assert isinstance(record, dict)
     path = home / relative
     maximum = len(schema.encode("ascii") + b"\n" + appended)
     try:
@@ -235,7 +242,9 @@ def init_home(home: Path, argv: list[str]) -> int:
     return 0
 
 
-def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
+def load_config_receipt(
+    home: Path,
+) -> tuple[dict[str, object], bytes, dict[str, object]] | None:
     config_path = home / "config.json"
     receipt_path = home / "home.json"
     try:
@@ -253,7 +262,7 @@ def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
         receipt_raw = receipt_path.read_bytes()
         value = json.loads(raw.decode("utf-8"))
         receipt = json.loads(receipt_raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, RecursionError, UnicodeError, ValueError):
         raise RuntimeError("configuration is malformed")
     if not isinstance(value, dict) or set(value) != {"apiVersion", "paths"} or value["apiVersion"] != "agent-lab.config/v0alpha1":
         raise RuntimeError("configuration is not closed")
@@ -262,7 +271,11 @@ def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
         raise RuntimeError("configuration paths are not closed")
     if len(set(paths.values())) != 4 or any(not isinstance(item, str) or not SAFE_COMPONENT.fullmatch(item) for item in paths.values()):
         raise RuntimeError("configuration paths are unsafe")
-    canonical_config = canonical(value) + b"\n"
+    try:
+        canonical_config = canonical(value) + b"\n"
+        canonical_receipt = canonical(receipt) + b"\n"
+    except (RecursionError, TypeError, ValueError, UnicodeError) as error:
+        raise RuntimeError("configuration is malformed") from error
     if raw != canonical_config:
         raise RuntimeError("configuration is not canonical")
     if (
@@ -271,12 +284,27 @@ def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
         or receipt["apiVersion"] != "agent-lab.home/v0alpha1"
         or receipt["paths"] != paths
         or receipt["configDigest"] != "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
-        or receipt_raw != canonical(receipt) + b"\n"
+        or receipt_raw != canonical_receipt
     ):
         raise RuntimeError("configuration does not match the initialized home receipt")
     locks = receipt["locks"]
     if not isinstance(locks, dict) or set(locks) != set(LOCK_SPECS):
         raise RuntimeError("home lock receipt is not closed")
+    state_component = paths["state"]
+    assert isinstance(state_component, str)
+    for key in LOCK_SPECS:
+        validate_lock_receipt(state_component, key, locks[key])
+    return value, canonical_config, receipt
+
+
+def load_config(home: Path) -> tuple[dict[str, object], bytes] | None:
+    loaded = load_config_receipt(home)
+    if loaded is None:
+        return None
+    value, canonical_config, receipt = loaded
+    paths = value["paths"]
+    locks = receipt["locks"]
+    assert isinstance(paths, dict) and isinstance(locks, dict)
     state_component = paths["state"]
     assert isinstance(state_component, str)
     for key in LOCK_SPECS:
@@ -299,6 +327,17 @@ def image_catalog_module():
     spec = spec_from_file_location("agent_lab_image_catalog", path)
     if spec is None or spec.loader is None:
         raise ImportError("image catalog module cannot be loaded")
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def experiment_store_module():
+    path = Path(__file__).resolve().with_name("experiment_store.py")
+    spec = spec_from_file_location("agent_lab_experiment_store", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Experiment store module cannot be loaded")
     module = module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -358,6 +397,65 @@ def image_command(home: Path, argv: list[str]) -> int:
         write_json(result)
     except OSError as error:
         print(f"INFRA Agent Lab image catalog result is uncertain: {error}", file=sys.stderr)
+        return 125
+    return 0
+
+
+def experiment_command(home: Path, argv: list[str]) -> int:
+    if argv[:1] == ["install"] and len(argv) == 2:
+        operation = "install"
+    elif argv[:1] == ["inspect"] and len(argv) == 2:
+        operation = "inspect"
+    else:
+        return 2
+
+    try:
+        loaded = load_config_receipt(home)
+    except RuntimeError as error:
+        print(f"INFRA Agent Lab {error}", file=sys.stderr)
+        return 125
+    if loaded is None:
+        print("FAIL Agent Lab home is not initialized", file=sys.stderr)
+        return 1
+
+    if operation == "install" and sys.platform != "linux":
+        print("INFRA Agent Lab Experiment installation requires Linux", file=sys.stderr)
+        return 125
+
+    paths = loaded[0]["paths"]
+    assert isinstance(paths, dict)
+    cache = home / str(paths["cache"]) / "tools"
+    os.environ["AGENT_LAB_HOME"] = str(home)
+    os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(cache / "cue"))
+    os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(cache / "cedar"))
+
+    try:
+        store = experiment_store_module()
+    except Exception as error:
+        print(f"INFRA Agent Lab Experiment store is unavailable: {error}", file=sys.stderr)
+        return 125
+
+    try:
+        if operation == "install":
+            result = store.install_directory(home, Path(argv[1]))
+        else:
+            result = store.inspect_install(home, argv[1])
+        if not isinstance(result, dict):
+            raise TypeError("Experiment store returned a non-object result")
+    except store.StoreReject as error:
+        print(f"FAIL Experiment {error}", file=sys.stderr)
+        return 1
+    except store.StoreInfrastructure as error:
+        print(f"INFRA Agent Lab Experiment store {error}", file=sys.stderr)
+        return 125
+    except Exception as error:
+        print(f"INFRA Agent Lab Experiment store operation is unavailable: {error}", file=sys.stderr)
+        return 125
+
+    try:
+        write_json(result)
+    except Exception as error:
+        print(f"INFRA Agent Lab Experiment store result is uncertain: {error}", file=sys.stderr)
         return 125
     return 0
 
@@ -431,6 +529,8 @@ def main(argv: list[str]) -> int:
         os.environ.setdefault("AGENT_LAB_CUE_TOOL_DIR", str(home / "cache/tools/cue"))
         os.environ.setdefault("AGENT_LAB_CEDAR_TOOL_DIR", str(home / "cache/tools/cedar"))
         return experiment_module().main(["experiment.py", "authorize-directory", argv[3]])
+    if argv[:1] == ["experiment"] and argv[1:2] in (["install"], ["inspect"]):
+        return experiment_command(home, argv[1:])
     if argv[:1] == ["image"]:
         return image_command(home, argv[1:])
     print("Usage: agent-lab [--home ABSOLUTE_HOME] {version|init|config|experiment|image}", file=sys.stderr)

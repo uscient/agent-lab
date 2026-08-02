@@ -1944,6 +1944,81 @@ def inspect_image(
     return result
 
 
+@contextmanager
+def hold_local_image_entries(
+    home: Path,
+    dependencies: Sequence[dict[str, object]],
+    *,
+    limits: CatalogLimits = CatalogLimits(),
+    fault: FaultHook | None = None,
+) -> Iterator[dict[str, object]]:
+    """Hold one verified snapshot while exact active dependencies are consumed."""
+
+    try:
+        requested = tuple(dependencies)
+    except (TypeError, ValueError) as error:
+        _infra("selected local image dependencies are malformed", error)
+
+    expected: dict[str, dict[str, object]] = {}
+    for dependency in requested:
+        if not isinstance(dependency, dict) or set(dependency) != {
+            "entryDigest",
+            "generation",
+            "name",
+            "subject",
+        }:
+            _infra("selected local image dependency schema is not closed")
+        name = dependency.get("name")
+        entry_digest = dependency.get("entryDigest")
+        generation = dependency.get("generation")
+        subject = dependency.get("subject")
+        if (
+            not isinstance(name, str)
+            or not image_name(name)
+            or name.startswith("agent-lab.")
+            or not _is_digest(entry_digest)
+            or type(generation) is not int
+            or generation != 1
+            or not isinstance(subject, str)
+            or not oci_subject(subject)
+        ):
+            _infra("selected local image dependency binding is invalid")
+        prior = expected.get(name)
+        if prior is not None and prior != dependency:
+            _infra("selected local image dependencies contradict one another")
+        expected[name] = dict(dependency)
+
+    if not expected:
+        yield {"catalog": None, "records": {}}
+        return
+
+    authority = _load_home(home)
+    with _catalog_lock(authority, exclusive=False) as lock_descriptor:
+        _fault(fault, "experiment catalog lock.after_acquire")
+        state = _load_catalog(authority, lock_descriptor, limits)
+        selected: dict[str, dict[str, object]] = {}
+        for name in sorted(expected, key=lambda item: item.encode("ascii")):
+            record = state.records.get(name)
+            if record is None or record["state"] != "active":
+                _reject("selected local image dependency is unknown or inactive")
+            dependency = expected[name]
+            if any(
+                record[field] != dependency[field]
+                for field in ("name", "entryDigest", "generation", "subject")
+            ):
+                _reject("selected local image dependency has drifted")
+            selected[name] = dict(record)
+        if state.snapshot_digest is None or state.revision < 1:
+            _infra("selected local image dependencies have no committed snapshot")
+        yield {
+            "catalog": {
+                "revision": state.revision,
+                "snapshotDigest": state.snapshot_digest,
+            },
+            "records": selected,
+        }
+
+
 def resolve_local_images(
     home: Path,
     names: Sequence[str],

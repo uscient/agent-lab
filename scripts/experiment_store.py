@@ -1,0 +1,1531 @@
+#!/usr/bin/env python3
+"""Durable, permit-gated publication of verified Experiment envelopes."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager, nullcontext
+import ctypes
+import errno
+import fcntl
+import hashlib
+from importlib.util import module_from_spec, spec_from_file_location
+import json
+import math
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+from typing import Callable, Iterator, NamedTuple, NoReturn, Sequence
+
+
+INSTALL_KEY_DOMAIN = b"agent-lab.experiment-installation-key.v1\0"
+SOURCE_DIGEST_DOMAIN = b"agent-lab.experiment-tree.v1\0"
+STAGE_PAYLOAD_DOMAIN = b"agent-lab.experiment-stage-payload.v1\0"
+INSTALL_API = "agent-lab.experiment-install/v0alpha1"
+PROVENANCE_API = "agent-lab.experiment-provenance/v0alpha1"
+INTENT_API = "agent-lab.experiment-install-intent/v0alpha1"
+LOCK_SCHEMA = "agent-lab.experiments-lock/v0alpha1"
+OPERATION_WRAPPER = "experiment-install"
+CLEANUP_WRAPPER = "experiment-install-cleanup"
+MAX_STAGE_ENTRIES = 16
+MAX_STAGE_BYTES = 4_194_304
+MAX_AUTHORITY_BYTES = 65_536
+MAX_ARTIFACT_BYTES = 262_144
+MAX_RECORD_BYTES = 1_048_576
+SAFE_COMPONENT = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+IMAGE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+PAYLOAD_DIRECTORIES = {"payload", "payload/artifact", "payload/records"}
+PAYLOAD_FILES = {
+    "payload/artifact/experiment.cue",
+    "payload/records/decision.json",
+    "payload/records/install.json",
+    "payload/records/plan.json",
+    "payload/records/provenance.json",
+}
+STAGE_ALLOWED = {"intent.json", *PAYLOAD_DIRECTORIES, *PAYLOAD_FILES}
+RECORD_PATHS = {
+    "artifact/experiment.cue",
+    "records/decision.json",
+    "records/plan.json",
+    "records/provenance.json",
+}
+
+FaultHook = Callable[[str], None]
+
+
+class StoreError(Exception):
+    """Base class for classified Experiment-store failures."""
+
+
+class StoreReject(StoreError):
+    """The requested operation is a safe ordinary rejection."""
+
+
+class StoreInfrastructure(StoreError):
+    """The store could not establish a trustworthy result."""
+
+
+class DuplicateKey(ValueError):
+    """A JSON object contains a duplicate decoded key."""
+
+
+class HomeAuthority(NamedTuple):
+    home: Path
+    store: Path
+    staging: Path
+    state: Path
+    locks: Path
+    lock: Path
+    lock_device: int
+    lock_inode: int
+    config_raw: bytes
+    receipt_raw: bytes
+    store_device: int
+
+
+class VerifiedInstall(NamedTuple):
+    name: str
+    installation_key: str
+    receipt_digest: str
+    file_digests: dict[str, str]
+
+
+def canonical(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (RecursionError, TypeError, ValueError, UnicodeError) as error:
+        raise StoreInfrastructure("store data cannot be encoded canonically") from error
+
+
+def digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _reject(message: str) -> NoReturn:
+    raise StoreReject(message)
+
+
+def _infra(message: str, error: BaseException | None = None) -> NoReturn:
+    if error is None:
+        raise StoreInfrastructure(message)
+    raise StoreInfrastructure(message) from error
+
+
+def _fault(hook: FaultHook | None, point: str) -> None:
+    if hook is not None:
+        hook(point)
+
+
+def _pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateKey(key)
+        result[key] = value
+    return result
+
+
+def _nonfinite(value: str) -> NoReturn:
+    raise ValueError(value)
+
+
+def _parse_object(data: bytes, purpose: str) -> dict[str, object]:
+    try:
+        text = data.decode("ascii")
+        value = json.loads(
+            text,
+            object_pairs_hook=_pairs,
+            parse_constant=_nonfinite,
+        )
+        _reject_nonfinite(value)
+    except (DuplicateKey, UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
+        _infra(f"{purpose} is not bounded canonical JSON", error)
+    if not isinstance(value, dict):
+        _infra(f"{purpose} is not one JSON object")
+    if data != canonical(value) + b"\n":
+        _infra(f"{purpose} is not canonical")
+    return value
+
+
+def _reject_nonfinite(value: object) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite number")
+    if isinstance(value, dict):
+        for item in value.values():
+            _reject_nonfinite(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_nonfinite(item)
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _absolute_directory_chain(path: Path) -> None:
+    if not path.is_absolute() or path == Path("/") or os.path.normpath(str(path)) != str(path):
+        _infra("Agent Lab home path is not an absolute canonical non-root path")
+    current = Path("/")
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            _reject("Agent Lab home is not initialized")
+        except OSError as error:
+            _infra("Agent Lab home path cannot be inspected", error)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            _infra("Agent Lab home path contains an unsafe component")
+
+
+def _verify_directory(
+    path: Path,
+    *,
+    modes: tuple[int, ...] = (0o700,),
+    device: int | None = None,
+) -> os.stat_result:
+    try:
+        lexical = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        _infra("store directory is unavailable", error)
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        _infra("store directory cannot be verified", error)
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        _infra("store directory descriptor cannot be closed", error)
+    for metadata in (lexical, opened):
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) not in modes
+            or (device is not None and metadata.st_dev != device)
+        ):
+            _infra("store directory metadata is unsafe")
+    if (lexical.st_dev, lexical.st_ino) != (opened.st_dev, opened.st_ino):
+        _infra("store directory identity changed")
+    return opened
+
+
+def _read_file(
+    path: Path,
+    maximum: int,
+    purpose: str,
+    *,
+    mode: int,
+    device: int | None = None,
+) -> bytes:
+    try:
+        lexical = path.lstat()
+        if (
+            stat.S_ISLNK(lexical.st_mode)
+            or not stat.S_ISREG(lexical.st_mode)
+            or lexical.st_uid != os.getuid()
+            or lexical.st_nlink != 1
+            or stat.S_IMODE(lexical.st_mode) != mode
+            or lexical.st_size > maximum
+            or (device is not None and lexical.st_dev != device)
+        ):
+            _infra(f"{purpose} metadata is unsafe")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra(f"{purpose} is unavailable", error)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        final = os.fstat(descriptor)
+    except OSError as error:
+        _infra(f"{purpose} cannot be read safely", error)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            _infra(f"{purpose} descriptor cannot be closed", error)
+    try:
+        current = path.lstat()
+    except OSError as error:
+        _infra(f"{purpose} cannot be reverified", error)
+    for metadata in (opened, final, current):
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_size > maximum
+            or (device is not None and metadata.st_dev != device)
+        ):
+            _infra(f"{purpose} metadata changed unsafely")
+    if (
+        len(data) > maximum
+        or len(data) != final.st_size
+        or _identity(lexical) != _identity(opened)
+        or _identity(opened) != _identity(final)
+        or _identity(final) != _identity(current)
+    ):
+        _infra(f"{purpose} changed while being read")
+    return data
+
+
+def _load_home(home: Path) -> HomeAuthority:
+    try:
+        _absolute_directory_chain(home)
+        _verify_directory(home)
+        config_path = home / "config.json"
+        receipt_path = home / "home.json"
+        try:
+            config_raw = _read_file(
+                config_path,
+                MAX_AUTHORITY_BYTES,
+                "Agent Lab configuration",
+                mode=0o600,
+            )
+            receipt_raw = _read_file(
+                receipt_path,
+                MAX_AUTHORITY_BYTES,
+                "Agent Lab home receipt",
+                mode=0o600,
+            )
+        except StoreInfrastructure:
+            if not os.path.lexists(config_path) and not os.path.lexists(receipt_path):
+                _reject("Agent Lab home is not initialized")
+            raise
+        config = _parse_object(config_raw, "Agent Lab configuration")
+        receipt = _parse_object(receipt_raw, "Agent Lab home receipt")
+        if set(config) != {"apiVersion", "paths"} or config.get("apiVersion") != "agent-lab.config/v0alpha1":
+            _infra("Agent Lab configuration schema is not closed")
+        paths = config.get("paths")
+        if (
+            not isinstance(paths, dict)
+            or set(paths) != {"experiments", "images", "cache", "state"}
+            or len(set(paths.values())) != 4
+            or any(
+                not isinstance(item, str) or SAFE_COMPONENT.fullmatch(item) is None
+                for item in paths.values()
+            )
+        ):
+            _infra("Agent Lab configuration paths are unsafe")
+        expected_config_digest = digest(canonical(config))
+        locks_value = receipt.get("locks")
+        if (
+            set(receipt) != {"apiVersion", "configDigest", "locks", "paths"}
+            or receipt.get("apiVersion") != "agent-lab.home/v0alpha1"
+            or receipt.get("configDigest") != expected_config_digest
+            or receipt.get("paths") != paths
+            or not isinstance(locks_value, dict)
+            or set(locks_value) != {"experiments", "imageCatalog"}
+        ):
+            _infra("Agent Lab home receipt is not closed")
+        lock_record = locks_value.get("experiments")
+        expected_lock_path = f"{paths['state']}/locks/experiments.lock"
+        if (
+            not isinstance(lock_record, dict)
+            or set(lock_record) != {"device", "inode", "path", "schema"}
+            or type(lock_record.get("device")) is not int
+            or type(lock_record.get("inode")) is not int
+            or lock_record.get("path") != expected_lock_path
+            or lock_record.get("schema") != LOCK_SCHEMA
+        ):
+            _infra("Experiment store lock authority is absent from the home receipt")
+        store = home / str(paths["experiments"])
+        state = home / str(paths["state"])
+        staging = store / ".staging"
+        locks = state / "locks"
+        store_metadata = _verify_directory(store)
+        _verify_directory(state)
+        _verify_directory(locks)
+        _verify_directory(staging, device=store_metadata.st_dev)
+        lock = locks / "experiments.lock"
+        try:
+            lock_metadata = lock.lstat()
+        except OSError as error:
+            _infra("Experiment store lock is unavailable", error)
+        if (
+            lock_metadata.st_dev != lock_record["device"]
+            or lock_metadata.st_ino != lock_record["inode"]
+        ):
+            _infra("Experiment store lock identity does not match the home receipt")
+        return HomeAuthority(
+            home,
+            store,
+            staging,
+            state,
+            locks,
+            lock,
+            int(lock_record["device"]),
+            int(lock_record["inode"]),
+            config_raw,
+            receipt_raw,
+            store_metadata.st_dev,
+        )
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra("Agent Lab home cannot be validated", error)
+
+
+def _revalidate_authority(authority: HomeAuthority) -> None:
+    if (
+        _read_file(
+            authority.home / "config.json",
+            MAX_AUTHORITY_BYTES,
+            "Agent Lab configuration",
+            mode=0o600,
+        )
+        != authority.config_raw
+        or _read_file(
+            authority.home / "home.json",
+            MAX_AUTHORITY_BYTES,
+            "Agent Lab home receipt",
+            mode=0o600,
+        )
+        != authority.receipt_raw
+    ):
+        _infra("Agent Lab configuration changed during installation")
+    store = _verify_directory(authority.store)
+    _verify_directory(authority.state)
+    _verify_directory(authority.locks)
+    _verify_directory(authority.staging, device=store.st_dev)
+    if store.st_dev != authority.store_device:
+        _infra("Experiment store filesystem changed during installation")
+
+
+@contextmanager
+def _store_lock(authority: HomeAuthority, fault: FaultHook | None) -> Iterator[int]:
+    maximum = len(LOCK_SCHEMA.encode("ascii") + b"\n")
+    path = authority.lock
+    descriptor = -1
+    try:
+        lexical = path.lstat()
+        if (
+            not stat.S_ISREG(lexical.st_mode)
+            or stat.S_ISLNK(lexical.st_mode)
+            or lexical.st_uid != os.getuid()
+            or lexical.st_nlink != 1
+            or stat.S_IMODE(lexical.st_mode) != 0o600
+            or lexical.st_size != maximum
+            or (lexical.st_dev, lexical.st_ino)
+            != (authority.lock_device, authority.lock_inode)
+        ):
+            _infra("Experiment store lock metadata is unsafe")
+        descriptor = os.open(
+            path,
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size != maximum
+            or (opened.st_dev, opened.st_ino)
+            != (authority.lock_device, authority.lock_inode)
+        ):
+            _infra("Experiment store lock identity changed before acquisition")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        held = os.fstat(descriptor)
+        current = path.lstat()
+        expected = (authority.lock_device, authority.lock_inode)
+        if (
+            _identity(opened) != _identity(held)
+            or (current.st_dev, current.st_ino) != expected
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or current.st_nlink != 1
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_size != maximum
+        ):
+            _infra("Experiment store lock path changed while acquiring it")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.read(descriptor, maximum + 1) != LOCK_SCHEMA.encode("ascii") + b"\n":
+            _infra("Experiment store lock receipt is malformed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _fault(fault, "experiment store lock.after_acquire")
+        yield descriptor
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra("Experiment store lock cannot be held safely", error)
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            except OSError as error:
+                if not unwinding:
+                    _infra("Experiment store lock could not be released", error)
+
+
+def _module(path: Path, name: str):
+    spec = spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        _infra(f"{path.name} cannot be loaded")
+    value = module_from_spec(spec)
+    sys.modules[spec.name] = value
+    try:
+        spec.loader.exec_module(value)
+    except (ImportError, OSError) as error:
+        _infra(f"{path.name} cannot be loaded", error)
+    return value
+
+
+def _experiment_module():
+    return _module(Path(__file__).resolve().with_name("experiment.py"), "agent_lab_experiment_store_planning")
+
+
+def _catalog_module():
+    return _module(Path(__file__).resolve().with_name("image_catalog.py"), "agent_lab_experiment_store_catalog")
+
+
+def _selected_entries(plan: dict[str, object]) -> list[dict[str, object]]:
+    try:
+        members = plan["spec"]["members"]  # type: ignore[index]
+        if not isinstance(members, list):
+            raise ValueError("members")
+        selected: dict[tuple[str, str], dict[str, object]] = {}
+        for member in members:
+            if not isinstance(member, dict):
+                raise ValueError("member")
+            requested = member["requestedSelector"]
+            resolved = member["resolvedImage"]
+            if not isinstance(requested, dict) or not isinstance(resolved, dict):
+                raise ValueError("selector")
+            origin = resolved.get("origin")
+            if origin == "direct":
+                if set(resolved) != {"origin", "subject"} or set(requested) != {"digestRef"}:
+                    raise ValueError("direct selector")
+                continue
+            if (
+                origin not in {"agent-lab", "local"}
+                or set(requested) != {"catalogName"}
+                or set(resolved) != {"entryDigest", "generation", "origin", "subject"}
+            ):
+                raise ValueError("catalog selector")
+            name = requested["catalogName"]
+            entry = {
+                "entryDigest": resolved["entryDigest"],
+                "generation": resolved["generation"],
+                "name": name,
+                "origin": origin,
+                "subject": resolved["subject"],
+            }
+            if (
+                not _image_name(name)
+                or SHA256.fullmatch(str(entry["entryDigest"])) is None
+                or type(entry["generation"]) is not int
+                or int(entry["generation"]) < 1
+                or not isinstance(entry["subject"], str)
+            ):
+                raise ValueError("selected identity")
+            key = (str(origin), name)
+            if key in selected and selected[key] != entry:
+                raise ValueError("inconsistent selected identity")
+            selected[key] = entry
+        return [selected[key] for key in sorted(selected, key=lambda item: (item[0].encode(), item[1].encode()))]
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("Experiment plan has invalid selected-entry identities", error)
+
+
+def _local_dependencies(selected: Sequence[dict[str, object]]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "entryDigest": item["entryDigest"],
+            "generation": item["generation"],
+            "name": item["name"],
+            "subject": item["subject"],
+        }
+        for item in selected
+        if item["origin"] == "local"
+    )
+
+
+def _verify_held_catalog(
+    held: object,
+    dependencies: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    try:
+        if not isinstance(held, dict) or set(held) != {"catalog", "records"}:
+            raise ValueError("held envelope")
+        catalog = held["catalog"]
+        records = held["records"]
+        names = {str(item["name"]) for item in dependencies}
+        if (
+            not isinstance(catalog, dict)
+            or set(catalog) != {"revision", "snapshotDigest"}
+            or type(catalog.get("revision")) is not int
+            or int(catalog["revision"]) < 1
+            or SHA256.fullmatch(str(catalog.get("snapshotDigest"))) is None
+            or not isinstance(records, dict)
+            or set(records) != names
+        ):
+            raise ValueError("held catalog evidence")
+        by_name = {str(item["name"]): item for item in dependencies}
+        for name in names:
+            record = records[name]
+            expected = by_name[name]
+            if (
+                not isinstance(record, dict)
+                or record.get("name") != name
+                or record.get("state") != "active"
+                or record.get("entryDigest") != expected["entryDigest"]
+                or record.get("generation") != expected["generation"]
+                or record.get("subject") != expected["subject"]
+            ):
+                raise ValueError("held selected entry")
+        return {"revision": catalog["revision"], "snapshotDigest": catalog["snapshotDigest"]}
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("held local image catalog evidence is invalid", error)
+
+
+def _source_digest(data: bytes) -> str:
+    name = b"experiment.cue"
+    value = hashlib.sha256(SOURCE_DIGEST_DOMAIN)
+    value.update(len(name).to_bytes(4, "big"))
+    value.update(name)
+    value.update(len(data).to_bytes(8, "big"))
+    value.update(data)
+    return "sha256:" + value.hexdigest()
+
+
+def _image_name(value: object) -> bool:
+    if not isinstance(value, str) or not value.isascii():
+        return False
+    parts = value.split(".")
+    return (
+        len(value.encode("ascii")) <= 63
+        and len(parts) == 2
+        and all(1 <= len(part.encode("ascii")) <= 31 for part in parts)
+        and all(IMAGE_COMPONENT.fullmatch(part) is not None for part in parts)
+    )
+
+
+def _installation_identity(
+    source_digest: str,
+    plan: dict[str, object],
+    decision: dict[str, object],
+    selected: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    try:
+        contract = plan["contract"]
+        binding = decision["binding"]
+        if not isinstance(contract, dict) or not isinstance(binding, dict):
+            raise ValueError("binding")
+        identity = {
+            "authorizationDigest": binding["authorizationDigest"],
+            "contractDigest": contract["digest"],
+            "planDigest": binding["planDigest"],
+            "selectedEntries": list(selected),
+            "sourceDigest": source_digest,
+        }
+        if any(
+            SHA256.fullmatch(str(identity[key])) is None
+            for key in ("authorizationDigest", "contractDigest", "planDigest", "sourceDigest")
+        ):
+            raise ValueError("digest")
+        return identity
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("installation identity cannot be derived", error)
+
+
+def _candidate(
+    snapshot: object,
+    plan: dict[str, object],
+    decision: dict[str, object],
+    selected: Sequence[dict[str, object]],
+    catalog_evidence: dict[str, object] | None,
+) -> tuple[dict[str, bytes], dict[str, object], str, str]:
+    source_data = getattr(snapshot, "data", None)
+    source_digest = getattr(snapshot, "digest", None)
+    if not isinstance(source_data, bytes) or not isinstance(source_digest, str):
+        _infra("source snapshot is malformed")
+    if source_digest != _source_digest(source_data):
+        _infra("source snapshot digest is inconsistent")
+    identity = _installation_identity(source_digest, plan, decision, selected)
+    installation_key = digest(INSTALL_KEY_DOMAIN + canonical(identity))
+    plan_bytes = canonical(plan) + b"\n"
+    decision_bytes = canonical(decision) + b"\n"
+    provenance = {
+        "apiVersion": PROVENANCE_API,
+        "authorizationDigest": identity["authorizationDigest"],
+        "catalog": catalog_evidence,
+        "contractDigest": identity["contractDigest"],
+        "kind": "ExperimentInstallationProvenance",
+        "planDigest": identity["planDigest"],
+        "selectedEntries": list(selected),
+        "source": {
+            "bytes": len(source_data),
+            "digest": source_digest,
+            "entryCount": 1,
+            "fileCount": 1,
+            "format": "agent-lab.experiment-tree/v1",
+            "kind": "directory",
+        },
+        "transport": {"kind": "local-directory"},
+    }
+    provenance_bytes = canonical(provenance) + b"\n"
+    files = {
+        "artifact/experiment.cue": source_data,
+        "records/decision.json": decision_bytes,
+        "records/plan.json": plan_bytes,
+        "records/provenance.json": provenance_bytes,
+    }
+    records = {
+        "artifact/experiment.cue": {
+            "digest": digest(source_data),
+            "schema": "agent-lab/v0alpha1",
+        },
+        "records/decision.json": {
+            "digest": digest(decision_bytes),
+            "schema": decision.get("apiVersion"),
+        },
+        "records/plan.json": {
+            "digest": digest(plan_bytes),
+            "schema": plan.get("apiVersion"),
+        },
+        "records/provenance.json": {
+            "digest": digest(provenance_bytes),
+            "schema": PROVENANCE_API,
+        },
+    }
+    try:
+        requested_name = plan["metadata"]["requestedName"]  # type: ignore[index]
+    except (KeyError, TypeError) as error:
+        _infra("Experiment plan has no requested name", error)
+    if not isinstance(requested_name, str) or SAFE_COMPONENT.fullmatch(requested_name) is None:
+        _infra("Experiment plan requested name is unsafe")
+    receipt = {
+        "apiVersion": INSTALL_API,
+        "identity": identity,
+        "installationKey": installation_key,
+        "kind": "ExperimentInstallationReceipt",
+        "name": requested_name,
+        "records": records,
+    }
+    receipt_bytes = canonical(receipt) + b"\n"
+    files["records/install.json"] = receipt_bytes
+    return files, receipt, installation_key, digest(receipt_bytes)
+
+
+def _directory_names(path: Path, purpose: str, maximum: int) -> tuple[str, ...]:
+    try:
+        names = os.listdir(path)
+    except OSError as error:
+        _infra(f"{purpose} cannot be enumerated", error)
+    if len(names) > maximum:
+        _infra(f"{purpose} exceeds its fixed entry bound")
+    try:
+        return tuple(sorted(names, key=lambda item: os.fsencode(item)))
+    except (TypeError, UnicodeError) as error:
+        _infra(f"{purpose} contains an invalid name", error)
+
+
+def _path_state(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as error:
+        _infra("store path state is ambiguous", error)
+    if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+        return "directory"
+    return "other"
+
+
+def _record_schema(receipt: dict[str, object], path: str) -> tuple[str, str]:
+    try:
+        records = receipt["records"]
+        if not isinstance(records, dict) or set(records) != RECORD_PATHS:
+            raise ValueError("record set")
+        record = records[path]
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"digest", "schema"}
+            or SHA256.fullmatch(str(record.get("digest"))) is None
+            or not isinstance(record.get("schema"), str)
+        ):
+            raise ValueError("record binding")
+        return str(record["digest"]), str(record["schema"])
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("installation receipt record binding is invalid", error)
+
+
+def _verify_envelope(
+    path: Path,
+    expected_name: str,
+    device: int,
+    *,
+    root_modes: tuple[int, ...] = (0o500,),
+) -> VerifiedInstall:
+    _verify_directory(path, modes=root_modes, device=device)
+    if _directory_names(path, "installed envelope", 2) != ("artifact", "records"):
+        _infra("installed envelope layout is not closed")
+    artifact_dir = path / "artifact"
+    records_dir = path / "records"
+    _verify_directory(artifact_dir, modes=(0o500,), device=device)
+    _verify_directory(records_dir, modes=(0o500,), device=device)
+    if _directory_names(artifact_dir, "installed artifact", 1) != ("experiment.cue",):
+        _infra("installed artifact layout is not closed")
+    if _directory_names(records_dir, "installed records", 4) != (
+        "decision.json",
+        "install.json",
+        "plan.json",
+        "provenance.json",
+    ):
+        _infra("installed record layout is not closed")
+    raw = {
+        "artifact/experiment.cue": _read_file(
+            artifact_dir / "experiment.cue",
+            MAX_ARTIFACT_BYTES,
+            "installed Experiment artifact",
+            mode=0o400,
+            device=device,
+        ),
+        "records/decision.json": _read_file(
+            records_dir / "decision.json",
+            MAX_RECORD_BYTES,
+            "installed authorization decision",
+            mode=0o400,
+            device=device,
+        ),
+        "records/install.json": _read_file(
+            records_dir / "install.json",
+            MAX_RECORD_BYTES,
+            "installed receipt",
+            mode=0o400,
+            device=device,
+        ),
+        "records/plan.json": _read_file(
+            records_dir / "plan.json",
+            MAX_RECORD_BYTES,
+            "installed plan",
+            mode=0o400,
+            device=device,
+        ),
+        "records/provenance.json": _read_file(
+            records_dir / "provenance.json",
+            MAX_RECORD_BYTES,
+            "installed provenance",
+            mode=0o400,
+            device=device,
+        ),
+    }
+    plan = _parse_object(raw["records/plan.json"], "installed plan")
+    decision = _parse_object(raw["records/decision.json"], "installed authorization decision")
+    provenance = _parse_object(raw["records/provenance.json"], "installed provenance")
+    receipt = _parse_object(raw["records/install.json"], "installed receipt")
+    try:
+        if (
+            set(plan) != {"apiVersion", "contract", "kind", "metadata", "spec"}
+            or plan.get("apiVersion") != "agent-lab.request/v0alpha1"
+            or plan.get("kind") != "RequestedExperimentPlan"
+            or not isinstance(plan.get("metadata"), dict)
+            or plan["metadata"].get("requestedName") != expected_name  # type: ignore[union-attr]
+            or not isinstance(plan.get("contract"), dict)
+        ):
+            raise ValueError("plan")
+        contract = plan["contract"]
+        if (
+            set(contract) != {"digest", "name", "version"}  # type: ignore[arg-type]
+            or contract.get("name") != "agent-lab.experiment"  # type: ignore[union-attr]
+            or contract.get("version") != "v0alpha1"  # type: ignore[union-attr]
+            or SHA256.fullmatch(str(contract.get("digest"))) is None  # type: ignore[union-attr]
+        ):
+            raise ValueError("contract")
+        plan_digest = digest(canonical(plan))
+        if (
+            set(decision) != {"action", "apiVersion", "binding", "kind", "principal", "resource", "verdict"}
+            or decision.get("apiVersion") != "agent-lab.authorization/v0alpha1"
+            or decision.get("kind") != "ExperimentAuthorizationDecision"
+            or decision.get("action") != "experiment.install"
+            or decision.get("verdict") != "permit"
+            or not isinstance(decision.get("binding"), dict)
+        ):
+            raise ValueError("decision")
+        binding = decision["binding"]
+        source_digest = _source_digest(raw["artifact/experiment.cue"])
+        if (
+            set(binding) != {"authorizationDigest", "contractDigest", "planDigest", "sourceDigest"}  # type: ignore[arg-type]
+            or binding.get("planDigest") != plan_digest  # type: ignore[union-attr]
+            or binding.get("sourceDigest") != source_digest  # type: ignore[union-attr]
+            or binding.get("contractDigest") != contract.get("digest")  # type: ignore[union-attr]
+            or SHA256.fullmatch(str(binding.get("authorizationDigest"))) is None  # type: ignore[union-attr]
+        ):
+            raise ValueError("decision binding")
+        selected = _selected_entries(plan)
+        identity = _installation_identity(source_digest, plan, decision, selected)
+        if (
+            set(provenance) != {
+                "apiVersion", "authorizationDigest", "catalog", "contractDigest", "kind",
+                "planDigest", "selectedEntries", "source", "transport",
+            }
+            or provenance.get("apiVersion") != PROVENANCE_API
+            or provenance.get("kind") != "ExperimentInstallationProvenance"
+            or provenance.get("authorizationDigest") != identity["authorizationDigest"]
+            or provenance.get("contractDigest") != identity["contractDigest"]
+            or provenance.get("planDigest") != identity["planDigest"]
+            or provenance.get("selectedEntries") != list(selected)
+            or provenance.get("source") != {
+                "bytes": len(raw["artifact/experiment.cue"]),
+                "digest": source_digest,
+                "entryCount": 1,
+                "fileCount": 1,
+                "format": "agent-lab.experiment-tree/v1",
+                "kind": "directory",
+            }
+            or provenance.get("transport") != {"kind": "local-directory"}
+        ):
+            raise ValueError("provenance")
+        catalog = provenance.get("catalog")
+        local_selected = [item for item in selected if item["origin"] == "local"]
+        if local_selected:
+            if (
+                not isinstance(catalog, dict)
+                or set(catalog) != {"revision", "snapshotDigest"}
+                or type(catalog.get("revision")) is not int
+                or int(catalog["revision"]) < 1
+                or SHA256.fullmatch(str(catalog.get("snapshotDigest"))) is None
+            ):
+                raise ValueError("catalog provenance")
+        elif catalog is not None:
+            raise ValueError("unexpected catalog provenance")
+        installation_key = digest(INSTALL_KEY_DOMAIN + canonical(identity))
+        if (
+            set(receipt) != {"apiVersion", "identity", "installationKey", "kind", "name", "records"}
+            or receipt.get("apiVersion") != INSTALL_API
+            or receipt.get("kind") != "ExperimentInstallationReceipt"
+            or receipt.get("name") != expected_name
+            or receipt.get("identity") != identity
+            or receipt.get("installationKey") != installation_key
+        ):
+            raise ValueError("receipt")
+        expected_schemas = {
+            "artifact/experiment.cue": "agent-lab/v0alpha1",
+            "records/decision.json": str(decision["apiVersion"]),
+            "records/plan.json": str(plan["apiVersion"]),
+            "records/provenance.json": PROVENANCE_API,
+        }
+        for record_path in RECORD_PATHS:
+            record_digest, schema = _record_schema(receipt, record_path)
+            if record_digest != digest(raw[record_path]) or schema != expected_schemas[record_path]:
+                raise ValueError("record digest")
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("installed envelope does not match its receipt", error)
+    file_digests = {item: digest(data) for item, data in raw.items()}
+    return VerifiedInstall(
+        expected_name,
+        installation_key,
+        digest(raw["records/install.json"]),
+        file_digests,
+    )
+
+
+def _intent(files: dict[str, bytes], name: str, key: str, receipt_digest: str) -> dict[str, object]:
+    file_digests = {path: digest(data) for path, data in sorted(files.items())}
+    return {
+        "apiVersion": INTENT_API,
+        "files": file_digests,
+        "installationKey": key,
+        "name": name,
+        "payloadDigest": digest(STAGE_PAYLOAD_DOMAIN + canonical(file_digests)),
+        "phase": "prepared",
+        "receiptDigest": receipt_digest,
+    }
+
+
+def _validate_intent(value: dict[str, object]) -> None:
+    try:
+        files = value["files"]
+        if (
+            set(value) != {
+                "apiVersion", "files", "installationKey", "name", "payloadDigest", "phase", "receiptDigest",
+            }
+            or value["apiVersion"] != INTENT_API
+            or value["phase"] != "prepared"
+            or not isinstance(value["name"], str)
+            or SAFE_COMPONENT.fullmatch(value["name"]) is None
+            or SHA256.fullmatch(str(value["installationKey"])) is None
+            or SHA256.fullmatch(str(value["receiptDigest"])) is None
+            or not isinstance(files, dict)
+            or set(files) != {
+                "artifact/experiment.cue",
+                "records/decision.json",
+                "records/install.json",
+                "records/plan.json",
+                "records/provenance.json",
+            }
+            or any(SHA256.fullmatch(str(item)) is None for item in files.values())
+            or value["payloadDigest"] != digest(STAGE_PAYLOAD_DOMAIN + canonical(files))
+            or value["receiptDigest"] != files["records/install.json"]
+        ):
+            raise ValueError("intent")
+    except (KeyError, TypeError, ValueError) as error:
+        _infra("Experiment staging intent is invalid", error)
+
+
+def _scan_wrapper(authority: HomeAuthority, path: Path, *, cleanup: bool) -> dict[str, object] | None:
+    _verify_directory(path, modes=(0o700,), device=authority.store_device)
+    count = 1
+    byte_count = 0
+    pending = [path]
+    found: set[str] = set()
+    while pending:
+        parent = pending.pop()
+        remaining = MAX_STAGE_ENTRIES - count
+        for name in _directory_names(parent, "Experiment staging wrapper", max(remaining, 0)):
+            item = parent / name
+            relative = str(item.relative_to(path))
+            if relative not in STAGE_ALLOWED:
+                _infra("Experiment staging wrapper contains an unknown entry")
+            try:
+                metadata = item.lstat()
+            except OSError as error:
+                _infra("Experiment staging entry cannot be inspected", error)
+            count += 1
+            found.add(relative)
+            if count > MAX_STAGE_ENTRIES or metadata.st_dev != authority.store_device or metadata.st_uid != os.getuid():
+                _infra("Experiment staging state exceeds or leaves its fixed authority")
+            if stat.S_ISLNK(metadata.st_mode):
+                _infra("Experiment staging state contains a symlink")
+            if stat.S_ISDIR(metadata.st_mode):
+                if relative not in PAYLOAD_DIRECTORIES or stat.S_IMODE(metadata.st_mode) not in (0o700, 0o500):
+                    _infra("Experiment staging directory metadata is unsafe")
+                pending.append(item)
+            elif stat.S_ISREG(metadata.st_mode):
+                allowed_modes = (0o600,) if relative == "intent.json" else (0o600, 0o400)
+                if stat.S_IMODE(metadata.st_mode) not in allowed_modes or metadata.st_nlink != 1:
+                    _infra("Experiment staging file metadata is unsafe")
+                byte_count += metadata.st_size
+                if byte_count > MAX_STAGE_BYTES:
+                    _infra("Experiment staging state exceeds its fixed byte bound")
+            else:
+                _infra("Experiment staging state contains an unsafe type")
+    intent_path = path / "intent.json"
+    if "intent.json" not in found:
+        if cleanup:
+            return None
+        _infra("Experiment operation wrapper has no durable intent")
+    value = _parse_object(
+        _read_file(
+            intent_path,
+            MAX_AUTHORITY_BYTES,
+            "Experiment staging intent",
+            mode=0o600,
+            device=authority.store_device,
+        ),
+        "Experiment staging intent",
+    )
+    _validate_intent(value)
+    files = value["files"]
+    assert isinstance(files, dict)
+    for relative in found & PAYLOAD_FILES:
+        payload_relative = relative.removeprefix("payload/")
+        maximum = MAX_ARTIFACT_BYTES if payload_relative == "artifact/experiment.cue" else MAX_RECORD_BYTES
+        mode = stat.S_IMODE((path / relative).lstat().st_mode)
+        raw = _read_file(
+            path / relative,
+            maximum,
+            "Experiment staged payload",
+            mode=mode,
+            device=authority.store_device,
+        )
+        if digest(raw) != files[payload_relative]:
+            _infra("Experiment staged payload does not match its durable intent")
+    return value
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        function = library.renameat2
+    except (AttributeError, OSError) as error:
+        _infra("Linux no-replace rename is unavailable", error)
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    result = function(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+    if result != 0:
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            _infra("Experiment no-replace publication raced with an existing target")
+        _infra("Experiment no-replace publication failed", OSError(code, os.strerror(code)))
+
+
+def _fsync_directory(path: Path, purpose: str, *, modes: tuple[int, ...] = (0o700,)) -> None:
+    metadata = _verify_directory(path, modes=modes)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        if (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) != (metadata.st_dev, metadata.st_ino):
+            _infra(f"{purpose} directory identity changed")
+        os.fsync(descriptor)
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra(f"{purpose} directory cannot be persisted", error)
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if not unwinding:
+                    _infra(f"{purpose} directory descriptor cannot be closed", error)
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("write made no progress")
+        view = view[written:]
+
+
+def _write_file(path: Path, data: bytes, purpose: str, fault: FaultHook | None) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            _infra(f"{purpose} file metadata is unsafe")
+        _write_all(descriptor, data)
+        if purpose == "experiment artifact":
+            _fault(fault, "experiment artifact.after_write")
+        os.fsync(descriptor)
+        if purpose == "experiment receipt":
+            _fault(fault, "experiment receipt.after_fsync")
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra(f"{purpose} could not be written durably", error)
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if not unwinding:
+                    _infra(f"{purpose} descriptor could not be closed", error)
+
+
+def _persist_read_only_file(path: Path, purpose: str) -> None:
+    descriptor = -1
+    try:
+        os.chmod(path, 0o400, follow_symlinks=False)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
+            _infra(f"{purpose} committed metadata is unsafe")
+        os.fsync(descriptor)
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra(f"{purpose} mode could not be persisted", error)
+    finally:
+        unwinding = sys.exc_info()[0] is not None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if not unwinding:
+                    _infra(f"{purpose} descriptor could not be closed", error)
+
+
+def _prepare_stage(
+    authority: HomeAuthority,
+    files: dict[str, bytes],
+    name: str,
+    key: str,
+    receipt_digest: str,
+    fault: FaultHook | None,
+) -> tuple[Path, dict[str, object]]:
+    wrapper = authority.staging / OPERATION_WRAPPER
+    payload = wrapper / "payload"
+    intent = _intent(files, name, key, receipt_digest)
+    try:
+        wrapper.mkdir(mode=0o700)
+        _write_file(wrapper / "intent.json", canonical(intent) + b"\n", "experiment intent", fault)
+        _fsync_directory(wrapper, "Experiment intent wrapper")
+        _fsync_directory(authority.staging, "Experiment staging intent")
+        payload.mkdir(mode=0o700)
+        (payload / "artifact").mkdir(mode=0o700)
+        (payload / "records").mkdir(mode=0o700)
+        ordered = (
+            "artifact/experiment.cue",
+            "records/decision.json",
+            "records/plan.json",
+            "records/provenance.json",
+            "records/install.json",
+        )
+        for relative in ordered:
+            purpose = "experiment receipt" if relative == "records/install.json" else (
+                "experiment artifact" if relative == "artifact/experiment.cue" else "experiment record"
+            )
+            _write_file(payload / relative, files[relative], purpose, fault)
+        _fsync_directory(payload / "artifact", "Experiment staged artifact")
+        _fsync_directory(payload / "records", "Experiment staged records")
+        _fsync_directory(payload, "Experiment staged envelope")
+        _fsync_directory(wrapper, "Experiment staged wrapper")
+        _fsync_directory(authority.staging, "Experiment staged operation")
+        for relative in ordered:
+            _persist_read_only_file(payload / relative, "Experiment staged file")
+        os.chmod(payload / "artifact", 0o500, follow_symlinks=False)
+        os.chmod(payload / "records", 0o500, follow_symlinks=False)
+        _fsync_directory(payload / "artifact", "Experiment committed artifact", modes=(0o500,))
+        _fsync_directory(payload / "records", "Experiment committed records", modes=(0o500,))
+        # This runtime's containment LSM rejects moving a non-writable directory.
+        # Keep only the envelope root private-writable until the no-replace move;
+        # all children are already committed and fsynced.  The root is changed to
+        # 0500 and fsynced before the post-publication fault seam can run.
+        _fsync_directory(payload, "Experiment staged envelope root", modes=(0o700,))
+        _fsync_directory(wrapper, "Experiment committed wrapper")
+        _fsync_directory(authority.staging, "Experiment committed staging")
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra("Experiment staging envelope could not be prepared", error)
+    _scan_wrapper(authority, wrapper, cleanup=False)
+    _verify_envelope(payload, name, authority.store_device, root_modes=(0o700,))
+    return wrapper, intent
+
+
+def _remove_tree(path: Path, root: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        _infra("Experiment cleanup residue cannot be inspected", error)
+    relative = str(path.relative_to(root)) if path != root else "."
+    if metadata.st_uid != os.getuid() or stat.S_ISLNK(metadata.st_mode):
+        _infra("Experiment cleanup residue metadata is unsafe")
+    if stat.S_ISREG(metadata.st_mode):
+        if relative not in STAGE_ALLOWED or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o400):
+            _infra("Experiment cleanup file is unsafe")
+        try:
+            path.unlink()
+        except OSError as error:
+            _infra("Experiment cleanup file cannot be removed", error)
+        return
+    if not stat.S_ISDIR(metadata.st_mode) or (
+        path == root and stat.S_IMODE(metadata.st_mode) != 0o700
+    ) or (
+        path != root and relative not in PAYLOAD_DIRECTORIES
+    ):
+        _infra("Experiment cleanup directory is unsafe")
+    try:
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.chmod(path, 0o700, follow_symlinks=False)
+        names = _directory_names(path, "Experiment cleanup residue", MAX_STAGE_ENTRIES)
+        for name in sorted(names, key=lambda item: (item == "intent.json", os.fsencode(item))):
+            _remove_tree(path / name, root)
+        path.rmdir()
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra("Experiment cleanup directory cannot be removed", error)
+
+
+def _finish_cleanup(authority: HomeAuthority, cleanup: Path) -> None:
+    if cleanup != authority.staging / CLEANUP_WRAPPER:
+        _infra("Experiment cleanup target changed")
+    _scan_wrapper(authority, cleanup, cleanup=True)
+    _remove_tree(cleanup, cleanup)
+    _fsync_directory(authority.staging, "Experiment staging cleanup")
+
+
+def _cleanup_operation(authority: HomeAuthority, wrapper: Path) -> None:
+    if wrapper != authority.staging / OPERATION_WRAPPER:
+        _infra("Experiment operation cleanup target changed")
+    _scan_wrapper(authority, wrapper, cleanup=False)
+    cleanup = authority.staging / CLEANUP_WRAPPER
+    _rename_noreplace(wrapper, cleanup)
+    _fsync_directory(authority.staging, "Experiment cleanup handoff")
+    _finish_cleanup(authority, cleanup)
+
+
+def _intent_matches_final(
+    authority: HomeAuthority,
+    intent: dict[str, object],
+) -> bool:
+    name = str(intent["name"])
+    target = authority.store / name
+    state = _path_state(target)
+    if state == "absent":
+        return False
+    if state != "directory":
+        _infra("Experiment staged operation conflicts with an ambiguous final target")
+    verified = _verify_envelope(target, name, authority.store_device)
+    files = intent["files"]
+    assert isinstance(files, dict)
+    if (
+        verified.installation_key != intent["installationKey"]
+        or verified.receipt_digest != intent["receiptDigest"]
+        or any(verified.file_digests.get(path) != expected for path, expected in files.items())
+    ):
+        _infra("Experiment staged operation conflicts with the final installation")
+    return True
+
+
+def _reconcile(authority: HomeAuthority) -> None:
+    names = _directory_names(authority.staging, "Experiment staging root", 1)
+    if not names:
+        _fsync_directory(authority.staging, "Experiment empty staging recovery")
+        return
+    if names == (CLEANUP_WRAPPER,):
+        cleanup = authority.staging / CLEANUP_WRAPPER
+        intent = _scan_wrapper(authority, cleanup, cleanup=True)
+        if intent is not None and _intent_matches_final(authority, intent):
+            _fsync_directory(authority.store, "Experiment committed recovery")
+        _finish_cleanup(authority, cleanup)
+        return
+    if names != (OPERATION_WRAPPER,):
+        _infra("Experiment staging root contains an unknown wrapper")
+    wrapper = authority.staging / OPERATION_WRAPPER
+    intent = _scan_wrapper(authority, wrapper, cleanup=False)
+    assert intent is not None
+    if _intent_matches_final(authority, intent):
+        _fsync_directory(authority.store, "Experiment committed recovery")
+    _cleanup_operation(authority, wrapper)
+
+
+def _existing(authority: HomeAuthority, name: str) -> VerifiedInstall | None:
+    target = authority.store / name
+    state = _path_state(target)
+    if state == "absent":
+        return None
+    if state != "directory":
+        _infra("Experiment installation target is ambiguous")
+    return _verify_envelope(target, name, authority.store_device)
+
+
+@contextmanager
+def _held_catalog_context(
+    home: Path,
+    dependencies: Sequence[dict[str, object]],
+    fault: FaultHook | None,
+) -> Iterator[object | None]:
+    if not dependencies:
+        with nullcontext(None) as held:
+            yield held
+        return
+    catalog = _catalog_module()
+    operation = getattr(catalog, "hold_local_image_entries", None)
+    if not callable(operation):
+        _infra("held local image catalog support is unavailable")
+    try:
+        with operation(home, tuple(dependencies), fault=fault) as held:
+            yield held
+    except catalog.CatalogReject as error:
+        raise StoreReject(str(error)) from error
+    except catalog.CatalogInfrastructure as error:
+        raise StoreInfrastructure(str(error)) from error
+    except (AttributeError, OSError) as error:
+        _infra("held local image catalog cannot be acquired", error)
+
+
+def install_directory(
+    home: Path,
+    source: Path,
+    *,
+    fault: FaultHook | None = None,
+) -> dict[str, object]:
+    """Freshly validate/authorize one directory and publish its envelope once."""
+
+    if sys.platform != "linux":
+        _infra("effectful Experiment installation requires Linux")
+    authority = _load_home(Path(home))
+    experiment = _experiment_module()
+    prior_home = os.environ.get("AGENT_LAB_HOME")
+    os.environ["AGENT_LAB_HOME"] = str(authority.home)
+    try:
+        try:
+            snapshot = experiment.read_directory_snapshot(str(source))
+            manifest = experiment.authored_manifest(snapshot)
+            resolution = experiment.cue_plan_with_evidence(manifest)
+            plan = resolution.plan
+            if not isinstance(plan, dict):
+                _infra("CUE produced a malformed Experiment plan")
+            decision, status = experiment.authorize_plan(plan, snapshot.digest)
+        except experiment.InvalidManifest as error:
+            raise StoreReject(str(error)) from error
+        except experiment.InfrastructureError as error:
+            raise StoreInfrastructure(str(error)) from error
+        except (AttributeError, OSError) as error:
+            _infra("Experiment validation or authorization is unavailable", error)
+    finally:
+        if prior_home is None:
+            os.environ.pop("AGENT_LAB_HOME", None)
+        else:
+            os.environ["AGENT_LAB_HOME"] = prior_home
+    if status != 0 or not isinstance(decision, dict) or decision.get("verdict") != "permit":
+        _reject("fresh Experiment installation authorization denied")
+    selected = _selected_entries(plan)
+    dependencies = _local_dependencies(selected)
+    try:
+        held_context = _held_catalog_context(authority.home, dependencies, fault)
+        with held_context as held:
+            catalog_evidence = _verify_held_catalog(held, dependencies) if dependencies else None
+            with _store_lock(authority, fault):
+                _revalidate_authority(authority)
+                _reconcile(authority)
+                files, _, key, receipt_digest = _candidate(
+                    snapshot,
+                    plan,
+                    decision,
+                    selected,
+                    catalog_evidence,
+                )
+                name = str(plan["metadata"]["requestedName"])  # type: ignore[index]
+                existing = _existing(authority, name)
+                if existing is not None:
+                    if existing.installation_key != key:
+                        _reject("Experiment name already has a different installation")
+                    return {
+                        "changed": False,
+                        "installationKey": existing.installation_key,
+                        "name": name,
+                        "receiptDigest": existing.receipt_digest,
+                    }
+                wrapper, _ = _prepare_stage(
+                    authority,
+                    files,
+                    name,
+                    key,
+                    receipt_digest,
+                    fault,
+                )
+                _revalidate_authority(authority)
+                _fault(fault, "experiment envelope.before_noreplace")
+                _rename_noreplace(wrapper / "payload", authority.store / name)
+                try:
+                    os.chmod(authority.store / name, 0o500, follow_symlinks=False)
+                except OSError as error:
+                    _infra("published Experiment mode is uncertain", error)
+                _fsync_directory(
+                    authority.store / name,
+                    "Experiment published envelope",
+                    modes=(0o500,),
+                )
+                _fault(fault, "experiment envelope.after_noreplace")
+                _fsync_directory(authority.store, "Experiment store root")
+                _fault(fault, "experiment store root.after_fsync")
+                verified = _verify_envelope(authority.store / name, name, authority.store_device)
+                if verified.installation_key != key or verified.receipt_digest != receipt_digest:
+                    _infra("published Experiment does not match its candidate")
+                _cleanup_operation(authority, wrapper)
+                return {
+                    "changed": True,
+                    "installationKey": key,
+                    "name": name,
+                    "receiptDigest": receipt_digest,
+                }
+    except StoreError:
+        raise
+    except experiment.InvalidManifest as error:
+        raise StoreReject(str(error)) from error
+    except experiment.InfrastructureError as error:
+        raise StoreInfrastructure(str(error)) from error
+    except (AttributeError, OSError, RuntimeError) as error:
+        _infra("Experiment store operation could not establish a result", error)
+
+
+def inspect_install(home: Path, name: str) -> dict[str, object]:
+    """Read-only verification and identity projection for one installed name."""
+
+    if not isinstance(name, str) or SAFE_COMPONENT.fullmatch(name) is None:
+        _reject("Experiment name is invalid")
+    authority = _load_home(Path(home))
+    try:
+        installed = _existing(authority, name)
+    except StoreError:
+        raise
+    except OSError as error:
+        _infra("Experiment installation cannot be inspected", error)
+    if installed is None:
+        _reject("Experiment name is not installed")
+    return {
+        "installationKey": installed.installation_key,
+        "name": name,
+        "receiptDigest": installed.receipt_digest,
+        "state": "installed",
+    }
