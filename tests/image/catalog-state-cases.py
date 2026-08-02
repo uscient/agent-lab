@@ -290,7 +290,10 @@ def stored_active_names(home: Path) -> list[str] | None:
             or any(character not in "0123456789abcdef" for character in snapshot_digest[7:])
         ):
             return None
-        snapshot_raw = stable_record(root / "snapshots" / f"{snapshot_digest[7:]}.json")
+        snapshot_raw = stable_record(
+            root / "snapshots" / f"{snapshot_digest[7:]}.json",
+            maximum=262144,
+        )
         if snapshot_raw is None:
             return None
         snapshot = json.loads(snapshot_raw)
