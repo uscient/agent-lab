@@ -2,7 +2,7 @@
 set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-subcases=(
+all_subcases=(
   "$repo_root/tests/install/local-install-cases.sh"
   "$repo_root/tests/experiment/local-config-cases.sh"
   "$repo_root/tests/experiment/local-image-catalog-cases.sh"
@@ -11,9 +11,53 @@ subcases=(
   "$repo_root/tests/experiment/install-integrity-cases.py"
   "$repo_root/tests/experiment/install-mutation-cases.py"
 )
-expected_count=133
+readonly all_subcases
+
+if [ "$#" -eq 0 ]; then
+  route=all
+elif [ "$#" -eq 1 ]; then
+  route="$1"
+else
+  printf 'Usage: %s [local|install]\n' "${BASH_SOURCE[0]}" >&2
+  exit 2
+fi
+
+case "$route" in
+  all)
+    selected_start=0
+    selected_count=7
+    expected_start=1
+    expected_count=133
+    lane_count=3
+    final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
+    ;;
+  local)
+    selected_start=0
+    selected_count=3
+    expected_start=1
+    expected_count=86
+    lane_count=1
+    final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
+    ;;
+  install)
+    selected_start=3
+    selected_count=4
+    expected_start=87
+    expected_count=47
+    lane_count=1
+    final_marker='EXPERIMENT INSTALL LIFECYCLE PASS'
+    ;;
+  *)
+    printf 'Usage: %s [local|install]\n' "${BASH_SOURCE[0]}" >&2
+    exit 2
+    ;;
+esac
+readonly route selected_start selected_count expected_start expected_count
+readonly lane_count
+readonly final_marker
+subcases=("${all_subcases[@]:$selected_start:$selected_count}")
+readonly subcases
 work=""
-readonly lane_count=3
 lane_pids=()
 lifecycle_pid="$$"
 lifecycle_pgid=""
@@ -79,6 +123,7 @@ trap 'handle_signal 130' INT
 trap 'handle_signal 131' QUIT
 trap 'handle_signal 143' TERM
 
+expected_all="$work/expected-all"
 expected="$work/expected"
 observed="$work/observed"
 printf '%s\n' \
@@ -113,6 +158,12 @@ printf '%s\n' \
   M-STORE-AUTH-001 M-STORE-SOURCE-001 M-STORE-ATOM-001 M-STORE-RETRY-001 \
   M-STORE-DUR-001 M-STORE-LAYOUT-001 M-STORE-KEY-001 M-STORE-VERIFY-001 \
   M-STORE-LIVE-001 M-STORE-UNCERT-001 M-STORE-STAGE-001 > "$expected"
+mv "$expected" "$expected_all"
+if ! awk -v start="$expected_start" -v count="$expected_count" \
+  'NR >= start && NR < start + count {print}' "$expected_all" > "$expected"; then
+  printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
+  exit 125
+fi
 : > "$observed"
 
 run_subcase() {
@@ -231,4 +282,4 @@ fi
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi
-printf 'EXPERIMENT LOCAL LIFECYCLE PASS\n'
+printf '%s\n' "$final_marker"

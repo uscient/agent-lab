@@ -378,10 +378,8 @@ run_replica "$work/baseline.out" env \
 mutant_lifecycle="$replica/tests/experiment/local-lifecycle-hidden-duplicate.sh"
 awk '
   { print }
-  $0 == "subcases=(" { in_subcases=1; next }
-  in_subcases && $0 == ")" {
+  $0 == "subcases=(\"${all_subcases[@]:$selected_start:$selected_count}\")" {
     print "\"$repo_root/tests/install/local-install-cases.sh\" >/dev/null 2>&1"
-    in_subcases=0
   }
 ' "$replica_lifecycle" > "$mutant_lifecycle"
 chmod +x "$mutant_lifecycle"
@@ -435,22 +433,18 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
     install-mutation-cases.py > "$expected_install_executions"
 
   reset_fixtures
-  split_barrier="$work/split-barrier"
   local_executions="$work/local-executions"
   install_executions="$work/install-executions"
-  mkdir "$split_barrier"
   : > "$local_executions"
   : > "$install_executions"
   local_route_rc=0
   install_route_rc=0
   env \
     AGENT_LAB_AGG_EXEC_LOG="$local_executions" \
-    AGENT_LAB_AGG_BARRIER_DIR="$split_barrier" \
     bash "$replica_local_onboarding" > "$work/local-route.out" 2>&1 &
   local_route_pid=$!
   env \
     AGENT_LAB_AGG_EXEC_LOG="$install_executions" \
-    AGENT_LAB_AGG_BARRIER_DIR="$split_barrier" \
     bash "$replica_install_lifecycle" > "$work/install-route.out" 2>&1 &
   install_route_pid=$!
   wait "$local_route_pid" || local_route_rc=$?
@@ -670,9 +664,9 @@ if [ "$lane_assignment_count" -eq 3 ] &&
      "$replica_local_onboarding" || true)" -eq 1 ] &&
    [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" install' \
      "$replica_install_lifecycle" || true)" -eq 1 ]; then
-  pass AGG-010 "split routes share one scheduler and cap lifecycle concurrency at two lanes"
+  pass AGG-010 "split routes share one scheduler and use one aggregate lane each"
 else
-  fail AGG-010 "split routes share one scheduler and cap lifecycle concurrency at two lanes"
+  fail AGG-010 "split routes share one scheduler and use one aggregate lane each"
 fi
 
 hold_ids=(
