@@ -66,6 +66,10 @@ OBSERVED: list[str] = []
 CLI_CALLS = 0
 
 
+class MatrixInfrastructure(RuntimeError):
+    """Crash-matrix setup could not establish trusted fixture state."""
+
+
 def check(assertion: str, condition: bool, message: str, detail: str = "") -> None:
     global FAILURES
     OBSERVED.append(assertion)
@@ -388,6 +392,31 @@ def stored_oracle_sensitivity(home: Path, expected: list[str]) -> bool:
         )
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return False
+
+
+def matrix_infrastructure_sensitivity(root: Path, home: Path) -> bool:
+    original_main = MODULE.main
+    init_propagated = False
+    try:
+        MODULE.main = lambda _arguments: 125
+        try:
+            matrix_home(root, "injected-infrastructure-home")
+        except MatrixInfrastructure:
+            init_propagated = True
+    finally:
+        MODULE.main = original_main
+
+    original_image_command = MODULE.image_command
+    add_propagated = False
+    try:
+        MODULE.image_command = lambda _home, _arguments: 125
+        try:
+            matrix_add(home, "vendor.infrastructure", THIRD_SUBJECT)
+        except MatrixInfrastructure:
+            add_propagated = True
+    finally:
+        MODULE.image_command = original_image_command
+    return init_propagated and add_propagated
 
 
 def fingerprint(root: Path) -> tuple[tuple[str, str, int, int, str], ...]:
@@ -1380,6 +1409,10 @@ def main() -> int:
             matrix_oracle_home, ["vendor.second", "vendor.worker"]
         ):
             matrix_failures.append("stored-oracle-sensitivity")
+        if matrix_oracle_home is None or not matrix_infrastructure_sensitivity(
+            root, matrix_oracle_home
+        ):
+            matrix_failures.append("matrix-infrastructure-sensitivity")
         check(
             "CAT-CRASH-006",
             not matrix_failures,
