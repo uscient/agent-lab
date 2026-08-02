@@ -39,6 +39,7 @@ suite lint scripts/dev/lint-scripts PASS lint-scripts
 suite cue-tool-contract tests/dev/cue-tool-cases.sh SUMMARY failures=0
 suite cedar-tool-contract tests/dev/cedar-tool-cases.sh SUMMARY failures=0
 suite gate-contract tests/dev/security-gate-cases.sh SUMMARY failures=0
+suite workstream-contract tests/dev/workstream-cases.sh SUMMARY failures=0
 suite gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY failures=0
 suite ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
 suite required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
