@@ -46,6 +46,7 @@ chmod +x "$probe_bin/probe"
 ln -s probe "$probe_bin/git"
 ln -s probe "$probe_bin/grep"
 ln -s probe "$probe_bin/sed"
+ln -s probe "$probe_bin/python3"
 real_git="$(command -v git)"
 real_grep="$(command -v grep)"
 real_sed="$(command -v sed)"
@@ -117,6 +118,22 @@ expect_inherited_nocasematch_allow() {
     | env BASHOPTS=nocasematch GIT_DIR="$guard_git_dir" \
         bash "$guard" >/dev/null 2>&1 || rc=$?
   _check allow "$name" "$rc"
+}
+expect_hostile_python_block() {
+  local name="$1" cmd="$2" rc=0 seen=""
+  : > "$probe_log"
+  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(jq -Rn --arg c "$cmd" '$c')" \
+    | env -u AGENT_LAB_MAINTENANCE -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+        PATH="$probe_bin:$PATH" GIT_DIR="$guard_git_dir" \
+        AGENT_LAB_PROCESS_PROBE_LOG="$probe_log" \
+        AGENT_LAB_REAL_GIT="$real_git" AGENT_LAB_REAL_GREP="$real_grep" \
+        AGENT_LAB_REAL_SED="$real_sed" "$guard" >/dev/null 2>&1 || rc=$?
+  seen="$(tr '\n' ',' < "$probe_log")"
+  if [ "$rc" -eq 2 ] && [[ "$seen" != *python3* ]]; then
+    pass "$name"
+  else
+    fail "$name (rc=$rc invoked=$seen)"
+  fi
 }
 
 echo "== allow: local work + git (commit inversion fixed; local merge/rebase preserved) =="
@@ -376,6 +393,10 @@ expect_file_content block "lowercase write still protects rails" \
   write 'AGENTS.md' "$hostile_note"
 expect_cmd allow "literal heredoc content is data, not a command" \
   $'cat > tmp/workbench-note.md <<\'NOTE\'\nAGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text\nNOTE'
+expect_cmd allow "literal Python writer content is data, not a command" \
+  $'python3 -c \'doc = """AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text"""\nopen("proj/flow/_guard-python-note.md", "w").write(doc)\''
+expect_cmd allow "literal Python heredoc writer content is data, not a command" \
+  $'python3 <<\'PY\'\ndoc = """AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text"""\nopen("proj/flow/_guard-python-heredoc.md", "w").write(doc)\nPY'
 
 echo "== hot-path helpers are lazy =="
 expect_no_eager_helpers "allowed command avoids git/grep/sed" \
@@ -430,9 +451,33 @@ expect_cmd block "literal heredoc symlink into rail" \
   $'cat > '"$guard_tmp_link"$' <<\'NOTE\'\npolicy prose only\nNOTE'
 expect_cmd block "dynamic heredoc rail target is not treated as data" \
   $'target=AGENTS.md; cat > "$target" <<\'NOTE\'\npolicy prose only\nNOTE'
+expect_cmd block "literal Python writer still protects rails" \
+  'python3 -c '\''open("AGENTS.md", "w").write("policy prose only")'\'''
+expect_cmd block "literal Python writer cannot mutate Git metadata" \
+  'python3 -c '\''open(".git/config", "w").write("policy prose only")'\'''
+expect_cmd block "literal Python writer cannot mutate nested Git metadata" \
+  'python3 -c '\''open("proj/flow/.git/config", "w").write("git push")'\'''
+expect_cmd block "literal Python writer cannot leave repository" \
+  'python3 -c '\''open("../outside.md", "w").write("policy prose only")'\'''
+expect_cmd block "literal Python writer symlink still protects rails" \
+  "python3 -c 'open(\"$guard_tmp_link\", \"w\").write(\"policy prose only\")'"
+expect_cmd block "dynamic Python writer target fails closed" \
+  'python3 -c '\''open(input(), "w").write("policy prose only")'\'''
+expect_cmd block "lookalike Python executable is not trusted" \
+  './python3 -c '\''open("proj/flow/note.md", "w").write("git push")'\'''
+expect_cmd block "double-quoted Python source can expand shell commands" \
+  $'python3 -c "open(\'proj/flow/note.md\', \'w\').write(\'$(git push)\')"'
+expect_cmd block "unquoted Python heredoc can expand shell commands" \
+  $'python3 <<PY\nopen("proj/flow/note.md", "w").write("$(git push)")\nPY'
+expect_hostile_python_block "hostile PATH Python is neither trusted nor invoked" \
+  'python3 -c '\''open("proj/flow/note.md", "w").write("safe")'\'''
+expect_cmd block "Python writer cannot hide a second operation" \
+  'python3 -c '\''import subprocess; open("tmp/workbench-note.md", "w").write("safe"); subprocess.run(["git", "push"])'\'''
 expect_cmd block "real rm after stripped msg"  'git commit -m "tidy"; rm policy/x'
 expect_cmd block "command after literal heredoc remains executable" \
   $'cat > tmp/workbench-note.md <<\'NOTE\'\nsafe note\nNOTE\ngh pr merge 1'
+expect_cmd block "command after Python heredoc remains executable" \
+  $'python3 <<\'PY\'\nopen("tmp/workbench-note.md", "w").write("safe")\nPY\ngh pr merge 1'
 
 echo "== malformed hook envelopes fail closed =="
 expect_payload block "malformed JSON" '{'
