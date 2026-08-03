@@ -62,6 +62,9 @@ private temporary bind receives only `.serena/cache` writes; global state is tmp
 Lab secrets mount, host home mount, proxy environment, Docker socket, or runtime install path.
 All binds are private and non-recursive; preflight rejects child mounts and nested Git metadata
 before Docker starts.
+The ignored `proj/` collaboration tree is shared RW only for cooperating host-side development
+agents. Startup rejects links, special objects, and multiply linked files already present there;
+host writers are trusted not to introduce them after that snapshot.
 The Serena source and direct language-server/tool versions are fetched at the explicit image build
 and pinned before the no-network runtime is started.
 

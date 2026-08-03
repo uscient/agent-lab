@@ -56,6 +56,19 @@ agent-state paths, and protected rails are hidden or overlaid read-only. Its pro
 private temporary mount, and its global state is tmpfs-only. It receives no host home directory,
 credentials, secrets, Docker socket, proxy configuration, port, or network access.
 
+The Git-ignored `proj/` tree is shared planning state: it stays on the writable `/workspace` bind,
+so agents using the same checkout see and can edit the same files. Because Serena honors
+`.gitignore`, use ordinary file tools rather than semantic tools for `proj/` prose. Sharing does not
+make it repository authority or a secret store; startup still rejects sensitive credential, key,
+and environment path names nested inside it. `proj/` must be a real directory containing only
+ordinary directories and singly linked regular files; symlinks, hardlinks, and host IPC objects
+fail closed before container startup.
+
+That preflight is a startup snapshot, not a continuous monitor. Concurrent host-side agents are
+trusted to keep `proj/` within the ordinary-file contract while Serena runs. Treat an untrusted
+concurrent writer as outside this practical shared-directory design; containing one would require a
+brokered storage service rather than a direct writable bind.
+
 That separation is deliberate. Serena helps an agent develop Agent Lab without becoming an Agent
 Lab runtime dependency, authority system, or source of truth. Repository files, `AGENTS.md`, and
 the normal checks remain authoritative.
@@ -239,6 +252,7 @@ Run the normal repository gates separately:
 | Wrong project or root | Activate `/workspace`; require `agent-lab-dev` before semantic work. |
 | Active project but empty symbol result | Confirm the file is a non-ignored `.sh` or `.bash` under `/workspace`, then prove language-server readiness with another live operation. |
 | Extensionless Bash, Python, prose, or configuration file | This is outside the configured semantic scope; use ordinary tools and say why. |
+| `proj/` is absent or read-only | Reload or restart the client/MCP so it creates a new Serena container. Activation alone does not recreate container mounts. |
 | Containment preflight failure | Remove the reported child mount, nested `.git`, sensitive symlink, or nested credential/key/environment path. Use a non-root canonical UID/GID. Do not weaken the preflight. |
 | Semantic or diagnostic operation fails | Run `./scripts/dev/serena-smoke` and use its reported MCP, Serena, and language-server output. |
 
@@ -287,8 +301,10 @@ workspace folders and does not over-ignore source or tests. No project memories 
 persisted; repository guidance is sufficient and remains canonical.
 
 `scripts/serena-mcp` starts the one-shot `compose.serena.yaml` service. Every bind is private and
-non-recursive. Startup fails closed on child mounts, visible nested `.git` objects, nested
-credential/key/environment paths, sensitive symlinks, and root or noncanonical UID/GID values.
+non-recursive. The ignored `proj/` tree is inherited from the writable project bind; runtime-state
+roots, local environment files, Git metadata, and secrets remain masked. Startup fails closed on
+child mounts, visible nested `.git` objects, nested credential/key/environment paths, sensitive
+symlinks, unsafe shared-`proj/` objects, and root or noncanonical UID/GID values.
 Client registrations remove `BASH_ENV` and `ENV` before invoking a non-login, no-profile Bash so
 ambient host startup files cannot run before the contained launcher.
 

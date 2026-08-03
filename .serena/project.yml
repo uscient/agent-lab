@@ -161,8 +161,9 @@ initial_prompt: >-
   ./scripts/dev/brief and ./scripts/dev/changed commands. Serena does not
   establish Git or GitHub authority. For flow, group, or slice work, follow
   AGENTS.md and docs/workstreams.md and use ./scripts/dev/workstream for
-  integration. Use ordinary tools for prose, configuration, and extensionless
-  Bash rails.
+  integration. The ignored proj/ is shared writable planning state for agents
+  in this checkout; use ordinary tools for it, prose, configuration, and
+  extensionless Bash rails.
 
 # time budget (seconds) per tool call for the retrieval of additional symbol information
 # such as docstrings or parameter information.

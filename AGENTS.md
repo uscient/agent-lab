@@ -66,8 +66,8 @@ containment (`SECURITY.md`, `THREAT_MODEL.md`).
   Activation is not readiness—complete a live symbol operation.
 - Start with `get_symbols_overview` or targeted `find_symbol`; use `find_declaration` and
   `find_referencing_symbols` for impact. Prefer bounded semantic editors when boundaries are reliable.
-- Use ordinary tools for prose, configuration, generated data, partial text, extensionless Bash, and
-  the Python smoke harness. If Serena failed, report that instead of claiming semantic verification.
+- Shared ignored `proj/` is writable ordinary-file state; no links or IPC. Use ordinary tools for
+  it, prose, config, partial text, extensionless Bash, and Python smoke. Report Serena failures.
 - After edits, inspect affected symbols, call `get_diagnostics_for_file`, and run normal gates.
   Activation plus `list_memories` is the onboarding check. Never store secrets, transient IDs, or
   host-only paths. See `docs/serena.md`.

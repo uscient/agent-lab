@@ -61,6 +61,7 @@ printf '%s\n' '{}' > "$probe_project/.mcp.json"
 printf '%s\n' 'project_name: fixture' > "$probe_project/.serena/project.yml"
 printf '%s\n' 'services: {}' > "$probe_project/compose.serena.yaml"
 printf '%s\n' 'masked fixture value' > "$probe_project/.env.local"
+printf '%s\n' 'shared-planning' > "$probe_project/proj/shared.md"
 printf '%s\n' '#!/usr/bin/env bash' > "$probe_project/src/safe.sh"
 
 agent_lab_serena_prepare_mounts "$probe_project" "$probe_state"
@@ -119,7 +120,6 @@ if jq -e \
           "/workspace/.env.local",
           "/workspace/secrets",
           "/workspace/cache",
-          "/workspace/proj",
           "/workspace/AGENTS.md",
           "/workspace/policy",
           "/workspace/.mcp.json",
@@ -130,9 +130,9 @@ if jq -e \
               .Destination == $target and .RW == false)
         )
     ' "$probe_inspect" >/dev/null; then
-  pass "live Serena mounts mask Git/local state, protect rails, and isolate cache"
+  pass "live Serena mounts share proj, mask Git/local state, protect rails, and isolate cache"
 else
-  fail "live Serena mounts mask Git/local state, protect rails, and isolate cache"
+  fail "live Serena mounts share proj, mask Git/local state, protect rails, and isolate cache"
 fi
 
 if docker exec "$mount_probe_container" \
@@ -141,6 +141,14 @@ if docker exec "$mount_probe_container" \
   pass "ordinary project source remains writable"
 else
   fail "ordinary project source remains writable"
+fi
+
+if docker exec "$mount_probe_container" \
+     bash -c 'grep -Fxq "shared-planning" /workspace/proj/shared.md && printf "%s\n" "agent-edit" >> /workspace/proj/shared.md' &&
+   grep -Fxq 'agent-edit' "$probe_project/proj/shared.md"; then
+  pass "shared proj planning state is visible and writable"
+else
+  fail "shared proj planning state is visible and writable"
 fi
 
 if ! docker exec "$mount_probe_container" \
