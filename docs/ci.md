@@ -51,9 +51,17 @@ optional check. The optional OpenClaw image is not built by CI.
 
 The fast job records and validates the immutable event diff base and checked-out
 head. It rejects missing, malformed, unfetched, non-ancestor, or mismatched SHAs
-rather than guessing `HEAD^`. The sole zero-predecessor exception is the human
-creation of literal `flow` at the exact R0-updated `dev` commit; that push still
-runs the complete gates and CodeQL.
+rather than guessing `HEAD^`. The sole zero-predecessor exception is the human creation of literal
+`flow` at the exact bootstrap-closure `dev` commit before another `dev` merge. CI requires that
+head to equal current `origin/dev` and proves it contains the immutable recorded R0 merge; that push
+still runs the complete gates and CodeQL.
+
+For pull requests, the fast job also reads the body only from the GitHub event file and validates the
+latest append-only evidence cycle against the event's exact base/head SHAs and route. Body edits must
+preserve every prior cycle. Program routes and base-policy protected changes require non-`N/A` RED
+predecessor, RED, GREEN, product mutation, and CI mutation. Missing, malformed, stale,
+skipped-as-green, or mutation-insensitive required evidence is not GREEN. PR-body prose complements
+current-head statuses and review; it does not replace either one.
 
 ## Trust boundary
 
@@ -74,8 +82,8 @@ write access.
 
 After each base has emitted its first check, require `CI / Required gates` and
 CodeQL on `dev`, `flow`, every `group/**` base, and any retained publication
-branch. Require current-base testing or a merge queue, approval of the latest
-push, and stale-approval dismissal. Deny force updates and deletion for
+branch. Require current-base testing, approval of the latest push, and stale-approval dismissal;
+the verified program route does not use a merge queue. Deny force updates and deletion for
 `flow`, `work/**`, `group/**`, and `slice/group/**`; keep merge commits and disable
 automatic program-branch deletion through final review.
 

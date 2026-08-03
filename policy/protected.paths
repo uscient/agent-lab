@@ -25,6 +25,7 @@ scripts/lib/serena.sh
 scripts/serena-mcp
 tools/serena-entrypoint.sh
 .github/workflows/
+.github/PULL_REQUEST_TEMPLATE.md
 scripts/dev/workstream
 scripts/dev/workflow-check
 scripts/dev/ci-fast
@@ -45,6 +46,7 @@ tests/dev/workflow-check-cases.sh
 tests/dev/ci-workflow-cases.sh
 tests/dev/required-gates-cases.sh
 tests/dev/security-gate-cases.sh
+tests/dev/docker-harness-cases.sh
 tests/dev/guard-diff-cases.sh
 tests/guard/
 tests/agent/policy-verify.sh

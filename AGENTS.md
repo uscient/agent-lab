@@ -75,8 +75,9 @@ containment (`SECURITY.md`, `THREAT_MODEL.md`).
 ## Authority
 
 - `AGENTS.md` is the sole operating-policy source for agents developing this repository.
-- GitHub is the integration source of truth. Humans create and protect initial `flow` at the exact R0
-  `dev` SHA, own final merges into `dev`, releases, protected settings, authentication, and policy.
+- GitHub governs integration. Humans freeze `dev`, create/protect `flow` at the exact closure commit
+  containing R0, and hold it until CI/CodeQL and protection pass. They own `dev` merges, releases,
+  settings, auth, policy.
 - Agents may publish their current branch, open only its derived PR route, and perform only the
   verified intermediate merges above. Explicit rail maintenance requires `AGENT_LAB_MAINTENANCE=1`.
 

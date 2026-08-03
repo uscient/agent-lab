@@ -9,6 +9,11 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && 
 ci="${AGENT_LAB_CI_WORKFLOW:-$repo_root/.github/workflows/ci.yml}"
 codeql="${AGENT_LAB_CODEQL_WORKFLOW:-$repo_root/.github/workflows/codeql.yml}"
 ci_fast="$repo_root/scripts/dev/ci-fast"
+agents="$repo_root/AGENTS.md"
+workstreams_doc="$repo_root/docs/workstreams.md"
+development_doc="$repo_root/docs/development.md"
+ci_doc="$repo_root/docs/ci.md"
+r0_sha="9ef827c1b0c947babd90ed251deefcd50c04947c"
 failures=0
 
 pass() { printf 'PASS %s\n' "$1"; }
@@ -114,6 +119,8 @@ if [ "$(grep -Fxc '    branches: [dev, flow, master, main]' "$ci")" -eq 1 ] &&
 else
   fail "CI runs for flow pushes and every authorized PR base"
 fi
+require_text "$ci" '    types: [opened, synchronize, reopened, edited, ready_for_review]' \
+  "PR evidence edits rerun the required workflow"
 if [ "$(grep -Fxc '    branches: [dev, flow, master, main]' "$codeql")" -eq 1 ] &&
    [ "$(grep -Fxc "    branches: [dev, flow, master, main, 'work/**', 'group/**']" "$codeql")" -eq 1 ]; then
   pass "CodeQL runs for flow pushes and every authorized PR base"
@@ -161,10 +168,31 @@ require_job_text fast '^([0-9a-f]{40}|[0-9a-f]{64})$' \
   "fast job validates the event SHA grammar"
 require_job_text fast 'merge_group) base="$MERGE_GROUP_BASE_SHA"' \
   "fast job resolves the immutable merge-group base"
+require_job_text fast "          FLOW_R0_SHA: $r0_sha" \
+  "fast job pins the immutable R0 bootstrap ancestor"
+require_job_text fast \
+  'GIT_NO_REPLACE_OBJECTS=1 git merge-base --is-ancestor "$FLOW_R0_SHA" "$dev_head"' \
+  "fast job proves the bootstrap closure contains R0"
 require_job_text fast '[ "$head" = "$dev_head" ]' \
-  "fast job permits only the exact zero-base flow bootstrap neighbor"
+  "fast job permits only the exact current-dev flow bootstrap closure"
 require_job_text fast 'cross-repository PRs are not accepted' \
   "fast job rejects cross-repository evidence"
+require_job_text fast \
+  './scripts/dev/workflow-check "$evidence_mode" "$body"' \
+  "fast job validates the actual PR evidence"
+require_job_text fast \
+  '"$PR_BASE_SHA" "$PR_HEAD_SHA" "$PR_HEAD_REF" "$PR_BASE_REF"' \
+  "fast job binds evidence to immutable identities and route"
+require_job_text fast 'flow | group/* | work/*) evidence_mode=pr-body-strict' \
+  "program PR evidence cannot waive adversarial fields"
+require_job_text fast '"$PR_BASE_SHA:policy/protected.paths"' \
+  "fast job reads evidence applicability from the base policy"
+require_job_text fast '"$GITHUB_EVENT_PATH"' \
+  "fast job reads untrusted PR prose only from the event file"
+require_job_text fast 'payload.get("changes", {}).get("body", {}).get("from")' \
+  "fast job reads the prior body for append-only edits"
+require_job_text fast './scripts/dev/workflow-check evidence-append "$old_body" "$body"' \
+  "fast job prevents prior evidence from being erased"
 require_job_text fast 'valid_group()' \
   "fast job bounds the reserved group namespace"
 require_job_text fast '[ "$PR_HEAD_REF" = "group/$group_name" ] && valid_group "$group_name"' \
@@ -265,6 +293,16 @@ if ! grep -Fq 'git rev-parse HEAD^' "$ci"; then
 else
   fail "diff-base selection has no implicit HEAD fallback"
 fi
+
+for doctrine in "$agents" "$workstreams_doc" "$development_doc" "$ci_doc"; do
+  if { grep -Fq 'bootstrap-closure `dev` commit' "$doctrine" ||
+       grep -Fq 'exact closure commit' "$doctrine"; } &&
+     ! grep -Fq 'exact R0-updated `dev`' "$doctrine"; then
+    pass "${doctrine#"$repo_root/"} binds flow creation to the bootstrap closure"
+  else
+    fail "${doctrine#"$repo_root/"} binds flow creation to the bootstrap closure"
+  fi
+done
 if ! grep -Eq '^[[:space:]]*(paths|paths-ignore):' "$ci" "$codeql" &&
    ! grep -Fq 'continue-on-error:' "$ci" "$codeql"; then
   pass "required workflow scope has no path filter or continue-on-error escape"
@@ -319,6 +357,18 @@ if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
     '0,/125) classification=infrastructure/s//125) classification=assertion-failure/'
   run_ci_mutant weaken-flow-bootstrap \
     's/\[ "$head" = "$dev_head" \]/[ "$head" != "$dev_head" ]/'
+  run_ci_mutant erase-r0-bootstrap-pin \
+    "s/$r0_sha/0000000000000000000000000000000000000000/"
+  run_ci_mutant bypass-r0-ancestry \
+    's/GIT_NO_REPLACE_OBJECTS=1 git merge-base --is-ancestor "$FLOW_R0_SHA" "$dev_head"/true/'
+  run_ci_mutant omit-pr-evidence-edit \
+    's/, edited//'
+  run_ci_mutant bypass-pr-evidence \
+    's#./scripts/dev/workflow-check "$evidence_mode" "$body" \\#true #'
+  run_ci_mutant waive-program-evidence \
+    's/flow | group\/\* | work\/\*) evidence_mode=pr-body-strict/flow | group\/* | work\/*) evidence_mode=pr-body/'
+  run_ci_mutant erase-append-only-evidence \
+    's#./scripts/dev/workflow-check evidence-append "$old_body" "$body"#true#'
   run_ci_mutant bypass-reducer \
     's#run: ./scripts/dev/required-gates#run: true#'
   run_ci_mutant codeql-omit-flow \

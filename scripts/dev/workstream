@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+workflow_check="$repo_root/scripts/dev/workflow-check"
 cd "$repo_root"
 
 usage() {
@@ -12,6 +13,7 @@ Usage:
   scripts/dev/workstream slice NAME
   scripts/dev/workstream sync
   scripts/dev/workstream pr [gh-pr-create options]
+  scripts/dev/workstream evidence PR_NUMBER BODY_FILE
   scripts/dev/workstream merge PR_NUMBER
   scripts/dev/workstream group-pr [gh-pr-create options]
   scripts/dev/workstream final [gh-pr-create options]
@@ -33,6 +35,9 @@ valid_group() {
 real_git=""
 real_gh=""
 real_jq=""
+real_mktemp=""
+real_find=""
+real_bash=""
 for candidate in /usr/bin/git /usr/local/bin/git /bin/git; do
   [ -x "$candidate" ] && { real_git="$candidate"; break; }
 done
@@ -42,11 +47,43 @@ done
 for candidate in /usr/bin/jq /usr/local/bin/jq /bin/jq; do
   [ -x "$candidate" ] && { real_jq="$candidate"; break; }
 done
+for candidate in /usr/bin/mktemp /usr/local/bin/mktemp /bin/mktemp; do
+  [ -x "$candidate" ] && { real_mktemp="$candidate"; break; }
+done
+for candidate in /usr/bin/find /usr/local/bin/find /bin/find; do
+  [ -x "$candidate" ] && { real_find="$candidate"; break; }
+done
+for candidate in /usr/bin/bash /bin/bash; do
+  [ -x "$candidate" ] && { real_bash="$candidate"; break; }
+done
 [ -n "$real_git" ] || die "git is unavailable from a trusted system path"
 [ -n "$real_gh" ] || die "gh is unavailable from a trusted system path"
 [ -n "$real_jq" ] || die "jq is unavailable from a trusted system path"
+[ -n "$real_mktemp" ] || die "mktemp is unavailable from a trusted system path"
+[ -n "$real_find" ] || die "find is unavailable from a trusted system path"
+[ -n "$real_bash" ] || die "bash is unavailable from a trusted system path"
+[ -x "$workflow_check" ] || die "workflow evidence checker is unavailable"
 repository="uscient/agent-lab"
 repository_target="github.com/$repository"
+workstream_state=""
+
+cleanup_workstream_state() {
+  if [ -n "$workstream_state" ]; then
+    "$real_find" "$workstream_state" -depth -delete >/dev/null 2>&1 || true
+    workstream_state=""
+  fi
+}
+
+begin_workstream_state() {
+  workstream_state="$($real_mktemp -d)" || die "cannot allocate temporary workstream state"
+  trap cleanup_workstream_state EXIT
+  trap 'cleanup_workstream_state; exit 125' HUP INT TERM
+}
+
+end_workstream_state() {
+  cleanup_workstream_state
+  trap - EXIT HUP INT TERM
+}
 
 current_branch() {
   "$real_git" -C "$repo_root" symbolic-ref --short -q HEAD 2>/dev/null \
@@ -204,6 +241,86 @@ case "$command_name" in
     esac
     exec "$real_gh" pr create --repo "$repository_target" --base "$base" --head "$branch" "$@"
     ;;
+  evidence)
+    [ "$#" -eq 2 ] || usage
+    pr_number="$1"
+    body_file="$2"
+    [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || refuse "PR number must be a positive integer"
+    [ -f "$body_file" ] && [ -r "$body_file" ] || refuse "evidence body must be a readable file"
+    branch="$(current_branch)"
+    case "$branch" in
+      work/*)
+        valid_component "${branch#work/}" || refuse "invalid current workstream branch"
+        base=dev
+        ;;
+      group/*)
+        valid_group "${branch#group/}" || refuse "invalid current group branch"
+        base=flow
+        ;;
+      slice/group/*/*)
+        remainder="${branch#slice/group/}"
+        group="${remainder%%/*}"
+        name="${remainder#*/}"
+        valid_group "$group" && valid_component "$name" || refuse "invalid group slice branch"
+        base="group/$group"
+        ;;
+      slice/*/*)
+        remainder="${branch#slice/}"
+        slug="${remainder%%/*}"
+        name="${remainder#*/}"
+        valid_component "$slug" && valid_component "$name" || refuse "invalid workstream slice branch"
+        base="work/$slug"
+        ;;
+      flow) base=dev ;;
+      *) refuse "evidence update requires a program or matching legacy-workstream branch" ;;
+    esac
+    require_clean
+    metadata="$($real_gh pr view "$pr_number" --repo "$repository_target" \
+      --json number,state,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository,body)" \
+      || die "cannot read PR $pr_number"
+    if ! printf '%s' "$metadata" | "$real_jq" -e \
+      --argjson number "$pr_number" --arg branch "$branch" --arg base "$base" \
+      --arg repository "$repository" '
+      (.number == $number) and (.state == "OPEN") and
+      (.isCrossRepository == false) and (.headRepository.nameWithOwner == $repository) and
+      (.headRefName == $branch) and (.baseRefName == $base) and
+      (.baseRefOid | test("^[0-9a-f]{40}$")) and
+      (.headRefOid | test("^[0-9a-f]{40}$")) and (.body | type == "string")
+    ' >/dev/null; then
+      refuse "PR $pr_number is not the open same-repository PR for $branch -> $base"
+    fi
+    base_sha="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefOid)"
+    head_sha="$(printf '%s' "$metadata" | "$real_jq" -r .headRefOid)"
+    begin_workstream_state
+    old_body="$workstream_state/old-body"
+    printf '%s' "$metadata" | "$real_jq" -er '.body' > "$old_body" \
+      || die "cannot read existing evidence for PR $pr_number"
+    if ! PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$body_file" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null; then
+      refuse "replacement evidence for PR $pr_number is missing, malformed, or stale"
+    fi
+    if ! PATH=/usr/bin:/bin "$real_bash" "$workflow_check" evidence-append "$old_body" "$body_file" >/dev/null; then
+      refuse "replacement evidence for PR $pr_number changed or erased prior cycles"
+    fi
+    "$real_gh" pr edit "$pr_number" --repo "$repository_target" --body-file "$body_file" >/dev/null \
+      || die "cannot update evidence for PR $pr_number"
+    post_metadata="$($real_gh pr view "$pr_number" --repo "$repository_target" \
+      --json number,state,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository,body)" \
+      || die "cannot confirm PR $pr_number evidence update"
+    if ! printf '%s' "$post_metadata" | "$real_jq" -e --rawfile expected "$body_file" \
+      --argjson number "$pr_number" --arg branch "$branch" --arg base "$base" \
+      --arg base_sha "$base_sha" --arg head_sha "$head_sha" '
+      def trim_one_newline: sub("\\n$"; "");
+      (.number == $number) and (.state == "OPEN") and
+      (.headRefName == $branch) and (.baseRefName == $base) and
+      (.baseRefOid == $base_sha) and (.headRefOid == $head_sha) and
+      ((.body | trim_one_newline) == ($expected | trim_one_newline))
+    ' >/dev/null; then
+      die "PR $pr_number changed while its evidence update was being confirmed"
+    fi
+    end_workstream_state
+    printf 'PASS workstream updated append-only evidence for PR %s at head %s\n' \
+      "$pr_number" "$head_sha"
+    ;;
   merge)
     [ "$#" -eq 1 ] || usage
     pr_number="$1"
@@ -218,7 +335,7 @@ case "$command_name" in
     require_clean
     metadata="$($real_gh pr view "$pr_number" \
       --repo "$repository_target" \
-      --json number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository,mergeStateStatus,reviewDecision,statusCheckRollup)" \
+      --json number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository,mergeStateStatus,reviewDecision,statusCheckRollup,body)" \
       || die "cannot read PR $pr_number"
     if ! printf '%s' "$metadata" | "$real_jq" -e \
       --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" '
@@ -258,6 +375,25 @@ case "$command_name" in
     fi
     base_sha="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefOid)"
     head_sha="$(printf '%s' "$metadata" | "$real_jq" -r .headRefOid)"
+    base_ref="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefName)"
+    head_ref="$(printf '%s' "$metadata" | "$real_jq" -r .headRefName)"
+    begin_workstream_state
+    evidence_file="$workstream_state/pr-body"
+    if ! printf '%s' "$metadata" | "$real_jq" -er '.body | select(type == "string")' \
+      > "$evidence_file"; then
+      refuse "PR $pr_number has no readable evidence ledger"
+    fi
+    if PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$evidence_file" "$base_sha" "$head_sha" "$head_ref" "$base_ref" >/dev/null; then
+      :
+    else
+      evidence_rc=$?
+      case "$evidence_rc" in
+        1) refuse "PR $pr_number evidence is missing, malformed, or stale" ;;
+        125) die "cannot validate PR $pr_number evidence" ;;
+        *) die "PR $pr_number evidence validator returned unexpected status $evidence_rc" ;;
+      esac
+    fi
+    end_workstream_state
     comparison="$($real_gh api "repos/$repository/compare/$base_sha...$head_sha" \
       --hostname github.com --jq .status)" \
       || die "cannot prove PR $pr_number contains its observed base"
@@ -280,9 +416,13 @@ case "$command_name" in
         refuse "observed flow base $base_sha is not green for Required gates and CodeQL"
       fi
     fi
-    "$real_gh" pr merge "$pr_number" --repo "$repository_target" \
-      --merge --match-head-commit "$head_sha" \
-      || die "merge request failed for PR $pr_number"
+    merge_result="$($real_gh api "repos/$repository/pulls/$pr_number/merge" \
+      --hostname github.com --method PUT -f "merge_method=merge" -f "sha=$head_sha")" \
+      || refuse "GitHub did not accept an immediate merge for PR $pr_number"
+    if ! printf '%s' "$merge_result" | "$real_jq" -e \
+      '.merged == true and (.sha | test("^[0-9a-f]{40}$"))' >/dev/null; then
+      refuse "PR $pr_number was not merged immediately; merge queues are not an intermediate route"
+    fi
     post_state="$($real_gh pr view "$pr_number" --repo "$repository_target" \
       --json state --jq .state)" \
       || die "cannot confirm PR $pr_number after merge request"

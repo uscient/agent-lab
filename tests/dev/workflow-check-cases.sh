@@ -96,6 +96,8 @@ expect_usage "missing command fails closed"
 expect_usage "unknown command fails closed" unknown
 expect_usage "missing commit subject fails closed" commit
 expect_usage "missing PR body path fails closed" pr-body
+expect_usage "missing strict PR body path fails closed" pr-body-strict
+expect_usage "missing evidence append bodies fail closed" evidence-append
 expect_usage "missing PR base fails closed" pr-base
 expect_usage "missing PR route fails closed" pr-route
 expect_usage "branch rejects extra arguments" branch xor/dev-lane extra
@@ -103,6 +105,8 @@ expect_usage "commit rejects extra arguments" commit "Implement workflow checks"
 expect_usage "commits rejects extra arguments" commits origin/dev extra
 expect_usage "PR title rejects extra arguments" pr-title "Implement workflow checks" extra
 expect_usage "PR body rejects extra arguments" pr-body body.md extra
+expect_usage "strict PR body rejects extra arguments" pr-body-strict body.md extra
+expect_usage "evidence append rejects extra arguments" evidence-append old.md new.md extra
 expect_usage "PR base rejects extra arguments" pr-base dev extra
 expect_usage "PR route rejects extra arguments" pr-route flow dev extra
 expect_usage "all rejects extra arguments" all origin/dev extra
@@ -161,6 +165,8 @@ expect_reject "overlong reserved group is rejected" "invalid reserved" branch \
 expect_reject "invalid reserved slice is rejected" "invalid reserved" branch slice/group/not-valid/cli
 
 echo "== pull request metadata =="
+evidence_base="1111111111111111111111111111111111111111"
+evidence_head="2222222222222222222222222222222222222222"
 expect_ok "outcome PR title is accepted" pr-title \
   "Standardize development workflow metadata"
 expect_ok "conventional PR title is accepted" pr-title \
@@ -213,8 +219,37 @@ Generic pull-request metadata hides the delivered outcome and evidence.
 ## Testing
 
 - `bash tests/dev/workflow-check-cases.sh` — pass.
+
+## Evidence
+
+### Cycle 1
+
+- Route: `xor/workflow` -> `dev`
+- Base: `1111111111111111111111111111111111111111`
+- Head: `2222222222222222222222222222222222222222`
+- Scenarios: `WF-CI-CURRENT`
+- Assertions: `WORKFLOW-BODY-RC`
+- RED predecessor: `1111111111111111111111111111111111111111`
+- RED: `bash tests/dev/workflow-check-cases.sh` — rc=1 classification=assertion-failure
+- GREEN: `bash tests/dev/workflow-check-cases.sh` — rc=0 classification=success
+- Product mutation: `reject-route-forgery` — detected rc=1 classification=assertion-failure
+- CI mutation: `omit-evidence-check` — detected rc=1 classification=assertion-failure
+- Runner: local Bash fixture
+- Duration: 1s
+- Cleanup: temporary fixture removed
+- Artifacts: N/A — no retained binary artifacts
+- Unverified: none
 EOF
 expect_ok "complete PR body is accepted" pr-body "$good_body"
+expect_ok "complete PR body binds its latest evidence cycle" pr-body "$good_body" \
+  "$evidence_base" "$evidence_head"
+expect_reject "complete PR body binds its latest route" "latest Route does not match" \
+  pr-body "$good_body" "$evidence_base" "$evidence_head" xor/other dev
+expect_ok "strict PR body accepts complete adversarial evidence" pr-body-strict "$good_body" \
+  "$evidence_base" "$evidence_head" xor/workflow dev
+append_fixture_evidence() {
+  sed -n '/^## Evidence$/,$p' "$good_body" >> "$1"
+}
 
 template_body="$work/template-body.md"
 awk '
@@ -225,6 +260,24 @@ awk '
     if ($0 == "## Motivation / Context") print "\nReview metadata needs deterministic local evidence."
     if ($0 == "## Changes") print "\n- add executable workflow conventions."
     if ($0 == "## Testing") print "\n- `bash tests/dev/workflow-check-cases.sh` — pass."
+    if ($0 == "## Evidence") {
+      print "\n### Cycle 1"
+      print "\n- Route: `xor/workflow` -> `dev`"
+      print "- Base: `1111111111111111111111111111111111111111`"
+      print "- Head: `2222222222222222222222222222222222222222`"
+      print "- Scenarios: `WF-CI-CURRENT`"
+      print "- Assertions: `WORKFLOW-BODY-RC`"
+      print "- RED predecessor: `1111111111111111111111111111111111111111`"
+      print "- RED: `bash tests/dev/workflow-check-cases.sh` — rc=1 classification=assertion-failure"
+      print "- GREEN: `bash tests/dev/workflow-check-cases.sh` — rc=0 classification=success"
+      print "- Product mutation: `reject-route-forgery` — detected rc=1 classification=assertion-failure"
+      print "- CI mutation: `omit-evidence-check` — detected rc=1 classification=assertion-failure"
+      print "- Runner: local Bash fixture"
+      print "- Duration: 1s"
+      print "- Cleanup: temporary fixture removed"
+      print "- Artifacts: N/A — no retained binary artifacts"
+      print "- Unverified: none"
+    }
   }
 ' "$repo_root/.github/PULL_REQUEST_TEMPLATE.md" > "$template_body"
 expect_ok "tracked PR template can produce a valid checked body" \
@@ -272,7 +325,7 @@ footer_body="$work/footer-body.md"
 } > "$footer_body"
 expect_reject "member footer is rejected" "member notice" pr-body "$footer_body"
 
-for section in "Summary" "Motivation / Context" "Changes" "Testing"; do
+for section in "Summary" "Motivation / Context" "Changes" "Testing" "Evidence"; do
   section_slug="$(printf '%s' "$section" | tr ' /' '--')"
   missing_body="$work/missing-$section_slug.md"
   awk -v heading="## $section" '
@@ -311,6 +364,7 @@ One change.
 
 Not run — fixture.
 EOF
+append_fixture_evidence "$reordered_body"
 expect_reject "required sections out of order are rejected" "section order" \
   pr-body "$reordered_body"
 
@@ -376,8 +430,122 @@ Generic pull-request metadata hides the delivered outcome and evidence.
 ## Testing
 
 Not run — documentation-only fixture.
+
+## Evidence
+
+### Cycle 1
+
+- Route: `xor/workflow` -> `dev`
+- Base: `1111111111111111111111111111111111111111`
+- Head: `2222222222222222222222222222222222222222`
+- Scenarios: N/A — documentation-only fixture
+- Assertions: `WORKFLOW-BODY-NOT-RUN`
+- RED predecessor: N/A — documentation-only fixture
+- RED: N/A — documentation-only fixture
+- GREEN: N/A — documentation-only fixture
+- Product mutation: N/A — documentation-only fixture
+- CI mutation: N/A — documentation-only fixture
+- Runner: local Bash fixture
+- Duration: 1s
+- Cleanup: temporary fixture removed
+- Artifacts: N/A — no retained binary artifacts
+- Unverified: documentation behavior only
 EOF
 expect_ok "explicit not-run reason is accepted" pr-body "$not_run_body"
+expect_reject "strict evidence cannot waive RED" "RED predecessor cannot be N/A" \
+  pr-body-strict "$not_run_body"
+
+missing_evidence_body="$work/missing-evidence-body.md"
+awk '$0 == "## Evidence" { exit } { print }' "$good_body" > "$missing_evidence_body"
+expect_reject "missing Evidence section is rejected" "missing section: Evidence" \
+  pr-body "$missing_evidence_body"
+
+missing_evidence_field_body="$work/missing-evidence-field-body.md"
+grep -Fv -- '- Cleanup:' "$good_body" > "$missing_evidence_field_body"
+expect_reject "missing Evidence field is rejected" "Evidence cycle 1 field order" \
+  pr-body "$missing_evidence_field_body"
+
+stale_evidence_body="$work/stale-evidence-body.md"
+cp "$good_body" "$stale_evidence_body"
+expect_reject "stale Evidence head is rejected" "latest Head does not match" \
+  pr-body "$stale_evidence_body" "$evidence_base" \
+  "3333333333333333333333333333333333333333"
+
+duplicate_cycle_body="$work/duplicate-cycle-body.md"
+{
+  cat "$good_body"
+  sed -n '/^### Cycle 1$/,$p' "$good_body"
+} > "$duplicate_cycle_body"
+expect_reject "duplicate Evidence cycle is rejected" "expected Cycle 2" \
+  pr-body "$duplicate_cycle_body"
+
+skipped_green_body="$work/skipped-green-body.md"
+sed 's/rc=0 classification=success/skipped — pass/' "$good_body" > "$skipped_green_body"
+expect_reject "skipped evidence cannot claim GREEN" "cannot classify skipped evidence as GREEN" \
+  pr-body "$skipped_green_body"
+
+forged_mutation_body="$work/forged-mutation-body.md"
+sed '/^- CI mutation:/s/detected rc=1 classification=assertion-failure/success rc=0 classification=success/' \
+  "$good_body" > "$forged_mutation_body"
+expect_reject "successful mutation cannot masquerade as detection" "CI mutation must record" \
+  pr-body "$forged_mutation_body"
+
+rc_prefix_body="$work/rc-prefix-body.md"
+sed '/^- RED:/s/rc=1 /rc=10 /' "$good_body" > "$rc_prefix_body"
+expect_reject "RED return-code prefixes cannot impersonate rc=1" "RED must record" \
+  pr-body "$rc_prefix_body"
+
+undetected_mutation_body="$work/undetected-mutation-body.md"
+sed '/^- CI mutation:/s/ detected / undetected /' "$good_body" > "$undetected_mutation_body"
+expect_reject "undetected mutation text cannot impersonate detection" "CI mutation must record" \
+  pr-body "$undetected_mutation_body"
+
+green_suffix_body="$work/green-suffix-body.md"
+sed '/^- GREEN:/s/classification=success/classification=successor/' \
+  "$good_body" > "$green_suffix_body"
+expect_reject "GREEN classification suffixes cannot impersonate success" "GREEN must record" \
+  pr-body "$green_suffix_body"
+
+mutation_suffix_body="$work/mutation-suffix-body.md"
+sed '/^- CI mutation:/s/classification=assertion-failure/classification=assertion-failureish/' \
+  "$good_body" > "$mutation_suffix_body"
+expect_reject "mutation classification suffixes cannot impersonate failure" "CI mutation must record" \
+  pr-body "$mutation_suffix_body"
+
+reasonless_na_body="$work/reasonless-na-body.md"
+sed '/^- Product mutation:/s/N\/A — documentation-only fixture/N\/A/' \
+  "$not_run_body" > "$reasonless_na_body"
+expect_reject "reasonless Evidence N/A is rejected" "Product mutation N/A requires a reason" \
+  pr-body "$reasonless_na_body"
+
+punctuation_na_body="$work/punctuation-na-body.md"
+sed '/^- Product mutation:/s/N\/A — documentation-only fixture/N\/A — .../' \
+  "$not_run_body" > "$punctuation_na_body"
+expect_reject "punctuation-only Evidence N/A is rejected" "Product mutation N/A requires a reason" \
+  pr-body "$punctuation_na_body"
+
+appended_evidence_body="$work/appended-evidence-body.md"
+{
+  cat "$good_body"
+  sed -n '/^### Cycle 1$/,$p' "$good_body" |
+    sed 's/^### Cycle 1$/### Cycle 2/'
+} > "$appended_evidence_body"
+expect_ok "evidence update preserves prior cycles and appends the next cycle" \
+  evidence-append "$good_body" "$appended_evidence_body"
+
+expect_ok "non-evidence edits may preserve the unchanged evidence ledger" \
+  evidence-append "$good_body" "$good_body"
+
+rewritten_evidence_body="$work/rewritten-evidence-body.md"
+sed 's/WORKFLOW-BODY-RC/WORKFLOW-BODY-FORGED/' \
+  "$appended_evidence_body" > "$rewritten_evidence_body"
+expect_reject "evidence update cannot rewrite a prior cycle" "changed or erased" \
+  evidence-append "$good_body" "$rewritten_evidence_body"
+
+erased_evidence_body="$work/erased-evidence-body.md"
+sed -n '1,/^## Evidence$/p' "$good_body" > "$erased_evidence_body"
+expect_reject "evidence update cannot erase every prior cycle" "changed or erased" \
+  evidence-append "$good_body" "$erased_evidence_body"
 
 vague_testing_body="$work/vague-testing-body.md"
 cat > "$vague_testing_body" <<'EOF'
@@ -397,6 +565,7 @@ Generic pull-request metadata hides the delivered outcome and evidence.
 
 Tests pass.
 EOF
+append_fixture_evidence "$vague_testing_body"
 expect_reject "vague Testing evidence is rejected" "Testing must list" \
   pr-body "$vague_testing_body"
 
@@ -418,6 +587,7 @@ Generic pull-request metadata hides the delivered outcome and evidence.
 
 - `bash tests/dev/workflow-check-cases.sh`
 EOF
+append_fixture_evidence "$command_only_body"
 expect_reject "Testing command without an observed result is rejected" "observed result" \
   pr-body "$command_only_body"
 
@@ -451,6 +621,7 @@ Generic pull-request metadata hides the delivered outcome and evidence.
 
 Not run
 EOF
+append_fixture_evidence "$reasonless_not_run_body"
 expect_reject "reasonless not-run evidence is rejected" "Not run requires a reason" \
   pr-body "$reasonless_not_run_body"
 
@@ -859,7 +1030,7 @@ else
   printf '%s\n' "$checker_out"
 fi
 
-expected_passes=134
+expected_passes=160
 if [ "$passes" -ne "$expected_passes" ]; then
   fail "contract executed the exact expected assertions ($passes/$expected_passes)"
 fi
