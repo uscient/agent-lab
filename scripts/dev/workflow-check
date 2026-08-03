@@ -537,6 +537,19 @@ check_pr_body() {
     infra "cannot read PR body: $body_file"
     return
   fi
+  # GitHub and some clients store PR bodies with CRLF. Section headings must match
+  # exactly ("## Summary"), so normalize before parsing.
+  body_normalized="$(mktemp)" || {
+    infra "cannot create temporary PR body normalization state"
+    return
+  }
+  if ! tr -d '\r' <"$body_file" >"$body_normalized"; then
+    find "$body_normalized" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    infra "cannot normalize PR body: $body_file"
+    return
+  fi
+  body_file="$body_normalized"
+  trap 'find "$body_normalized" -maxdepth 0 -delete >/dev/null 2>&1 || true' RETURN
   if grep -Eiq '^[[:space:]]*>[[:space:]]+\*\*.*Important policy notice\*\*[[:space:]]*$|^## Checklist \(members only\)[[:space:]]*$|^If you are not a member, please close this PR instead of submitting\.[[:space:]]*$' "$body_file"; then
     fail "PR body retains the member notice"
     return
