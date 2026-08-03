@@ -123,7 +123,7 @@ case "$sub" in
         ;;
     esac
     ;;
-  pull) block "git pull is forbidden — fetch (where available) + local merge of a LOCAL ref instead" ;;
+  pull) block "git pull is forbidden — fetch, then use the branch's allowed rebase or workstream sync" ;;
   merge | rebase)
     [ "$alternate_context" -eq 0 ] \
       || block "integration through an alternate worktree or Git directory is forbidden"

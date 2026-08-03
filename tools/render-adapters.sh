@@ -27,8 +27,8 @@ SERENA_MCP_MUTATORS='mcp__serena__replace_symbol_body|mcp__serena__insert_before
 
 # Unconditional native deny heads. AGENTS.md is authoritative; guard handles scoped operations.
 NATIVE_DENY=(
-  "git pull" "git config" "git credential" "gh auth" "gh api" "gh repo" "gh issue"
-  "gh release" "gh workflow" "gh run" "gh secret" "gh variable" "gh project" "gh gist"
+  "git pull" "git config" "git credential" "gh auth" "gh repo" "gh issue"
+  "gh release" "gh workflow" "gh secret" "gh variable" "gh project" "gh gist"
   "gh cache" "gh codespace" "gh extension" "gh alias" "gh ssh-key" "gh gpg-key" "gh label"
   "gh pr merge" "gh pr close" "gh pr edit" "gh pr ready" "gh pr reopen" "gh pr review" "gh pr comment"
   "gh release create" "gh release delete" "gh release edit" "gh release upload"
@@ -54,11 +54,12 @@ emit_claude() {
   # permissions.deny has NO maintenance bypass, so a native Edit(rail) deny self-locks even sanctioned
   # maintenance (the §13.9 self-lock; see docs/agent-config.md). The guard's Edit|Write matcher
   # enforces rail read-only WITH the AGENT_LAB_MAINTENANCE bypass; the git/remote denies above keep
-  # their native belt-and-suspenders. Secret reads stay natively denied (never needed for maintenance).
+  # their native belt-and-suspenders. Common local env/key paths stay natively denied; the guard
+  # covers other .env variants while permitting the tracked .env.example documentation.
   deny+=(
-    "Read(**/.env)" "Read(**/.env.*)" "Read(**/secrets/**)" "Read(**/*.pem)" "Read(**/*.key)" "Read(**/*.kdbx)"
-    "Edit(**/.env)" "Edit(**/.env.*)" "Edit(**/secrets/**)" "Edit(**/*.pem)" "Edit(**/*.key)" "Edit(**/*.kdbx)"
-    "Write(**/.env)" "Write(**/.env.*)" "Write(**/secrets/**)" "Write(**/*.pem)" "Write(**/*.key)" "Write(**/*.kdbx)"
+    "Read(**/.env)" "Read(**/.env.local)" "Read(**/.env.*.local)" "Read(**/secrets/**)" "Read(**/*.pem)" "Read(**/*.key)" "Read(**/*.kdbx)"
+    "Edit(**/.env)" "Edit(**/.env.local)" "Edit(**/.env.*.local)" "Edit(**/secrets/**)" "Edit(**/*.pem)" "Edit(**/*.key)" "Edit(**/*.kdbx)"
+    "Write(**/.env)" "Write(**/.env.local)" "Write(**/.env.*.local)" "Write(**/secrets/**)" "Write(**/*.pem)" "Write(**/*.key)" "Write(**/*.kdbx)"
   )
 
   local guard='bash "$(git rev-parse --show-toplevel)/tools/pretooluse-guard.sh"'
@@ -133,9 +134,9 @@ emit_grok() {
     echo "[permission]"
     echo "deny = ["
     for d in "${NATIVE_DENY[@]}"; do printf '  "Bash(%s*)",\n' "$d"; done
-    echo '  "Read(**/.env)", "Read(**/.env.*)", "Read(**/secrets/**)", "Read(**/*.pem)", "Read(**/*.key)", "Read(**/*.kdbx)",'
-    echo '  "Edit(**/.env)", "Edit(**/.env.*)", "Edit(**/secrets/**)", "Edit(**/*.pem)", "Edit(**/*.key)", "Edit(**/*.kdbx)",'
-    echo '  "Write(**/.env)", "Write(**/.env.*)", "Write(**/secrets/**)", "Write(**/*.pem)", "Write(**/*.key)", "Write(**/*.kdbx)",'
+    echo '  "Read(**/.env)", "Read(**/.env.local)", "Read(**/.env.*.local)", "Read(**/secrets/**)", "Read(**/*.pem)", "Read(**/*.key)", "Read(**/*.kdbx)",'
+    echo '  "Edit(**/.env)", "Edit(**/.env.local)", "Edit(**/.env.*.local)", "Edit(**/secrets/**)", "Edit(**/*.pem)", "Edit(**/*.key)", "Edit(**/*.kdbx)",'
+    echo '  "Write(**/.env)", "Write(**/.env.local)", "Write(**/.env.*.local)", "Write(**/secrets/**)", "Write(**/*.pem)", "Write(**/*.key)", "Write(**/*.kdbx)",'
     echo ']'
     echo "allow = ["
     for c in "${ALLOW[@]}"; do printf '  "Bash(%s*)",\n' "$c"; done
