@@ -28,7 +28,7 @@ block() {
 }
 
 input="$(</dev/stdin)"
-tool_name="" cmd="" fpath=""
+tool_name="" tool_name_lc="" cmd="" fpath=""
 if command -v jq >/dev/null 2>&1; then
   if ! tool_name="$(
     printf '%s' "$input" \
@@ -36,8 +36,10 @@ if command -v jq >/dev/null 2>&1; then
   )"; then
     block "hook input is not a valid JSON object and cannot be classified" "Autonomy boundary"
   fi
-  case "$tool_name" in
-    Read | Edit | Write | MultiEdit | NotebookEdit | apply_patch | str_replace_editor | \
+  tool_name_lc="${tool_name,,}"
+  case "$tool_name_lc" in
+    read | read_file | edit | edit_file | write | write_file | create_file | create_text_file | \
+    multiedit | notebookedit | apply_patch | str_replace_editor | \
     mcp__serena__replace_symbol_body | mcp__serena__insert_before_symbol | mcp__serena__insert_after_symbol | \
     serena__replace_symbol_body | serena__insert_before_symbol | serena__insert_after_symbol)
       fpath="$(
@@ -62,7 +64,7 @@ if command -v jq >/dev/null 2>&1; then
 else
   block "jq is unavailable and hook input cannot be classified" "Autonomy boundary"
 fi
-[ "$tool_name" != Bash ] || [ -n "$cmd" ] \
+[ "$tool_name_lc" != bash ] || [ -n "$cmd" ] \
   || block "Bash hook input is missing its command and cannot be classified" "Autonomy boundary"
 
 # matches_line <text> <extended-regex>: preserve grep's historical linewise matching semantics
@@ -138,14 +140,15 @@ maint="${AGENT_LAB_MAINTENANCE:-}"
 # ---------------------------------------------------------------------------
 # Host and Serena file-mutation path: protect secrets and maintenance-only rails.
 # ---------------------------------------------------------------------------
-case "$tool_name" in
-  Read)
+case "$tool_name_lc" in
+  read | read_file)
     if path_is_secret "$fpath" || path_is_auth_material "$fpath"; then
       block "reading secret, credential, authentication, or Git configuration material is forbidden" "Autonomy boundary"
     fi
     exit 0
     ;;
-  Edit | Write | MultiEdit | NotebookEdit | apply_patch | str_replace_editor)
+  edit | edit_file | write | write_file | create_file | create_text_file | \
+  multiedit | notebookedit | apply_patch | str_replace_editor)
     if path_is_secret "$fpath" || path_is_auth_material "$fpath"; then
       block "editing secret, credential, authentication, or Git configuration material is forbidden" "Autonomy boundary"
     fi
@@ -174,11 +177,56 @@ esac
 # ---------------------------------------------------------------------------
 hay="${cmd:-$input}"
 
+# Strip the literal body of one simple cat heredoc whose only shell operation is writing a literal
+# file target. The body is data, not shell syntax. Keep the header, delimiter, and every command
+# after the delimiter in the scan; malformed, dynamic, piped, or compound forms remain unstripped.
+strip_literal_cat_heredoc_data() {
+  local s="$1" first rest line target="" resolved="" delimiter="" output="" found=0
+  local header_re="^[[:space:]]*cat[[:space:]]+[0-9]*>>?[[:space:]]*[\"']?([A-Za-z0-9_./-]+)[\"']?[[:space:]]+<<-?[[:space:]]*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?[[:space:]]*$"
+  scan="$s"
+  [[ "$s" == *$'\n'* ]] || return
+  first="${s%%$'\n'*}"
+  if [[ ! "$first" =~ $header_re ]]; then
+    return
+  fi
+  target="${BASH_REMATCH[1]}"
+  delimiter="${BASH_REMATCH[2]}"
+  case "$target" in
+    /*) resolved="$(readlink -m -- "$target" 2>/dev/null || true)" ;;
+    *) resolved="$(readlink -m -- "$root/$target" 2>/dev/null || true)" ;;
+  esac
+  if [ -z "$resolved" ]; then
+    return
+  fi
+  if path_is_secret "$resolved" || path_is_auth_material "$resolved"; then
+    block "literal heredoc target resolves to secret, credential, authentication, or Git configuration material" "Autonomy boundary"
+  fi
+  if [ "$maint" != 1 ] && path_is_protected "$resolved"; then
+    block "literal heredoc target resolves to a protected rail — set AGENT_LAB_MAINTENANCE=1 for sanctioned maintenance" "Authority"
+  fi
+  rest="${s#*$'\n'}"
+  output="$first"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$found" -eq 0 ]; then
+      if [ "$line" = "$delimiter" ]; then
+        found=1
+        output+=$'\n'"$line"
+      fi
+    else
+      output+=$'\n'"$line"
+    fi
+  done <<< "$rest"
+  if [ "$found" -eq 1 ]; then
+    scan="$output"
+  fi
+}
+
 # scan = hay with safe message-flag DATA removed. The quoted literal argument of -m / --message / -F
 # is message text, not an operation, so it must not be matched as one. Strip it ONLY when it is a
 # plain quoted literal with no command substitution / expansion ($(  `  ${ ) — so anything that can
 # execute stays fully matched. -c (e.g. `sh -c "git push"`) is NOT a message flag and is never stripped.
 scan="$hay"
+strip_literal_cat_heredoc_data "$hay"
 case "$scan" in
   *-m* | *-F*)
     scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*'[^'\$\`]*'/\1 /g")"
