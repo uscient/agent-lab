@@ -23,7 +23,7 @@ One operating policy, shared enforcement, and three generated thin adapters:
 |---|---|---|
 | Operating policy | `AGENTS.md` | auto-discovered by all three tools |
 | Enforcement logic | `tools/pretooluse-guard.sh` + `tools/session-bootstrap.sh` + `policy/*.patterns` | command, file, secret-read, Serena-mutation, and session hooks |
-| Native adapter rule bodies | `policy/allow.commands` + `NATIVE_DENY` in `tools/render-adapters.sh` | `tools/render-adapters.sh` → the three adapters |
+| Native adapter rule bodies | `policy/allow.commands` + static secret-path rules in `tools/render-adapters.sh` | `tools/render-adapters.sh` → the three adapters |
 
 ```text
 AGENTS.md  policy/                       # shared core (instruction + enforcement data)
@@ -53,9 +53,15 @@ actual session.
    ```
 3. Verify: `bash tests/guard/pretooluse-cases.sh` and `bash tests/agent/policy-verify.sh`.
 
-The guard reads `policy/*.patterns` directly, so policy edits take effect immediately for the guard;
-the generator re-emits the per-tool belt-and-suspenders rules. **Never hand-edit the generated
-regions** in `.claude/settings.json`, `.codex/rules/agent-lab.rules`, or `.grok/config.toml`.
+The guard reads `policy/*.patterns` directly, so command-policy edits take effect immediately. The
+generator emits native auto-approve rules and static secret-file denials, but deliberately does not
+copy command denials into client startup configuration. **Never hand-edit the generated regions** in
+`.claude/settings.json`, `.codex/rules/agent-lab.rules`, or `.grok/config.toml`.
+
+After upgrading from an adapter version that did cache command denials, end existing Claude, Codex,
+and Grok sessions and launch each client once from the updated checkout. A running client may retain
+the rules it loaded at startup; editing files cannot rewrite that process's memory. This is a one-time
+migration step: subsequent command-policy changes are read by the live guard from the checkout.
 
 ## The `AGENT_LAB_MAINTENANCE=1` convention (and the self-lock)
 
@@ -76,9 +82,9 @@ rules avoid locking yourself out:
 2. **Wire the Claude adapter last** — generate `.claude/settings.json` as the final maintenance step,
    after all other files are in place.
 Note the guard's maintenance flag only relaxes the *guard*; native `deny` rules have no maintenance
-bypass. The Claude and Grok adapters therefore keep only unconditional command and secret-read
-denials in native `deny`; protected-path enforcement is left to their `Edit|Write` guard hooks
-(which honor the flag), so maintenance stays possible.
+bypass. The Claude and Grok adapters therefore keep only secret-file rules in native `deny`;
+protected-path and command enforcement is left to their live guard hooks (which honor the flag), so
+maintenance stays possible and command decisions always use the current checkout.
 
 ## Per-tool setup / trust
 
@@ -128,18 +134,20 @@ them.
 ## Forbidden flags (never use these as the autonomy mechanism)
 
 Autonomy comes from `acceptEdits` (Claude) / `on-request` + `workspace-write` (Codex) /
-`always-approve` + denies (Grok) — **never** a global approve-all that would also disarm the denials:
+`always-approve` + the trusted live hook (Grok). Do not use modes that disable repository hooks or
+containment:
 
 - Codex: `--yolo`, `--dangerously-bypass-approvals-and-sandbox`, `sandbox_mode = "danger-full-access"`, deprecated `codex exec --full-auto`, `--ignore-rules`.
-- Grok: `--yolo` **without** deny rules + hook (always pair them).
+- Grok: `--yolo` when it bypasses the project hook; use `--always-approve` with trusted hooks.
 - Claude: `permissions.defaultMode = "bypassPermissions"`.
 
 ## Add a 4th tool
 
 1. Add a thin adapter dir (e.g. `.cursor/`) that wires the tool's `PreToolUse` hook to
    `tools/pretooluse-guard.sh` and its `SessionStart` to `tools/session-bootstrap.sh <tool>`.
-2. Add an `emit_<tool>` branch to `tools/render-adapters.sh` that translates `policy/allow.commands`
-   + the deny set into the tool's native rule syntax; add the dir to `policy/protected.paths`.
+2. Add an `emit_<tool>` branch to `tools/render-adapters.sh` that translates
+   `policy/allow.commands` into native auto-approve rules and carries the static secret-file rules;
+   add the dir to `policy/protected.paths`. Do not duplicate command denials in startup-cached rules.
 3. Add the tool's rows to `tests/agent/agent-policy-checklist.md` and run the guard-fired + no-prompt
    + scoped-publish checks.
 The shared guard/policy/AGENTS.md are reused unchanged — that is the point of the architecture.
