@@ -204,8 +204,7 @@ agent_lab_serena_reject_nested_sensitive_paths() {
          -o -path "$repo_root/node_modules" \
          -o -path "$repo_root/.pytest_cache" \
          -o -path "$repo_root/__pycache__" \
-         -o -path "$repo_root/.idea" \
-         -o -path "$repo_root/proj" \) -prune \
+         -o -path "$repo_root/.idea" \) -prune \
       -o -mindepth 1 \
       \( -name '.env' \
          -o -name '.env.*' \
@@ -259,6 +258,48 @@ agent_lab_serena_reject_nested_sensitive_paths() {
   done < "$scan_file"
 }
 
+agent_lab_serena_validate_shared_proj() {
+  local repo_root="$1" state_root="$2" proj_root
+  local object_scan hardlink_scan unsafe relative
+  proj_root="$repo_root/proj"
+
+  # This is a startup snapshot. The threat model requires cooperating host
+  # writers to preserve the ordinary-file contract while Serena is running.
+  if [ ! -e "$proj_root" ] && [ ! -L "$proj_root" ]; then
+    return 0
+  fi
+  agent_lab_serena_require_mount_type \
+    "$proj_root" directory "shared planning root proj" ||
+    return 125
+
+  object_scan="$state_root/proj-unsafe-objects"
+  if ! find "$proj_root" -xdev -mindepth 1 \
+      ! -type d ! -type f -print0 > "$object_scan"; then
+    agent_lab_serena_fail "cannot complete shared proj object scan"
+    return 125
+  fi
+  if IFS= read -r -d '' unsafe < "$object_scan"; then
+    relative="${unsafe#"$repo_root"/}"
+    printf \
+      'Serena MCP: refusing symlink or special object in shared proj: %q\n' \
+      "$relative" >&2
+    return 125
+  fi
+
+  hardlink_scan="$state_root/proj-hardlinked-files"
+  if ! find "$proj_root" -xdev -type f ! -links 1 \
+      -print0 > "$hardlink_scan"; then
+    agent_lab_serena_fail "cannot complete shared proj hardlink scan"
+    return 125
+  fi
+  if IFS= read -r -d '' unsafe < "$hardlink_scan"; then
+    relative="${unsafe#"$repo_root"/}"
+    printf 'Serena MCP: refusing multiply linked file in shared proj: %q\n' \
+      "$relative" >&2
+    return 125
+  fi
+}
+
 agent_lab_serena_prepare_mounts() {
   local repo_root="$1" state_root="$2"
   local empty_dir empty_file cache_dir override_file
@@ -276,6 +317,8 @@ agent_lab_serena_prepare_mounts() {
     "$repo_root/policy/protected.paths" file "protected-path policy" ||
     return 125
   agent_lab_serena_require_mount_type "$state_root" directory "mask state root" ||
+    return 125
+  agent_lab_serena_validate_shared_proj "$repo_root" "$state_root" ||
     return 125
 
   agent_lab_serena_reject_child_mounts "$repo_root" /proc/self/mountinfo ||
@@ -339,7 +382,7 @@ agent_lab_serena_prepare_mounts() {
 
   runtime_roots=(
     data volumes runtime logs state cache .cache models browser-profiles
-    agent-state .tmp tmp node_modules .pytest_cache __pycache__ .idea proj
+    agent-state .tmp tmp node_modules .pytest_cache __pycache__ .idea
   )
   for relative in "${runtime_roots[@]}"; do
     path="$repo_root/$relative"

@@ -170,6 +170,10 @@ home, project, and egress policy. Instead, `scripts/serena-mcp` starts the fixed
 repo as the only content-bearing RW project bind at `/workspace`. Read-only overlays mask Git,
 local state, and protected rails, while a private temporary bind isolates `.serena/cache`. This
 preserves the control-plane/data-plane distinction while containing the development helper itself.
+The Git-ignored `proj/` planning tree deliberately remains on the shared writable project bind so
+agents in the checkout can collaborate there; it is not a secrets or authority surface. Preflight
+requires a real directory with ordinary directories and singly linked regular files. This is a startup
+snapshot; cooperating host-side writers are trusted to preserve that contract while Serena runs.
 All binds are private and non-recursive, and the launcher rejects child mounts or nested Git
 metadata before startup. Client registrations also remove `BASH_ENV` and `ENV` before invoking a
 non-login, no-profile Bash for repository-root discovery.

@@ -583,7 +583,6 @@ def inspect_runtime(repo_root: Path, compose_project: str) -> str:
         ".pytest_cache",
         "__pycache__",
         ".idea",
-        "proj",
         "secrets",
     }
     base_destinations = {
