@@ -70,6 +70,13 @@ expect_cmd() {
         GIT_DIR="$guard_git_dir" "$guard" >/dev/null 2>&1 || rc=$?
   _check "$exp" "$name" "$rc"
 }
+expect_cmd_env() {
+  local exp="$1" name="$2" key="$3" value="$4" cmd="$5" rc=0
+  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(jq -Rn --arg c "$cmd" '$c')" \
+    | env -u AGENT_LAB_MAINTENANCE -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+        "$key=$value" GIT_DIR="$guard_git_dir" "$guard" >/dev/null 2>&1 || rc=$?
+  _check "$exp" "$name" "$rc"
+}
 # expect_edit <block|allow> <name> <file_path> [maint]
 expect_edit() {
   local exp="$1" name="$2" fp="$3" maint="${4:-}" rc=0
@@ -87,6 +94,36 @@ expect_payload() {
   local exp="$1" name="$2" payload="$3" maint="${4:-}" rc=0
   printf '%s' "$payload" \
     | env AGENT_LAB_MAINTENANCE="$maint" "$guard" >/dev/null 2>&1 || rc=$?
+  _check "$exp" "$name" "$rc"
+}
+expect_socket_payload() {
+  local exp="$1" name="$2" payload="$3" rc=0
+  /usr/bin/python3 -I -S - "$guard" "$payload" "$guard_git_dir" <<'PY' || rc=$?
+import os
+import socket
+import subprocess
+import sys
+
+guard, payload, git_dir = sys.argv[1:]
+left, right = socket.socketpair()
+env = os.environ.copy()
+env.pop("AGENT_LAB_MAINTENANCE", None)
+env.pop("GIT_WORK_TREE", None)
+env.pop("GIT_COMMON_DIR", None)
+env["GIT_DIR"] = git_dir
+process = subprocess.Popen(
+    [guard],
+    stdin=right,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    env=env,
+)
+right.close()
+left.sendall(payload.encode())
+left.shutdown(socket.SHUT_WR)
+left.close()
+raise SystemExit(process.wait())
+PY
   _check "$exp" "$name" "$rc"
 }
 expect_file_content() {
@@ -164,6 +201,10 @@ expect_cmd allow "PR read with exact global repo" 'gh --repo uscient/agent-lab p
 expect_cmd allow "Actions read with exact repo"  'gh run list --repo uscient/agent-lab --limit 10'
 expect_cmd allow "API implicit GET for repo"     'gh api repos/uscient/agent-lab/branches/flow'
 expect_cmd allow "API explicit GET for repo"     'gh api --method GET repos/uscient/agent-lab/actions/runs --jq .total_count'
+expect_cmd allow "API GET with quoted jq expression" \
+  'gh api --method GET repos/uscient/agent-lab/pulls/52 --jq '\''.state + " " + .base.ref'\'''
+expect_cmd allow "variable-driven repository PR read" \
+  'pr=52; gh pr view $pr'
 expect_cmd allow "PR create to dev"            'gh pr create --base dev --head agent/test/guard --title x --body-file /tmp/body'
 expect_cmd allow "git branch -d (safe)"       'git branch -d old'
 expect_cmd allow "run tests"                  './scripts/dev/test quick'
@@ -188,6 +229,7 @@ expect_cmd allow "legacy slice PR matches parent" \
 set_guard_branch flow
 expect_cmd allow "flow final PR targets dev" \
   'gh pr create --base dev --head flow --title x --body y'
+expect_cmd allow "read-only merge-base on flow" 'git merge-base origin/dev HEAD'
 set_guard_branch agent/test/guard
 
 echo "== deny: commit on protected branches (branch backstop) =="
@@ -414,6 +456,61 @@ expect_cmd allow "msg single-quoted rail"      "git commit -m 'tidy policy/ and 
 expect_cmd allow "--message long form"         'git commit --message "discuss tee and rm in policy/"'
 expect_cmd allow "search data names forge CLI" 'rg -n "gh" README.md'
 expect_cmd allow "search alternation is data" 'rg -n "gh pr|gh run|gh api" README.md'
+expect_cmd allow "compound read-only audit keeps search terms as data" \
+  'git diff --check && git diff --stat && git status --short --branch && rg -n "git pull|gh api|gh auth|gh pr merge" tools/ tests/ || true'
+expect_cmd allow "Git log plus policy search stays read-only" \
+  'git log -1 --oneline && rg -n "gh api" tools/'
+expect_cmd allow "Git diff can feed a policy search" \
+  'git diff | rg "gh api"'
+expect_cmd allow "tracked file list can feed a policy search" \
+  'git ls-files | rg "gh api"'
+expect_cmd allow "ripgrep file list can feed grep policy search" \
+  'rg --files | grep "gh auth"'
+expect_cmd allow "Git log data does not become an operation" \
+  'git log --grep="git pull" && rg -n needle README.md'
+expect_cmd allow "Git log data is safe without a second search" \
+  'git log --grep="gh api" -5 --oneline'
+expect_cmd allow "Git diff pickaxe data does not become an operation" \
+  'git diff -G"git pull" -- .'
+expect_cmd allow "newline-separated read audit stays usable" \
+  $'git status --short\nrg -n "TODO" README.md || true'
+expect_cmd allow "search pipeline may end with true" \
+  'git ls-files | rg "secrets/" || true'
+expect_cmd allow "grep pipeline may end with true" \
+  'git diff | grep "gh api" || true'
+expect_cmd allow "local read may precede a policy search" \
+  $'ls\nrg -n "gh api" tools/ || true'
+expect_cmd allow "assignment and local read may precede a policy search" \
+  $'git status --short\ntarget=README.md; wc -l "$target"\nrg -n "gh api" tools/ || true'
+expect_cmd allow "dynamic pattern is data after option terminator" \
+  'pattern="gh api"; rg -n -- "$pattern" tools/ || true'
+expect_cmd allow "search stdout may be discarded" \
+  'rg -n "gh api|git pull" tools/ >/dev/null || true'
+expect_cmd allow "search stderr may be discarded" \
+  'rg -n "gh api|git pull" tools/ 2>/dev/null || true'
+expect_cmd allow "multiple searches may each tolerate no matches" \
+  $'grep -rnE "gh api|git pull" tools/ || true\nrg -n -g "*.sh" "gh api|git pull" tools/ || true'
+expect_cmd allow "search output may feed a safe jq filter" \
+  'rg -n "gh api" tools/ | jq -R .'
+expect_cmd allow "Git no-pager read keeps log search data" \
+  'git --no-pager log --grep="gh api" --oneline'
+expect_cmd allow "security terms remain search data" \
+  'rg -n "GITHUB_TOKEN|docker.sock|--privileged" tools/ tests/'
+expect_cmd allow "environment filename remains search data" 'rg -n "\.env" tools/ tests/'
+expect_cmd allow "secret directory name remains search data" 'rg -n "secrets/" tools/ tests/'
+expect_cmd allow "quoted regex anchors remain search data" 'rg -n '\''GITHUB_TOKEN$'\'' tools/'
+expect_cmd allow "unquoted trailing regex anchor remains search data" 'rg GITHUB_TOKEN$ tools/'
+expect_cmd allow "trailing regex anchor works before true" 'rg -n "TODO$" README.md || true'
+expect_cmd allow "option-shaped positional pattern remains data" 'rg -- --pre README.md'
+expect_cmd allow "explicit option-shaped pattern remains data" 'rg -e --pre README.md'
+expect_cmd allow "negative glob selector does not read the excluded file" 'rg -g "!.env" needle .'
+expect_cmd allow "grep exclusion does not read the excluded file" 'grep --exclude=.env -R needle .'
+expect_cmd allow "environment substring is an ordinary path" 'rg needle docs/.environment.md'
+expect_cmd allow "env-like infix is an ordinary path" 'rg needle docs/my.env.notes'
+expect_cmd allow "jq JSON property is not environment disclosure" 'jq -n '\''.env'\'''
+expect_cmd allow "GitHub jq JSON property is not environment disclosure" \
+  'gh api repos/uscient/agent-lab --jq .env'
+expect_cmd allow "quoted regex quantifiers remain search data" 'rg -n '\''docker[.]sock{1}'\'' tools/'
 expect_cmd allow "search data through read filter" 'rg -n "gh pr|gh run" README.md | head -n 20'
 expect_cmd allow "grep search is data" 'grep -n "gh run" README.md'
 expect_cmd allow "git grep search is data" 'git grep -n "gh api" -- README.md'
@@ -440,6 +537,14 @@ expect_cmd allow "literal pathlib writer content is data, not a command" \
   $'python3 <<\'PY\'\nfrom pathlib import Path\ndoc = """AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text"""\nPath("proj/flow/_guard-pathlib-note.md").write_text(doc, encoding="utf-8")\nPY'
 expect_cmd allow "agent-realistic pathlib multi-section builder under proj" \
   $'mkdir -p proj && python3 <<\'PY\'\nfrom pathlib import Path\nsections = ["# Title", "", "## One", "body one", "## Two", "body two"]\nPath("proj/flow/_guard-multi-section.md").write_text("\\n".join(sections) + "\\n", encoding="utf-8")\nprint(Path("proj/flow/_guard-multi-section.md").stat().st_size)\nPY'
+expect_cmd allow "unrelated variable name does not trigger search parsing" \
+  'target=README.md; wc -l "$target"'
+expect_cmd allow "safe jq variables are not environment disclosure" \
+  'value=x; jq -n --arg value "$value" '\''$value'\'''
+expect_cmd allow "local Git variable does not trigger search parsing" \
+  'branch=feature; git merge "$branch"'
+expect_cmd allow "search diagnostic may inspect its resolved executable" \
+  'command -v rg; ls -l "$(command -v rg)"'
 # Heredoc strip ends at the first line equal to the delimiter. Prefer Write/Edit for docs that
 # embed delimiter tokens; collision remains fail-closed rather than weakening the strip.
 expect_cmd block "heredoc delimiter collision remains fail-closed" \
@@ -465,10 +570,91 @@ expect_cmd block "ANSI-constructed forge command" 'g$'\''h'\'' pr merge 1'
 expect_cmd block "glob-constructed forge command" '/usr/bin/g[h] pr merge 1'
 expect_cmd block "search then forge command"    'rg -n "gh" README.md; gh pr merge 1'
 expect_cmd block "search preprocessor command"  'rg --pre "gh pr merge 1" needle README.md'
+expect_cmd block "search hostname helper command" 'rg --hostname-bin=/usr/bin/true needle README.md'
 expect_cmd block "git grep pager execution"     'git grep --open-files-in-pager=sh "gh pr merge"'
 expect_cmd block "brace search preprocessor"    'rg --p{re,re}=gh needle README.md'
+expect_cmd block "ANSI-constructed search preprocessor" 'rg --p$'\''re'\''=gh needle README.md'
+expect_cmd block "brace search hostname helper" 'rg --host{name,name}-bin=/usr/bin/true needle README.md'
 expect_cmd block "constructed preprocessor payload" 'rg --pre "g""h auth status" needle README.md'
 expect_cmd block "constructed search preprocessor" 'rg --p"re" "gh auth status" needle README.md'
+expect_cmd block "grouped pipe cannot hide a forge command" 'rg needle README.md |& gh pr merge 1'
+expect_cmd block "grouped redirect cannot hide a rail write" 'rg needle README.md &> AGENTS.md'
+expect_cmd block "short git-grep pager execution" 'git grep -Osh needle'
+expect_cmd block "clustered git-grep pager execution" 'git grep -nOsh needle'
+expect_cmd block "git-grep textconv execution" 'git grep --textconv needle'
+expect_cmd block "abbreviated git-grep pager execution" 'git grep --open-files-in-p=sh needle'
+expect_cmd block "abbreviated git-grep textconv execution" 'git grep --textc needle'
+expect_cmd block "abbreviated git-grep external engine" 'git grep --ext-g=sh needle'
+expect_cmd block "grep flag does not consume its pattern" 'grep -E needle .env'
+expect_cmd block "ripgrep glob selector retains secret target" 'rg -uuu -g .env needle .'
+expect_cmd block "grep include selector retains secret target" 'grep -R --include=.env needle .'
+expect_cmd block "grep clustered regexp retains secret input" 'grep -nefoo .env'
+expect_cmd block "grep clustered pattern file remains protected" 'grep -Ef.env README.md'
+expect_cmd block "ripgrep clustered glob retains secret target" 'rg -ug.env needle .'
+expect_cmd block "inspection chain cannot read environment files" 'rg -n needle .env && git status'
+expect_cmd block "inspection chain cannot read secret directories" 'rg -n needle secrets/ | head'
+expect_cmd block "inspection chain cannot read normalized secret directories" 'rg -n needle ./secrets'
+expect_cmd block "inspection chain cannot read SSH directories" 'rg -n needle ~/.ssh'
+expect_cmd block "file listing cannot inspect SSH directories" 'rg --files ~/.ssh'
+expect_cmd block "file listing cannot inspect normalized secret directories" 'rg --files ./secrets'
+expect_cmd block "file listing terminator retains SSH operand" 'rg --files -- ~/.ssh'
+expect_cmd block "file listing terminator retains secret operand" 'rg --files -- ./secrets'
+expect_cmd block "inspection cannot read parent-relative SSH path" 'rg needle ../.ssh'
+expect_cmd block "inspection cannot read nested absolute SSH path" 'rg needle /tmp/audit-user/.ssh'
+expect_cmd block "inspection cannot read HOME SSH path" 'rg needle $HOME/.ssh'
+expect_cmd block "inspection cannot read nested netrc" 'rg needle /tmp/audit-user/.netrc'
+expect_cmd block "inspection cannot read nested GitHub config" 'rg needle /tmp/audit-user/.config/gh'
+expect_cmd block "ordinary read cannot inspect nested SSH material" 'cat /tmp/audit-user/.ssh/id_rsa'
+expect_cmd block "ordinary read cannot inspect HOME SSH material" 'cat $HOME/.ssh/id_rsa'
+expect_cmd block "Git object syntax cannot hide an environment file" 'git show HEAD:.env'
+expect_cmd block "inspection chain cannot read a netrc" 'rg -n needle .netrc'
+expect_cmd block "inspection chain cannot use an environment ignore file" 'rg --ignore-file=.env needle tools/'
+expect_cmd block "inspection chain cannot use an environment pattern file" 'grep --file=.env needle tools/'
+expect_cmd block "inspection filter cannot use an environment file list" 'rg needle README.md | wc --files0-from=.env'
+expect_cmd block "inspection filter cannot consume an indirect file list" 'rg --files -0 ~/.ssh | sort --files0-from=-'
+expect_cmd block "search filter cannot execute a compressor" 'rg -n needle README.md | sort --compress-program=sh'
+expect_cmd block "search filter cannot write an output file" 'rg -n needle README.md | sort --output AGENTS.md'
+expect_cmd block "search filter cannot write protected temporary files" 'rg -n needle README.md | sort -T policy/'
+expect_cmd block "search filter cannot hide clustered output" 'rg -n needle README.md | sort -uoAGENTS.md'
+expect_cmd block "search filter cannot hide clustered temporary path" 'rg -n needle README.md | sort -uTpolicy/'
+expect_cmd block "constructed sort compressor is executable" 'rg needle README.md | sort --compress-pro{gram,gram}=sh'
+expect_cmd block "search filter cannot use a positional output file" 'rg -n needle README.md | uniq README.md AGENTS.md'
+expect_cmd block "standalone jq cannot disclose the environment" 'rg needle README.md; jq -n env'
+expect_cmd block "quoted jq filter cannot disclose the environment" 'jq -n '\''env'\'''
+expect_cmd block "jq ENV builtin cannot disclose the environment" 'jq -n '\''$ENV'\'''
+expect_cmd block "jq options cannot hide environment disclosure" 'jq -n --arg x y env'
+expect_cmd block "pipeline jq cannot disclose the environment" 'rg needle README.md | jq -n '\''env'\'''
+expect_cmd block "API jq cannot disclose the environment" \
+  'gh api repos/uscient/agent-lab --jq env'
+expect_cmd block "PR jq cannot disclose the environment" \
+  'gh pr list --repo uscient/agent-lab --json number --jq env'
+expect_cmd block "command-local ripgrep config is rejected" \
+  'RIPGREP_CONFIG_PATH=/tmp/rg.conf rg -n needle tools/'
+expect_cmd block "env-wrapped ripgrep config is rejected" \
+  'env RIPGREP_CONFIG_PATH=/tmp/rg.conf rg -n needle tools/'
+expect_cmd block "Git external diff cannot hide in an inspection chain" \
+  'GIT_EXTERNAL_DIFF=/usr/bin/true git diff && rg needle README.md'
+expect_cmd block "abbreviated Git external diff cannot hide" \
+  'git diff --ext-di && rg needle README.md'
+expect_cmd block "abbreviated Git output cannot hide" \
+  'git log --out=AGENTS.md && rg needle README.md'
+expect_cmd block "environment split wrapper cannot inject a command" \
+  'env -S "gh pr merge 1" rg needle README.md'
+expect_cmd block "environment chdir wrapper cannot redirect inspection" \
+  'env -C /tmp/audit-user/.ssh rg needle .'
+expect_cmd block "jq interpolation cannot disclose environment" \
+  'jq -n '\''"\(env.HOME)"'\'''
+expect_cmd block "GitHub jq interpolation cannot disclose environment" \
+  'gh api repos/uscient/agent-lab --jq '\''"\($ENV.HOME)"'\'''
+expect_cmd block "piped environment listing remains bulk disclosure" 'env | head'
+expect_cmd_env block "ambient ripgrep preprocessing is rejected" \
+  RIPGREP_CONFIG_PATH "$guard_git_work/rg.conf" 'rg -n "gh api" tools/'
+expect_cmd_env allow "explicit no-config defeats ambient ripgrep preprocessing" \
+  RIPGREP_CONFIG_PATH "$guard_git_work/rg.conf" 'rg --no-config -n "gh api" tools/'
+mkdir -p "$guard_git_work/pythonpath"
+printf '%s\n' 'raise SystemExit(99)' > "$guard_git_work/pythonpath/sitecustomize.py"
+expect_cmd_env allow "inspection parser ignores hostile Python customization" \
+  PYTHONPATH "$guard_git_work/pythonpath" 'rg -n "gh api" tools/'
 expect_cmd block "sh -c push (not a msg flag)" 'sh -c "git push"'
 expect_cmd block "bash -c push"                "bash -c 'git push'"
 expect_cmd block "eval push"                   'eval "git push"'
@@ -530,6 +716,17 @@ expect_cmd block "command after Python heredoc remains executable" \
   $'python3 <<\'PY\'\nopen("tmp/workbench-note.md", "w").write("safe")\nPY\ngh pr merge 1'
 
 echo "== malformed hook envelopes fail closed =="
+expect_socket_payload allow "socket-backed hook input is readable" \
+  '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+expect_socket_payload block "socket-backed hook input still blocks" \
+  '{"tool_name":"Bash","tool_input":{"command":"git push origin dev"}}'
+missing_policy_guard="$guard_git_work/missing-policy/tools/pretooluse-guard.sh"
+mkdir -p "${missing_policy_guard%/*}"
+cp "$guard" "$missing_policy_guard"
+rc=0
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git status"}}' \
+  | "$missing_policy_guard" >/dev/null 2>&1 || rc=$?
+_check block "missing policy inputs fail closed" "$rc"
 expect_payload block "malformed JSON" '{'
 expect_payload block "Bash missing command" '{"tool_name":"Bash","tool_input":{}}'
 

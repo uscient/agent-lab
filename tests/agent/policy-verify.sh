@@ -251,6 +251,52 @@ PY
   else
     fail "generated adapters contain exact allow/deny contradictions"
   fi
+  if python3 - <<'PY'
+import copy
+import json
+import re
+import tomllib
+from pathlib import Path
+
+claude = json.loads(Path(".claude/settings.json").read_text())["permissions"]
+grok = tomllib.loads(Path(".grok/config.toml").read_text())["permission"]
+codex_lines = Path(".codex/rules/agent-lab.rules").read_text().splitlines()
+
+def cached_command_denials(claude_policy, grok_policy, codex_policy):
+    found = []
+    found.extend(f"Claude:{rule}" for rule in claude_policy["deny"] if rule.startswith("Bash("))
+    found.extend(f"Grok:{rule}" for rule in grok_policy["deny"] if rule.startswith("Bash("))
+    found.extend(
+        f"Codex:{line.strip()}"
+        for line in codex_policy
+        if re.search(r'decision = "forbidden"', line)
+    )
+    return found
+
+actual = cached_command_denials(claude, grok, codex_lines)
+if actual:
+    print("\n".join(actual))
+    raise SystemExit(1)
+
+# Adversarial mutation: every client's old-style cached deny must be detected.
+mutated_claude = copy.deepcopy(claude)
+mutated_claude["deny"].append("Bash(gh api:*)")
+mutated_grok = copy.deepcopy(grok)
+mutated_grok["deny"].append("Bash(gh api*)")
+mutated_codex = [*codex_lines, 'prefix_rule(pattern = ["gh", "api"], decision = "forbidden")']
+for name, candidate in {
+    "Claude": cached_command_denials(mutated_claude, grok, codex_lines),
+    "Grok": cached_command_denials(claude, mutated_grok, codex_lines),
+    "Codex": cached_command_denials(claude, grok, mutated_codex),
+}.items():
+    if not any(item.startswith(f"{name}:") for item in candidate):
+        raise SystemExit(f"mutation escaped cached-deny detection for {name}")
+PY
+  then
+    pass "native adapters delegate command denial to the live guard and reject cached-deny mutations"
+  else
+    fail "native adapters cache command denials that can outlive the checkout"
+  fi
 else
   skip "tools/render-adapters.sh missing"
 fi
@@ -258,7 +304,27 @@ fi
 echo "== wiring: PreToolUse hooks point at the one guard =="
 for f in .claude/settings.json .codex/hooks.json .grok/hooks/git-policy.json; do
   if [ -f "$f" ]; then
-    grep -q 'pretooluse-guard.sh' "$f" && pass "wiring: $f -> guard" || fail "wiring: $f missing guard ref"
+    hook_commands="$(jq -r '.hooks.PreToolUse[].hooks[].command' "$f" 2>/dev/null || true)"
+    hook_cmd="${hook_commands%%$'\n'*}"
+    hook_ok=1
+    [ -n "$hook_cmd" ] || hook_ok=0
+    [ "$(printf '%s\n' "$hook_commands" | sort -u | wc -l)" -eq 1 ] || hook_ok=0
+
+    rc=0
+    printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git status"}}' \
+      | (cd "$root" && /bin/bash -c "$hook_cmd") >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || hook_ok=0
+
+    rc=0
+    hook_out="$(
+      printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git push origin dev"}}' \
+        | (cd "$root" && /bin/bash -c "$hook_cmd") 2>&1
+    )" || rc=$?
+    [ "$rc" -eq 2 ] && printf '%s' "$hook_out" | grep -q 'BLOCKED by agent-lab policy' || hook_ok=0
+
+    [ "$hook_ok" -eq 1 ] \
+      && pass "wiring: $f invokes one live guard for allow and block cases" \
+      || fail "wiring: $f is missing, inconsistent, or does not invoke the guard"
   else
     skip "wiring: $f not built yet"
   fi
