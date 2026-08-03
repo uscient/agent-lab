@@ -96,11 +96,28 @@ match_any() {
   return 1
 }
 
-# path_is_protected <path>: 0 if path matches any policy/protected.paths entry (at a / boundary)
+# path_is_protected <path>: 0 if path is inside this repository worktree and matches any
+# policy/protected.paths entry (at a / boundary on the repo-relative form). Host paths outside
+# $root never match — e.g. ~/.grok/sessions/... is not a rail even though .grok/ is protected
+# inside the repo.
 path_is_protected() {
-  local p="$1" entry needle hay
+  local p="$1" entry needle hay resolved="" rel=""
   [ -z "$p" ] && return 1
-  hay="/${p#/}/"
+  case "$p" in
+    /*) resolved="$(readlink -m -- "$p" 2>/dev/null || true)" ;;
+    *) resolved="$(readlink -m -- "$root/$p" 2>/dev/null || true)" ;;
+  esac
+  [ -n "$resolved" ] || return 1
+  case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *) return 1 ;;
+  esac
+  if [ "$resolved" = "$root" ]; then
+    rel=""
+  else
+    rel="${resolved#"$root"/}"
+  fi
+  hay="/${rel}/"
   while IFS= read -r entry || [ -n "$entry" ]; do
     [[ "$entry" =~ ^[[:space:]]*(#|$) ]] && continue
     needle="/${entry%/}/"
@@ -182,15 +199,20 @@ hay="${cmd:-$input}"
 # after the delimiter in the scan; malformed, dynamic, piped, or compound forms remain unstripped.
 strip_literal_cat_heredoc_data() {
   local s="$1" first rest line target="" resolved="" delimiter="" output="" found=0
-  local header_re="^[[:space:]]*cat[[:space:]]+[0-9]*>>?[[:space:]]*[\"']?([A-Za-z0-9_./-]+)[\"']?[[:space:]]+<<-?[[:space:]]*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?[[:space:]]*$"
+  local target_first_re="^[[:space:]]*cat[[:space:]]+[0-9]*>>?[[:space:]]*[\"']?([A-Za-z0-9_./-]+)[\"']?[[:space:]]+<<[[:space:]]*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"'][[:space:]]*$"
+  local delimiter_first_re="^[[:space:]]*cat[[:space:]]+<<[[:space:]]*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"'][[:space:]]+[0-9]*>>?[[:space:]]*[\"']?([A-Za-z0-9_./-]+)[\"']?[[:space:]]*$"
   scan="$s"
   [[ "$s" == *$'\n'* ]] || return
   first="${s%%$'\n'*}"
-  if [[ ! "$first" =~ $header_re ]]; then
+  if [[ "$first" =~ $target_first_re ]]; then
+    target="${BASH_REMATCH[1]}"
+    delimiter="${BASH_REMATCH[2]}"
+  elif [[ "$first" =~ $delimiter_first_re ]]; then
+    delimiter="${BASH_REMATCH[1]}"
+    target="${BASH_REMATCH[2]}"
+  else
     return
   fi
-  target="${BASH_REMATCH[1]}"
-  delimiter="${BASH_REMATCH[2]}"
   case "$target" in
     /*) resolved="$(readlink -m -- "$target" 2>/dev/null || true)" ;;
     *) resolved="$(readlink -m -- "$root/$target" 2>/dev/null || true)" ;;
@@ -221,51 +243,126 @@ strip_literal_cat_heredoc_data() {
   fi
 }
 
-# Recognize a narrowly constrained Python file writer without treating its literal document body as
-# shell operations. Python code is accepted only when its AST contains literal assignments plus one
-# or more open(...).write(...) calls with literal targets and content. Dynamic targets, imports,
-# subprocesses, extra statements, malformed heredocs, and commands after the delimiter fail closed.
+# Recognize a constrained Python document generator without treating its strings as shell
+# operations. Only non-expanding shell forms, pure computation, pathlib, and repository-local file
+# operations are accepted. Dynamic targets, unsafe imports/calls, malformed heredocs, and commands
+# after the delimiter fail closed.
 classify_literal_python_writer() {
   local s="$1" targets="" rc=0 target resolved
-  [[ "$s" =~ ^[[:space:]]*python3([[:space:]]|$) ]] || return 1
+  [[ "$s" =~ ^[[:space:]]*(mkdir[[:space:]]+-p[[:space:]]+proj[[:space:]]+\&\&[[:space:]]+)?python3([[:space:]]|$) ]] \
+    || return 1
   [ "$(command -v python3 2>/dev/null || true)" = /usr/bin/python3 ] && [ -x /usr/bin/python3 ] \
     || block "Python file-write command does not resolve to the trusted system interpreter" "Autonomy boundary"
   targets="$(
     printf '%s' "$s" | /usr/bin/python3 -I -S -c '
 import ast
 import re
+import shlex
 import sys
 
 raw = sys.stdin.read()
 
 def extract_code(text):
-    command = re.fullmatch(r"\s*python3\s+-c\s+\x27([^\x27]*)\x27\s*", text, re.DOTALL)
+    prefix = r"(?:mkdir\s+-p\s+proj\s*&&\s*)?"
+    command = re.fullmatch(r"\s*" + prefix + r"python3\s+-c\s+\x27([^\x27]*)\x27\s*", text, re.DOTALL)
     if command:
-        return command.group(1), True, True
+        return command.group(1), True, True, ""
 
     lines = text.splitlines()
     if not lines:
-        return "", False, False
+        return "", False, False, ""
     match = re.fullmatch(
-        r"\s*python3(?:\s+-)?\s+<<\s*([\x27\x22])([A-Za-z_][A-Za-z0-9_]*)\1\s*",
+        r"\s*" + prefix + r"python3(?:\s+-)?\s+<<\s*([\x27\x22])([A-Za-z_][A-Za-z0-9_]*)\1\s*",
         lines[0],
     )
     if not match:
-        return "", False, False
+        return "", False, False, ""
     delimiter = match.group(2)
     for index, line in enumerate(lines[1:], 1):
         if line == delimiter:
             trailing = lines[index + 1:]
-            if any(item.strip() for item in trailing):
-                return "\n".join(lines[1:index]), True, False
-            return "\n".join(lines[1:index]), True, True
-    return "\n".join(lines[1:]), True, False
+            return "\n".join(lines[1:index]), True, True, "\n".join(trailing)
+    return "\n".join(lines[1:]), True, False, ""
 
-code, python_shape, complete = extract_code(raw)
+code, python_shape, complete, trailing = extract_code(raw)
 if not python_shape:
     raise SystemExit(3)
 if not complete:
     raise SystemExit(2)
+
+def validate_trailing_verification(text):
+    if not text.strip():
+        return
+    if any(marker in text for marker in ("$(", chr(96), "<(", ">(", "$" "{")):
+        raise SystemExit(2)
+    allowed_commands = {
+        "[", "[[", "echo", "false", "grep", "head", "ls", "printf", "tail",
+        "test", "true", "wc",
+    }
+    separators = {";", "&&", "||", "|", "&"}
+    controls = {"if", "then", "elif", "else", "do", "!", "time"}
+    endings = {"fi", "done"}
+    for_mode = False
+    for raw_line in text.splitlines():
+        try:
+            lexer = shlex.shlex(raw_line, posix=True, punctuation_chars=";&|<>")
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            tokens = list(lexer)
+        except ValueError:
+            raise SystemExit(2)
+        if not tokens:
+            continue
+        if any(token in {"<", ">", "<<", ">>", "<>", ">|", "&>"} for token in tokens):
+            raise SystemExit(2)
+        expect_command = not for_mode
+        for token in tokens:
+            lowered = token.lower()
+            if (
+                token.startswith("/")
+                and token != "/dev/null"
+                or token == ".."
+                or token.startswith("../")
+                or "/.git" in token
+                or ".gitconfig" in lowered
+                or "/.ssh" in lowered
+                or "/.config/gh" in lowered
+                or "/secrets/" in lowered
+                or lowered.startswith("secrets/")
+                or "/.env" in lowered
+                or lowered.startswith(".env")
+            ):
+                raise SystemExit(2)
+            if for_mode:
+                if token == "do":
+                    for_mode = False
+                    expect_command = True
+                continue
+            if token in separators:
+                expect_command = True
+                continue
+            if not expect_command:
+                continue
+            if token == "for":
+                for_mode = True
+                expect_command = False
+                continue
+            if token in controls:
+                expect_command = True
+                continue
+            if token in endings:
+                expect_command = False
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+                continue
+            command = token.rsplit("/", 1)[-1]
+            if command not in allowed_commands:
+                raise SystemExit(2)
+            expect_command = False
+    if for_mode:
+        raise SystemExit(2)
+
+validate_trailing_verification(trailing)
 
 try:
     tree = ast.parse(code)
@@ -281,58 +378,192 @@ write_like = any(
 if not write_like:
     raise SystemExit(3)
 
-bindings = {}
+string_bindings = {}
+path_bindings = {}
+file_bindings = {}
 targets = []
 
-def literal(node):
-    if isinstance(node, ast.Name) and node.id in bindings:
-        return bindings[node.id]
+def literal_value(node):
+    if isinstance(node, ast.Name) and node.id in string_bindings:
+        return string_bindings[node.id]
     try:
         return ast.literal_eval(node)
     except (ValueError, TypeError):
         raise SystemExit(2)
 
-def validate_content(node):
-    value = literal(node)
-    if not isinstance(value, (str, bytes)):
-        raise SystemExit(2)
-
-def validate_open_write(call):
-    if len(call.args) != 1 or call.keywords:
-        raise SystemExit(2)
-    validate_content(call.args[0])
-    opener = call.func.value
-    if not isinstance(opener, ast.Call) or not isinstance(opener.func, ast.Name) or opener.func.id != "open":
-        raise SystemExit(2)
-    if not 1 <= len(opener.args) <= 2:
-        raise SystemExit(2)
-    target = literal(opener.args[0])
-    mode = literal(opener.args[1]) if len(opener.args) == 2 else None
-    if not isinstance(target, str) or mode not in {"w", "a", "x", "wb", "ab", "xb"}:
-        raise SystemExit(2)
-    for keyword in opener.keywords:
-        if keyword.arg not in {"encoding", "errors", "newline"}:
-            raise SystemExit(2)
-        literal(keyword.value)
-    targets.append(target)
+def path_target(node):
+    if isinstance(node, ast.Name) and node.id in path_bindings:
+        return path_bindings[node.id]
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Path"
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        target = literal_value(node.args[0])
+        if isinstance(target, str):
+            return target
+    raise SystemExit(2)
 
 for statement in tree.body:
     if isinstance(statement, ast.Assign):
         if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
-            raise SystemExit(2)
-        value = literal(statement.value)
-        if not isinstance(value, (str, bytes)):
-            raise SystemExit(2)
-        bindings[statement.targets[0].id] = value
-        continue
-    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
-        continue
-    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
-        call = statement.value
-        if isinstance(call.func, ast.Attribute) and call.func.attr == "write":
-            validate_open_write(call)
             continue
-    raise SystemExit(2)
+        name = statement.targets[0].id
+        if (
+            isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == "Path"
+        ):
+            path_bindings[name] = path_target(statement.value)
+            continue
+        try:
+            value = ast.literal_eval(statement.value)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, (str, bytes)):
+            string_bindings[name] = value
+    if isinstance(statement, ast.With):
+        for item in statement.items:
+            opener = item.context_expr
+            if (
+                isinstance(opener, ast.Call)
+                and isinstance(opener.func, ast.Name)
+                and opener.func.id == "open"
+                and isinstance(item.optional_vars, ast.Name)
+                and opener.args
+            ):
+                target = literal_value(opener.args[0])
+                if not isinstance(target, str):
+                    raise SystemExit(2)
+                file_bindings[item.optional_vars.id] = target
+
+safe_builtin_calls = {
+    "all", "any", "bool", "bytes", "dict", "enumerate", "float", "int", "len",
+    "chr", "list", "max", "min", "print", "range", "reversed", "set", "sorted", "str",
+    "sum", "tuple", "zip",
+}
+safe_method_calls = {
+    "add", "append", "count", "decode", "encode", "endswith", "extend", "format",
+    "get", "items", "join", "keys", "lower", "lstrip", "replace", "rstrip", "split",
+    "splitlines", "startswith", "strip", "upper", "update", "values",
+}
+
+class Validator(ast.NodeVisitor):
+    def visit_Import(self, node):
+        if not (
+            len(node.names) == 1
+            and node.names[0].name == "os"
+            and node.names[0].asname in {None, "os"}
+        ):
+            raise SystemExit(2)
+
+    def visit_ImportFrom(self, node):
+        if not (
+            node.module == "pathlib"
+            and node.level == 0
+            and len(node.names) == 1
+            and node.names[0].name == "Path"
+            and node.names[0].asname in {None, "Path"}
+        ):
+            raise SystemExit(2)
+
+    def visit_FunctionDef(self, node):
+        raise SystemExit(2)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_ClassDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+
+    def visit_Name(self, node):
+        if node.id.startswith("_"):
+            raise SystemExit(2)
+
+    def visit_Attribute(self, node):
+        if node.attr.startswith("_"):
+            raise SystemExit(2)
+        chain = []
+        current = node
+        while isinstance(current, ast.Attribute):
+            chain.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name) and current.id == "os":
+            full = ["os"] + list(reversed(chain))
+            if full not in (["os", "path"], ["os", "path", "getsize"]):
+                raise SystemExit(2)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id == "Path":
+                targets.append(path_target(node))
+            elif func.id == "open":
+                if not 1 <= len(node.args) <= 2:
+                    raise SystemExit(2)
+                target = literal_value(node.args[0])
+                mode = literal_value(node.args[1]) if len(node.args) == 2 else "r"
+                if not isinstance(target, str) or mode not in {
+                    "r", "rb", "w", "a", "x", "wb", "ab", "xb",
+                }:
+                    raise SystemExit(2)
+                if any(keyword.arg not in {"encoding", "errors", "newline"} for keyword in node.keywords):
+                    raise SystemExit(2)
+                targets.append(target)
+            elif func.id not in safe_builtin_calls:
+                raise SystemExit(2)
+            self.generic_visit(node)
+            return
+
+        if not isinstance(func, ast.Attribute):
+            raise SystemExit(2)
+        method = func.attr
+        chain = []
+        current = func
+        while isinstance(current, ast.Attribute):
+            chain.append(current.attr)
+            current = current.value
+        full = [current.id] + list(reversed(chain)) if isinstance(current, ast.Name) else []
+        if full == ["os", "path", "getsize"]:
+            if len(node.args) != 1 or node.keywords:
+                raise SystemExit(2)
+            target = literal_value(node.args[0])
+            if not isinstance(target, str):
+                raise SystemExit(2)
+            targets.append(target)
+        elif method in {"write_text", "write_bytes"}:
+            if len(node.args) != 1:
+                raise SystemExit(2)
+            allowed = {"encoding", "errors", "newline"} if method == "write_text" else set()
+            if any(keyword.arg not in allowed for keyword in node.keywords):
+                raise SystemExit(2)
+            targets.append(path_target(func.value))
+        elif method in {"read_text", "read_bytes", "resolve", "stat"}:
+            if method in {"read_text", "read_bytes"}:
+                allowed = {"encoding", "errors"} if method == "read_text" else set()
+                if node.args or any(keyword.arg not in allowed for keyword in node.keywords):
+                    raise SystemExit(2)
+            elif node.args or node.keywords:
+                raise SystemExit(2)
+            targets.append(path_target(func.value))
+        elif method == "write":
+            opener = func.value
+            direct_open = (
+                isinstance(opener, ast.Call)
+                and isinstance(opener.func, ast.Name)
+                and opener.func.id == "open"
+            )
+            bound_open = isinstance(opener, ast.Name) and opener.id in file_bindings
+            if not ((direct_open or bound_open) and len(node.args) == 1 and not node.keywords):
+                raise SystemExit(2)
+            if bound_open:
+                targets.append(file_bindings[opener.id])
+        elif method not in safe_method_calls:
+            raise SystemExit(2)
+        self.generic_visit(node)
+
+Validator().visit(tree)
 
 if not targets:
     raise SystemExit(2)

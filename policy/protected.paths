@@ -2,7 +2,9 @@
 # Read by tools/pretooluse-guard.sh: Edit/Write to these, or shell mutation of them, is DENIED
 # unless AGENT_LAB_MAINTENANCE=1 (an explicit, separately-approved maintenance task).
 # AGENTS.md defines maintenance authority. Entries ending in / are directory prefixes; others are file paths.
-# Paths are matched anywhere in the string (absolute or repo-relative), at a / boundary.
+# File-tool matches resolve the target into this repository worktree, then match the repo-relative
+# form at a / boundary. Host paths outside the worktree (for example ~/.grok/sessions/...) are not
+# rails. Shell command text still uses a literal substring check against these entries.
 
 AGENTS.md
 policy/

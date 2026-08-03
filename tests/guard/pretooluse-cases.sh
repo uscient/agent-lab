@@ -97,6 +97,13 @@ expect_file_content() {
   )" || infra "could not construct file-tool payload"
   expect_payload "$exp" "$name" "$payload"
 }
+expect_large_file_content() {
+  local exp="$1" name="$2" fp="$3" body="$4" rc=0
+  jq -cn --arg fp "$fp" --arg body "$body" \
+    '{toolName:"Write",toolInput:{filePath:$fp,content:($body + ("x" * 131072))}}' \
+    | env -u AGENT_LAB_MAINTENANCE "$guard" >/dev/null 2>&1 || rc=$?
+  _check "$exp" "$name" "$rc"
+}
 expect_no_eager_helpers() {
   local name="$1" payload="$2" rc=0
   : > "$probe_log"
@@ -342,6 +349,13 @@ expect_edit allow "edit AGENTS.md (maint=1)"         'AGENTS.md' 1
 expect_edit allow "edit Docker inventory (maint=1)"  'tests/dev/docker-harness-cases.sh' 1
 expect_edit allow "edit PR evidence template (maint=1)" '.github/PULL_REQUEST_TEMPLATE.md' 1
 expect_edit allow "edit .grok (maint=1)"             '.grok/config.toml' 1
+expect_edit block "edit repo .grok hooks (no maint)" '.grok/hooks/pretooluse.sh'
+expect_edit block "edit abs repo .grok (no maint)"   "$repo_root/.grok/hooks/pretooluse.sh"
+expect_edit allow "host .grok session path is not a rail" \
+  "${HOME:-/home/work}/.grok/sessions/agent-lab-guard-fixture/plan.md"
+expect_file_content allow "Write host .grok session path is not a rail" \
+  Write "${HOME:-/home/work}/.grok/sessions/agent-lab-guard-fixture/plan.md" \
+  $'session plan notes\nnot a repository rail\n'
 expect_edit allow "edit normal file"                 'scripts/dev/brief'
 expect_edit allow "edit README"                      'README.md'
 
@@ -387,16 +401,28 @@ expect_cmd allow "rail read output to tmp"      'wc -l AGENTS.md > /tmp/agent-la
 hostile_note=$'AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text'
 expect_file_content allow "Write content is data, not a command" \
   Write "$guard_git_work/write-note.md" "$hostile_note"
+expect_large_file_content allow "large Write content is data, not a command" \
+  'proj/flow/_guard-large-write.md' "$hostile_note"
 expect_file_content allow "lowercase write content is data, not a command" \
   write "$guard_git_work/write-note-lower.md" "$hostile_note"
 expect_file_content block "lowercase write still protects rails" \
   write 'AGENTS.md' "$hostile_note"
 expect_cmd allow "literal heredoc content is data, not a command" \
   $'cat > tmp/workbench-note.md <<\'NOTE\'\nAGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text\nNOTE'
+expect_cmd allow "literal heredoc supports delimiter-first writes" \
+  $'cat <<\'NOTE\' > proj/flow/_guard-large-write.md\nAGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text\nNOTE'
 expect_cmd allow "literal Python writer content is data, not a command" \
   $'python3 -c \'doc = """AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text"""\nopen("proj/flow/_guard-python-note.md", "w").write(doc)\''
 expect_cmd allow "literal Python heredoc writer content is data, not a command" \
   $'python3 <<\'PY\'\ndoc = """AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text"""\nopen("proj/flow/_guard-python-heredoc.md", "w").write(doc)\nPY'
+expect_cmd allow "literal pathlib writer content is data, not a command" \
+  $'python3 <<\'PY\'\nfrom pathlib import Path\ndoc = """AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text"""\nPath("proj/flow/_guard-pathlib-note.md").write_text(doc, encoding="utf-8")\nPY'
+expect_cmd allow "agent-realistic pathlib multi-section builder under proj" \
+  $'mkdir -p proj && python3 <<\'PY\'\nfrom pathlib import Path\nsections = ["# Title", "", "## One", "body one", "## Two", "body two"]\nPath("proj/flow/_guard-multi-section.md").write_text("\\n".join(sections) + "\\n", encoding="utf-8")\nprint(Path("proj/flow/_guard-multi-section.md").stat().st_size)\nPY'
+# Heredoc strip ends at the first line equal to the delimiter. Prefer Write/Edit for docs that
+# embed delimiter tokens; collision remains fail-closed rather than weakening the strip.
+expect_cmd block "heredoc delimiter collision remains fail-closed" \
+  $'cat > proj/flow/_guard-collision.md <<\'NOTE\'\n# Example block\nNOTE\n# remaining body after early delimiter\ngh pr merge 1\nNOTE'
 
 echo "== hot-path helpers are lazy =="
 expect_no_eager_helpers "allowed command avoids git/grep/sed" \
@@ -469,6 +495,8 @@ expect_cmd block "double-quoted Python source can expand shell commands" \
   $'python3 -c "open(\'proj/flow/note.md\', \'w\').write(\'$(git push)\')"'
 expect_cmd block "unquoted Python heredoc can expand shell commands" \
   $'python3 <<PY\nopen("proj/flow/note.md", "w").write("$(git push)")\nPY'
+expect_cmd block "unquoted cat heredoc can expand shell commands" \
+  $'cat > proj/flow/note.md <<NOTE\n$(git push)\nNOTE'
 expect_hostile_python_block "hostile PATH Python is neither trusted nor invoked" \
   'python3 -c '\''open("proj/flow/note.md", "w").write("safe")'\'''
 expect_cmd block "Python writer cannot hide a second operation" \
