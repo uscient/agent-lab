@@ -88,6 +88,14 @@ expect_payload() {
     | env AGENT_LAB_MAINTENANCE="$maint" "$guard" >/dev/null 2>&1 || rc=$?
   _check "$exp" "$name" "$rc"
 }
+expect_file_content() {
+  local exp="$1" name="$2" tool="$3" fp="$4" body="$5" payload
+  payload="$(
+    jq -cn --arg tool "$tool" --arg fp "$fp" --arg body "$body" \
+      '{toolName:$tool,toolInput:{filePath:$fp,content:$body}}'
+  )" || infra "could not construct file-tool payload"
+  expect_payload "$exp" "$name" "$payload"
+}
 expect_no_eager_helpers() {
   local name="$1" payload="$2" rc=0
   : > "$probe_log"
@@ -359,6 +367,16 @@ expect_cmd allow "--message long form"         'git commit --message "discuss te
 expect_cmd allow "search data names forge CLI" 'rg -n "gh" README.md'
 expect_cmd allow "rail read output to tmp"      'wc -l AGENTS.md > /tmp/agent-lab-rail-count'
 
+hostile_note=$'AGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text'
+expect_file_content allow "Write content is data, not a command" \
+  Write "$guard_git_work/write-note.md" "$hostile_note"
+expect_file_content allow "lowercase write content is data, not a command" \
+  write "$guard_git_work/write-note-lower.md" "$hostile_note"
+expect_file_content block "lowercase write still protects rails" \
+  write 'AGENTS.md' "$hostile_note"
+expect_cmd allow "literal heredoc content is data, not a command" \
+  $'cat > tmp/workbench-note.md <<\'NOTE\'\nAGENTS.md is authority\nNever run git pull\nA human may git merge a branch\nDo not invoke gh pr merge\n> quoted policy text\nNOTE'
+
 echo "== hot-path helpers are lazy =="
 expect_no_eager_helpers "allowed command avoids git/grep/sed" \
   '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
@@ -401,14 +419,20 @@ expect_cmd block "prefixed variable fd redirect" 'target=AGENTS.md; : 3> "./$tar
 expect_cmd block "nested fd redirect into rail"  'sh -c '\'' : 3> "$1"'\'' _ AGENTS.md'
 expect_cmd block "substituted fd redirect into rail" ': 3> "$(printf ./AGENTS.md)"'
 expect_cmd block "glob fd redirect into rail"    ': 3> ./*AGENTS.md'
-expect_cmd block "absolute fd redirect into rail" ': 3> "/home/work/projects/uscient/agent-lab/AGENTS.md"'
+expect_cmd block "absolute fd redirect into rail" ": 3> \"$repo_root/AGENTS.md\""
 expect_cmd block "quoted rail target construction" 'echo x > AGENTS"."md'
 expect_cmd block "ANSI rail target construction" 'echo x > AGENTS$'\''.md'\'''
 expect_cmd block "appended rail target construction" 'target=AGENTS; target+=.md; echo x > "$target"'
 expect_cmd block "symlink setup names rail"      'ln -sf AGENTS.md /tmp/agent-lab-rail-link'
 ln -s "$repo_root/AGENTS.md" "$guard_tmp_link" || infra "could not create rail-link fixture"
 expect_cmd block "wc tmp symlink into rail"      "wc -l AGENTS.md > $guard_tmp_link"
+expect_cmd block "literal heredoc symlink into rail" \
+  $'cat > '"$guard_tmp_link"$' <<\'NOTE\'\npolicy prose only\nNOTE'
+expect_cmd block "dynamic heredoc rail target is not treated as data" \
+  $'target=AGENTS.md; cat > "$target" <<\'NOTE\'\npolicy prose only\nNOTE'
 expect_cmd block "real rm after stripped msg"  'git commit -m "tidy"; rm policy/x'
+expect_cmd block "command after literal heredoc remains executable" \
+  $'cat > tmp/workbench-note.md <<\'NOTE\'\nsafe note\nNOTE\ngh pr merge 1'
 
 echo "== malformed hook envelopes fail closed =="
 expect_payload block "malformed JSON" '{'
