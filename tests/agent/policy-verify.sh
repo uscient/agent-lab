@@ -116,8 +116,21 @@ if [ -x tools/bin/git ]; then
   out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh run view 123 --log 2>&1 || true)"
   printf '%s' "$out" | grep -q '^REAL-GH run view 123 --log$' \
     && pass "gh shim allows read-only Actions logs" || fail "gh shim blocked Actions logs"
+  out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh run list --repo uscient/agent-lab 2>&1 || true)"
+  printf '%s' "$out" | grep -q '^REAL-GH run list --repo uscient/agent-lab$' \
+    && pass "gh shim allows exact-repo Actions reads" || fail "gh shim blocked exact-repo Actions reads"
+  out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh pr list --repo uscient/agent-lab 2>&1 || true)"
+  printf '%s' "$out" | grep -q '^REAL-GH pr list --repo uscient/agent-lab$' \
+    && pass "gh shim allows exact-repo PR reads" || fail "gh shim blocked exact-repo PR reads"
+  out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh api --method GET repos/uscient/agent-lab/branches/flow 2>&1 || true)"
+  printf '%s' "$out" | grep -q '^REAL-GH api --method GET repos/uscient/agent-lab/branches/flow$' \
+    && pass "gh shim allows scoped API GET" || fail "gh shim blocked scoped API GET"
   rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh run rerun 123 --failed >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks Actions mutation" || fail "gh shim allowed Actions mutation"
+  rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh api -X POST repos/uscient/agent-lab/issues >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "gh shim blocks API mutation" || fail "gh shim allowed API mutation"
+  rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh api repos/other/repo/branches/main >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "gh shim blocks cross-repo API GET" || fail "gh shim allowed cross-repo API GET"
   rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh -R uscient/agent-lab pr merge 1 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks PR mutation after global options" || fail "gh shim missed PR mutation after global options"
   rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh -R other/repo pr create --base dev >/dev/null 2>&1 || rc=$?
@@ -181,6 +194,62 @@ if [ -x tools/render-adapters.sh ]; then
   else
     fail "generated adapters drifted"
     sed 's/^/  /' "$policy_render_out"
+  fi
+  grok_deny="$(sed -n '/^deny = \[/,/^\]/p' .grok/config.toml)"
+  grok_allow="$(sed -n '/^allow = \[/,/^\]/p' .grok/config.toml)"
+  for family in run api; do
+    printf '%s\n' "$grok_allow" | grep -Fq "Bash(gh $family*)" \
+      && ! printf '%s\n' "$grok_deny" | grep -Fq "Bash(gh $family*)" \
+      && pass "Grok native rules allow guarded gh $family without an overriding deny" \
+      || fail "Grok native rules contradict guarded gh $family access"
+    jq -e --arg rule "Bash(gh $family:*)" \
+      '(.permissions.allow | index($rule)) != null and (.permissions.deny | index($rule)) == null' \
+      .claude/settings.json >/dev/null \
+      && pass "Claude native rules allow guarded gh $family without an overriding deny" \
+      || fail "Claude native rules contradict guarded gh $family access"
+    grep -Fq "pattern = [\"gh\", \"$family\"], decision = \"allow\"" .codex/rules/agent-lab.rules \
+      && ! grep -Fq "pattern = [\"gh\", \"$family\"], decision = \"forbidden\"" .codex/rules/agent-lab.rules \
+      && pass "Codex native rules allow guarded gh $family without an overriding deny" \
+      || fail "Codex native rules contradict guarded gh $family access"
+  done
+  if python3 - <<'PY'
+import json
+import re
+import tomllib
+from pathlib import Path
+
+def bash_head(rule):
+    if not rule.startswith("Bash("):
+        return None
+    return rule[5:-1].removesuffix(":*").removesuffix("*").strip()
+
+def exact_conflicts(allow, deny):
+    allowed = {head for rule in allow if (head := bash_head(rule))}
+    denied = {head for rule in deny if (head := bash_head(rule))}
+    return sorted(allowed & denied)
+
+claude = json.loads(Path(".claude/settings.json").read_text())["permissions"]
+grok = tomllib.loads(Path(".grok/config.toml").read_text())["permission"]
+conflicts = {
+    "Claude": exact_conflicts(claude["allow"], claude["deny"]),
+    "Grok": exact_conflicts(grok["allow"], grok["deny"]),
+}
+rules = Path(".codex/rules/agent-lab.rules").read_text().splitlines()
+codex = {"allow": set(), "forbidden": set()}
+for line in rules:
+    match = re.search(r'pattern = \[(.*?)\], decision = "(allow|forbidden)"', line)
+    if match:
+        codex[match.group(2)].add(" ".join(re.findall(r'"([^"]+)"', match.group(1))))
+conflicts["Codex"] = sorted(codex["allow"] & codex["forbidden"])
+for client, found in conflicts.items():
+    if found:
+        print(f"{client}: {', '.join(found)}")
+raise SystemExit(1 if any(conflicts.values()) else 0)
+PY
+  then
+    pass "generated adapters contain no exact allow/deny contradictions"
+  else
+    fail "generated adapters contain exact allow/deny contradictions"
   fi
 else
   skip "tools/render-adapters.sh missing"

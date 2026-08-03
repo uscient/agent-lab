@@ -129,6 +129,10 @@ path_is_protected() {
 # path_is_secret <path>: 0 for repository-local secret/key material.
 path_is_secret() {
   case "/$1" in
+    */secrets/*) return 0 ;;
+    */.env.example) return 1 ;;
+  esac
+  case "/$1" in
     */.env | */.env.* | */secrets/* | *.pem | *.key | *.kdbx) return 0 ;;
     *) return 1 ;;
   esac
@@ -733,20 +737,93 @@ validate_push() {
 }
 
 validate_gh() {
-  local words=() sub arg i base="" head="" required_base=""
+  local words=() sub arg i base="" head="" required_base="" family_i=1
+  local repo="" endpoint="" method="GET"
   read -r -a words <<<"$scan"
   [ "${words[0]:-}" = gh ] || return 1
-  if [ "${words[1]:-}" = run ]; then
-    case "${words[2]:-}" in list | view | watch) ;; *) return 1 ;; esac
-    for arg in "${words[@]:3}"; do
-      case "$arg" in -R | -R?* | --repo | --repo=* | --hostname | --hostname=*) return 1 ;; esac
+
+  # Explicit current-repository selectors are equivalent to running in this checkout. Agents use
+  # them routinely to make audit commands unambiguous; only cross-repository selectors are denied.
+  case "${words[1]:-}" in
+    -R | --repo)
+      repo="${words[2]:-}"
+      [ "$repo" = uscient/agent-lab ] || return 1
+      family_i=3
+      ;;
+    -R?*)
+      repo="${words[1]#-R}"
+      [ "$repo" = uscient/agent-lab ] || return 1
+      family_i=2
+      ;;
+    --repo=*)
+      repo="${words[1]#*=}"
+      [ "$repo" = uscient/agent-lab ] || return 1
+      family_i=2
+      ;;
+    --hostname | --hostname=*) return 1 ;;
+  esac
+
+  if [ "${words[$family_i]:-}" = api ]; then
+    i=$((family_i + 1))
+    while [ "$i" -lt "${#words[@]}" ]; do
+      arg="${words[$i]}"
+      case "$arg" in
+        -X | --method)
+          i=$((i + 1)); method="${words[$i]:-}" ;;
+        -X?*) method="${arg#-X}" ;;
+        --method=*) method="${arg#*=}" ;;
+        -f | -F | --field | --raw-field | --input | -H | --header | --hostname)
+          return 1 ;;
+        -f?* | -F?* | --field=* | --raw-field=* | --input=* | -H?* | --header=* | --hostname=*)
+          return 1 ;;
+        --paginate | --slurp | --include | --silent) ;;
+        --cache | --jq | --template)
+          i=$((i + 1)); [ "$i" -lt "${#words[@]}" ] || return 1 ;;
+        --cache=* | --jq=* | --template=*) ;;
+        -*) return 1 ;;
+        *)
+          [ -z "$endpoint" ] || return 1
+          endpoint="${arg#/}"
+          ;;
+      esac
+      i=$((i + 1))
+    done
+    [ "${method^^}" = GET ] || return 1
+    case "$endpoint" in
+      repos/uscient/agent-lab | repos/uscient/agent-lab/* | repos/uscient/agent-lab\?*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  if [ "${words[$family_i]:-}" = run ]; then
+    case "${words[$((family_i + 1))]:-}" in list | view | watch) ;; *) return 1 ;; esac
+    i=$((family_i + 2))
+    while [ "$i" -lt "${#words[@]}" ]; do
+      arg="${words[$i]}"
+      case "$arg" in
+        -R | --repo)
+          i=$((i + 1)); [ "${words[$i]:-}" = uscient/agent-lab ] || return 1 ;;
+        -R?*) [ "${arg#-R}" = uscient/agent-lab ] || return 1 ;;
+        --repo=*) [ "${arg#*=}" = uscient/agent-lab ] || return 1 ;;
+        --hostname | --hostname=*) return 1 ;;
+      esac
+      i=$((i + 1))
     done
     return 0
   fi
-  [ "${words[1]:-}" = pr ] || return 1
-  sub="${words[2]:-}"
-  for arg in "${words[@]:3}"; do
-    case "$arg" in -R | -R?* | --repo | --repo=* | --hostname | --hostname=*) return 1 ;; esac
+  [ "${words[$family_i]:-}" = pr ] || return 1
+  sub="${words[$((family_i + 1))]:-}"
+  i=$((family_i + 2))
+  while [ "$i" -lt "${#words[@]}" ]; do
+    arg="${words[$i]}"
+    case "$arg" in
+      -R | --repo)
+        i=$((i + 1)); [ "${words[$i]:-}" = uscient/agent-lab ] || return 1 ;;
+      -R?*) [ "${arg#-R}" = uscient/agent-lab ] || return 1 ;;
+      --repo=*) [ "${arg#*=}" = uscient/agent-lab ] || return 1 ;;
+      --hostname | --hostname=*) return 1 ;;
+    esac
+    i=$((i + 1))
   done
   case "$sub" in
     list | view | status | checks | diff) return 0 ;;
@@ -755,7 +832,7 @@ validate_gh() {
   esac
   load_branch
   required_base="$(expected_pr_base)" || return 1
-  i=3
+  i=$((family_i + 2))
   while [ "$i" -lt "${#words[@]}" ]; do
     arg="${words[$i]}"
     case "$arg" in
@@ -779,22 +856,52 @@ validate_remote_rebase() {
   [ "${words[2]}" = "$expected" ]
 }
 
-# is_nonexecuting_search_data <command>: true only for a single rg invocation whose
-# arguments cannot start another command. rg's --pre option is excluded because it executes an
-# external preprocessor. This lets a literal search pattern name a CLI without treating the data
-# as an invocation of that CLI.
+# is_nonexecuting_search_data <command>: true for an rg read whose arguments cannot execute another
+# command, optionally followed by one read-only output filter. Shell-aware tokenization keeps regex
+# alternation inside quotes as data. rg's --pre option and all substitutions remain excluded.
 is_nonexecuting_search_data() {
-  local s="$1" words=() arg
-  read -r -a words <<<"$s"
-  [ "${words[0]:-}" = rg ] || return 1
-  case "$s" in *';'* | *'&'* | *'|'* | *'`'* | *'$'* | *'<'* | *'>'*) return 1 ;; esac
-  [[ "$s" == *$'\n'* ]] && return 1
-  for arg in "${words[@]:1}"; do
-    case "$arg" in
-      --pre | --pre=* | -*\"* | -*\'* | -*\\* | -*\** | -*\?* | -*\[* | -*\{* | -*\}*) return 1 ;;
-    esac
-  done
-  return 0
+  /usr/bin/python3 - "$1" <<'PY'
+import os
+import shlex
+import sys
+
+text = sys.argv[1]
+if "\n" in text or "$" in text or "`" in text:
+    raise SystemExit(1)
+try:
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    tokens = list(lexer)
+except ValueError:
+    raise SystemExit(1)
+if not tokens or any(token in {";", "&&", "||", "&", "<", ">", "<<", ">>"} for token in tokens):
+    raise SystemExit(1)
+pipes = [i for i, token in enumerate(tokens) if token == "|"]
+if len(pipes) > 1:
+    raise SystemExit(1)
+split = pipes[0] if pipes else len(tokens)
+search = tokens[:split]
+tail = tokens[split + 1:] if pipes else []
+if not search:
+    raise SystemExit(1)
+command = os.path.basename(search[0])
+args = search[1:]
+if command == "git" and args[:1] == ["grep"]:
+    command = "git-grep"
+    args = args[1:]
+if command not in {"rg", "grep", "git-grep"}:
+    raise SystemExit(1)
+if any(arg.startswith("-") and any(char in arg for char in "\\*?[]{}") for arg in args):
+    raise SystemExit(1)
+if command == "rg" and any(arg == "--pre" or arg.startswith("--pre=") for arg in args):
+    raise SystemExit(1)
+if command == "git-grep" and any(arg == "--open-files-in-pager" or arg.startswith("--open-files-in-pager=") for arg in args):
+    raise SystemExit(1)
+if tail and os.path.basename(tail[0]) not in {"head", "tail", "sort", "uniq", "wc", "jq"}:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
 }
 
 # unsafe_protected_write_redirect <command>: true for every file-write redirect except literal
@@ -861,7 +968,7 @@ matches_line "$scan" "$git_slice_merge_re" \
   && block "slice integration is permitted only through the verified workstream helper" "Autonomy boundary"
 if matches_line "$shell_scan" "$gh_command_re" \
   && ! is_nonexecuting_search_data "$scan"; then
-  validate_gh || block "GitHub access is limited to direct read-only PR/Actions commands and the exact PR route derived from the current branch" "Autonomy boundary"
+  validate_gh || block "GitHub access is limited to repository-scoped PR/Actions reads, GET-only API reads, and the exact PR route derived from the current branch" "Autonomy boundary"
 fi
 
 match_any "$scan" "$pol/deny.patterns" \
@@ -887,7 +994,16 @@ matches_line "$scan" '(--network[=[:space:]]host|--net[=[:space:]]host|network_m
   && block "host networking is forbidden (breaks default-deny)" "Autonomy boundary"
 # secret/key material: agents developing the repository must not read or write secret-bearing paths.
 secret_path_re="(^|[[:space:]\"'=])([^[:space:]\"']*/)?(\\.env([^a-zA-Z]|$)|secrets/|[^[:space:]\"']*\\.(pem|key|kdbx)([^a-zA-Z]|$))"
-if matches_line "$scan" "$secret_path_re"; then
+# The tracked sample is documentation, not secret state. Preserve any directory prefix so an
+# example under secrets/ remains blocked, and require a token boundary so suffixes stay secret.
+secret_scan="$scan"
+if [[ "$secret_scan" == *'.env.example'* ]]; then
+  secret_scan="$(
+    printf '%s' "$scan" \
+      | sed -E "s#(^|[[:space:]\"'=])([^[:space:]\"']*/)?\\.env\\.example([[:space:]\"'<>;&|)]|$)#\\1\\2ENV_EXAMPLE\\3#g"
+  )"
+fi
+if matches_line "$secret_scan" "$secret_path_re"; then
   block "reading or writing .env / secrets / key material is forbidden" "Autonomy boundary"
 fi
 

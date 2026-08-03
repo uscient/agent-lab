@@ -1,9 +1,8 @@
 # AGENTS.md — Agent Lab operating rules
 
-Agent Lab is a Docker-containment lab (Bash + Docker Compose). You are an agent **developing this
-repo**. Work autonomously inside the boundary below; a `PreToolUse` guard enforces the edges. The
-guard is defense-in-depth—the **real** safety boundary is containment. See `SECURITY.md` and
-`THREAT_MODEL.md`.
+Agent Lab is a Bash/Docker Compose containment lab. You are **developing this repo**.
+Work inside this boundary; `PreToolUse` is defense-in-depth—the **real** safety boundary is
+containment. See `SECURITY.md` and `THREAT_MODEL.md`.
 
 Repo: `https://github.com/uscient/agent-lab` · authoritative branch: `dev`
 
@@ -15,11 +14,11 @@ Repo: `https://github.com/uscient/agent-lab` · authoritative branch: `dev`
   `[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*`. Legacy
   `slice/<work>/<slice>` and literal group `slice/group/<group>/<slice>` branches target only their
   matching parent.
-- **Integrate through PRs and retain history.** `scripts/dev/workstream merge` is the only agent
-  merge path: verified slice→work, group-slice→group, and approved group→`flow`. It requires the
-  current base and successful checks and uses a merge commit. Humans alone merge final ordinary,
-  workstream, or `flow` PRs into `dev`. Never directly push, commit, Git-merge, or rebase a protected
-  branch.
+- **Integrate through PRs; retain history.** Local merge/rebase is allowed on ordinary work branches.
+  `scripts/dev/workstream merge` is the sole agent merge into a reserved parent: verified
+  slice→work, group-slice→group, or approved group→`flow`. It requires current-base successful checks
+  and a merge commit. Humans alone merge final PRs into `dev`. Never push, commit, Git-merge, or
+  rebase a protected branch.
 - **Sync without erasing accepted merges.** Use `scripts/dev/workstream sync` on reserved branches.
   Workstreams, program groups, and group slices merge their moving parent and may never be rebased or
   force-updated; legacy slices may rebase only on their matching parent. Replay evidence after every
@@ -33,7 +32,7 @@ Repo: `https://github.com/uscient/agent-lab` · authoritative branch: `dev`
 
 | Auto — no prompt | Denied — guard blocks (exit 2) |
 |---|---|
-| read · edit · tests/build/lint · `git add`/`commit` · branch/switch · `git fetch`¹ · `git stash` · exact allowed rebase or workstream sync · push the current branch to its same-named `origin` branch (`--force-with-lease` only after an allowed non-program rebase)¹ · read-only `gh pr`/`gh run` · exact branch-derived PR creation¹ · verified `scripts/dev/workstream` intermediate integration¹ | write/integrate `dev`/`flow`/`master`/`main` directly · `pull` · integration from an unrelated remote base · program-branch force/rebase · plain `--force`, branch deletion, mirror push · direct PR merge or other unscoped `gh` remote write · `git remote` mutation · `gh auth` · Git identity/attribution mutation |
+| read · edit · tests/build/lint · `git add`/`commit` · branch/switch · `git fetch`¹ · `git stash` · allowed local merge/rebase or workstream sync · push the current branch to same-named `origin` (`--force-with-lease` only after an allowed non-program rebase)¹ · repository-scoped read-only `gh pr`/`gh run`/GET-only `gh api` · exact branch-derived PR creation¹ · verified `scripts/dev/workstream` intermediate integration¹ | write/integrate `dev`/`flow`/`master`/`main` directly · `pull` · integration from an unrelated remote base · program-branch force/rebase · plain `--force`, remote/forced branch deletion, mirror push · direct PR merge or other unscoped `gh` remote write · `git remote` mutation · `gh auth` · Git identity/attribution mutation |
 | | destructive: `rm -rf` · `reset --hard` · `clean -fdx` · unapproved history rewrite · broad `chmod`/`chown` · `sudo` · `sed -i` |
 | | containment: `docker.sock` · `--privileged` · host-net · secret/`.env` writes |
 
@@ -81,7 +80,7 @@ containment (`SECURITY.md`, `THREAT_MODEL.md`).
 - Agents may publish their current branch, open only its derived PR route, and perform only the
   verified intermediate merges above. Explicit rail maintenance requires `AGENT_LAB_MAINTENANCE=1`.
 
-Done = the scoped verified slice/group integration is complete, or the final draft PR to `dev` is
+Done = the scoped verified slice/group integration is complete, or the final PR to `dev` is
 open, plus a short handoff. Humans merge every final PR into `dev`.
 
 ---

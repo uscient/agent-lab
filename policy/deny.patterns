@@ -21,7 +21,7 @@
 (^|[^[:alnum:]_])git[[:space:]]+-c[[:space:]]+alias\.
 (^|[^[:alnum:]_])git[[:space:]]+-calias\.
 
-# --- unauthorized forge writes (the guard default-denies non-PR gh commands) ---
+# --- unauthorized forge writes (the guard admits scoped PR/Actions reads and GET-only repo API) ---
 gh[[:space:]]+pr[[:space:]]+(merge|close|edit|ready|reopen|review|comment)([[:space:]]|$)
 gh[[:space:]]+release[[:space:]]+(create|delete|edit|upload)([[:space:]]|$)
 gh[[:space:]]+api[[:space:]].*((-X|--method)[=[:space:]]*(POST|PUT|PATCH|DELETE))

@@ -99,6 +99,9 @@ git fetch origin dev
 git rebase origin/dev
 git push -u origin HEAD
 gh pr create --base dev ...
+gh pr list --repo uscient/agent-lab
+gh run list --repo uscient/agent-lab
+gh api --method GET repos/uscient/agent-lab/branches/dev
 
 # Reserved workstream and program branches:
 ./scripts/dev/workstream sync

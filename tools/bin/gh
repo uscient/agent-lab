@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PATH shim for `gh` — allows read-only PR and Actions diagnosis plus the branch-derived PR-create
-# route while blocking authentication, integration, release mutation, and other remote writes.
+# PATH shim for `gh` — allows repository-scoped PR/Actions reads, GET-only API diagnosis, and the
+# branch-derived PR-create route while blocking authentication, integration, and remote writes.
 # Verified intermediate integration is available only through scripts/dev/workstream.
 set -uo pipefail
 
@@ -50,10 +50,23 @@ args=("$@")
 n=${#args[@]}
 i=0
 sub=""
+readonly_repo="uscient/agent-lab"
 while [ "$i" -lt "$n" ]; do
   case "${args[$i]}" in
-    -R | --repo | --hostname) i=$((i + 2)); continue ;;
-    --repo=* | --hostname=* | --help | --version) i=$((i + 1)); continue ;;
+    -R | --repo)
+      [ "${args[$((i + 1))]:-}" = "$readonly_repo" ] \
+        || block "GitHub access must remain scoped to $readonly_repo"
+      i=$((i + 2)); continue ;;
+    -R?*)
+      [ "${args[$i]#-R}" = "$readonly_repo" ] \
+        || block "GitHub access must remain scoped to $readonly_repo"
+      i=$((i + 1)); continue ;;
+    --repo=*)
+      [ "${args[$i]#*=}" = "$readonly_repo" ] \
+        || block "GitHub access must remain scoped to $readonly_repo"
+      i=$((i + 1)); continue ;;
+    --hostname | --hostname=*) block "alternate GitHub hosts are forbidden" ;;
+    --help | --version) i=$((i + 1)); continue ;;
     -*) i=$((i + 1)); continue ;;
     *) sub="${args[$i]}"; break ;;
   esac
@@ -62,17 +75,24 @@ done
 case "$sub" in
   auth) block "GitHub authentication access is forbidden" ;;
   pr)
-    [ "$i" -eq 0 ] || block "GitHub PR commands must target the current repository directly"
-    for a in "${args[@]:$((i + 2))}"; do
+    j=$((i + 2))
+    while [ "$j" -lt "$n" ]; do
+      a="${args[$j]}"
       case "$a" in
-        -R | -R?* | --repo | --repo=* | --hostname | --hostname=*)
-          block "GitHub PR commands must target the current repository directly" ;;
+        -R | --repo)
+          j=$((j + 1)); [ "${args[$j]:-}" = "$readonly_repo" ] \
+            || block "GitHub PR commands must remain scoped to $readonly_repo" ;;
+        -R?*) [ "${a#-R}" = "$readonly_repo" ] \
+          || block "GitHub PR commands must remain scoped to $readonly_repo" ;;
+        --repo=*) [ "${a#*=}" = "$readonly_repo" ] \
+          || block "GitHub PR commands must remain scoped to $readonly_repo" ;;
+        --hostname | --hostname=*) block "alternate GitHub hosts are forbidden" ;;
       esac
+      j=$((j + 1))
     done
     case "${args[$((i + 1))]:-}" in
       list | view | status | checks | diff) ;;
       create)
-        [ "$i" -eq 0 ] || block "PR creation must target the current repository directly"
         branch="$("$real_git" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
         required_base="$(expected_pr_base "$branch")" \
           || block "PR creation is not authorized from branch $branch"
@@ -97,20 +117,56 @@ case "$sub" in
       *) block "PR mutation is forbidden; only reads and the derived create route are allowed" ;;
     esac ;;
   run)
-    [ "$i" -eq 0 ] || block "GitHub Actions commands must target the current repository directly"
     case "${args[$((i + 1))]:-}" in
       list | view | watch) ;;
       *) block "GitHub Actions access is read-only" ;;
     esac
-    for a in "${args[@]:$((i + 2))}"; do
+    j=$((i + 2))
+    while [ "$j" -lt "$n" ]; do
+      a="${args[$j]}"
       case "$a" in
-        -R | -R?* | --repo | --repo=* | --hostname | --hostname=*)
-          block "GitHub Actions commands must target the current repository directly" ;;
+        -R | --repo)
+          j=$((j + 1)); [ "${args[$j]:-}" = "$readonly_repo" ] \
+            || block "GitHub Actions commands must remain scoped to $readonly_repo" ;;
+        -R?*) [ "${a#-R}" = "$readonly_repo" ] \
+          || block "GitHub Actions commands must remain scoped to $readonly_repo" ;;
+        --repo=*) [ "${a#*=}" = "$readonly_repo" ] \
+          || block "GitHub Actions commands must remain scoped to $readonly_repo" ;;
+        --hostname | --hostname=*) block "alternate GitHub hosts are forbidden" ;;
       esac
+      j=$((j + 1))
     done
     ;;
+  api)
+    endpoint="" method="GET" j=$((i + 1))
+    while [ "$j" -lt "$n" ]; do
+      a="${args[$j]}"
+      case "$a" in
+        -X | --method) j=$((j + 1)); method="${args[$j]:-}" ;;
+        -X?*) method="${a#-X}" ;;
+        --method=*) method="${a#*=}" ;;
+        -f | -F | --field | --raw-field | --input | -H | --header | --hostname)
+          block "GitHub API access is GET-only" ;;
+        -f?* | -F?* | --field=* | --raw-field=* | --input=* | -H?* | --header=* | --hostname=*)
+          block "GitHub API access is GET-only" ;;
+        --paginate | --slurp | --include | --silent) ;;
+        --cache | --jq | --template)
+          j=$((j + 1)); [ "$j" -lt "$n" ] || block "GitHub API option is missing its value" ;;
+        --cache=* | --jq=* | --template=*) ;;
+        -*) block "unsupported GitHub API option" ;;
+        *) [ -z "$endpoint" ] || block "GitHub API accepts one repository endpoint"
+           endpoint="${a#/}" ;;
+      esac
+      j=$((j + 1))
+    done
+    [ "${method^^}" = GET ] || block "GitHub API access is GET-only"
+    case "$endpoint" in
+      repos/uscient/agent-lab | repos/uscient/agent-lab/* | repos/uscient/agent-lab\?*) ;;
+      *) block "GitHub API access must remain scoped to $readonly_repo" ;;
+    esac
+    ;;
   "" | help | version) ;;
-  *) block "GitHub access is limited to the scoped PR and read-only Actions workflow" ;;
+  *) block "GitHub access is limited to scoped PR/Actions reads and GET-only repository API reads" ;;
 esac
 
 exec "$real" "$@"
