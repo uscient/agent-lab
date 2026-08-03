@@ -221,12 +221,165 @@ strip_literal_cat_heredoc_data() {
   fi
 }
 
+# Recognize a narrowly constrained Python file writer without treating its literal document body as
+# shell operations. Python code is accepted only when its AST contains literal assignments plus one
+# or more open(...).write(...) calls with literal targets and content. Dynamic targets, imports,
+# subprocesses, extra statements, malformed heredocs, and commands after the delimiter fail closed.
+classify_literal_python_writer() {
+  local s="$1" targets="" rc=0 target resolved
+  [[ "$s" =~ ^[[:space:]]*python3([[:space:]]|$) ]] || return 1
+  [ "$(command -v python3 2>/dev/null || true)" = /usr/bin/python3 ] && [ -x /usr/bin/python3 ] \
+    || block "Python file-write command does not resolve to the trusted system interpreter" "Autonomy boundary"
+  targets="$(
+    printf '%s' "$s" | /usr/bin/python3 -I -S -c '
+import ast
+import re
+import sys
+
+raw = sys.stdin.read()
+
+def extract_code(text):
+    command = re.fullmatch(r"\s*python3\s+-c\s+\x27([^\x27]*)\x27\s*", text, re.DOTALL)
+    if command:
+        return command.group(1), True, True
+
+    lines = text.splitlines()
+    if not lines:
+        return "", False, False
+    match = re.fullmatch(
+        r"\s*python3(?:\s+-)?\s+<<\s*([\x27\x22])([A-Za-z_][A-Za-z0-9_]*)\1\s*",
+        lines[0],
+    )
+    if not match:
+        return "", False, False
+    delimiter = match.group(2)
+    for index, line in enumerate(lines[1:], 1):
+        if line == delimiter:
+            trailing = lines[index + 1:]
+            if any(item.strip() for item in trailing):
+                return "\n".join(lines[1:index]), True, False
+            return "\n".join(lines[1:index]), True, True
+    return "\n".join(lines[1:]), True, False
+
+code, python_shape, complete = extract_code(raw)
+if not python_shape:
+    raise SystemExit(3)
+if not complete:
+    raise SystemExit(2)
+
+try:
+    tree = ast.parse(code)
+except SyntaxError:
+    raise SystemExit(2 if ".write" in code else 3)
+
+write_like = any(
+    isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr in {"write", "write_text", "write_bytes"}
+    for node in ast.walk(tree)
+)
+if not write_like:
+    raise SystemExit(3)
+
+bindings = {}
+targets = []
+
+def literal(node):
+    if isinstance(node, ast.Name) and node.id in bindings:
+        return bindings[node.id]
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError):
+        raise SystemExit(2)
+
+def validate_content(node):
+    value = literal(node)
+    if not isinstance(value, (str, bytes)):
+        raise SystemExit(2)
+
+def validate_open_write(call):
+    if len(call.args) != 1 or call.keywords:
+        raise SystemExit(2)
+    validate_content(call.args[0])
+    opener = call.func.value
+    if not isinstance(opener, ast.Call) or not isinstance(opener.func, ast.Name) or opener.func.id != "open":
+        raise SystemExit(2)
+    if not 1 <= len(opener.args) <= 2:
+        raise SystemExit(2)
+    target = literal(opener.args[0])
+    mode = literal(opener.args[1]) if len(opener.args) == 2 else None
+    if not isinstance(target, str) or mode not in {"w", "a", "x", "wb", "ab", "xb"}:
+        raise SystemExit(2)
+    for keyword in opener.keywords:
+        if keyword.arg not in {"encoding", "errors", "newline"}:
+            raise SystemExit(2)
+        literal(keyword.value)
+    targets.append(target)
+
+for statement in tree.body:
+    if isinstance(statement, ast.Assign):
+        if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+            raise SystemExit(2)
+        value = literal(statement.value)
+        if not isinstance(value, (str, bytes)):
+            raise SystemExit(2)
+        bindings[statement.targets[0].id] = value
+        continue
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
+        continue
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        call = statement.value
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "write":
+            validate_open_write(call)
+            continue
+    raise SystemExit(2)
+
+if not targets:
+    raise SystemExit(2)
+for target in targets:
+    if not target or any(char in target for char in "\x00\r\n"):
+        raise SystemExit(2)
+    print(target)
+' 2>/dev/null
+  )" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) return 1 ;;
+    *) block "Python file-write command is dynamic, compound, or cannot be classified safely" "Autonomy boundary" ;;
+  esac
+  [ -n "$targets" ] || return 1
+  while IFS= read -r target || [ -n "$target" ]; do
+    case "$target" in
+      /*) resolved="$(readlink -m -- "$target" 2>/dev/null || true)" ;;
+      *) resolved="$(readlink -m -- "$root/$target" 2>/dev/null || true)" ;;
+    esac
+    [ -n "$resolved" ] \
+      || block "Python file-write target cannot be resolved safely" "Autonomy boundary"
+    case "$resolved" in
+      */.git | */.git/*)
+        block "Python file-write target resolves to Git metadata or control files" "Prime directives"
+        ;;
+      "$root"/*) ;;
+      *) block "literal Python file writes are limited to the repository working tree" "Autonomy boundary" ;;
+    esac
+    if path_is_secret "$resolved" || path_is_auth_material "$resolved"; then
+      block "Python file-write target resolves to secret, credential, authentication, or Git configuration material" "Autonomy boundary"
+    fi
+    if [ "$maint" != 1 ] && path_is_protected "$resolved"; then
+      block "Python file-write target resolves to a protected rail — set AGENT_LAB_MAINTENANCE=1 for sanctioned maintenance" "Authority"
+    fi
+  done <<< "$targets"
+  scan="python3 validated-literal-file-write"
+  return 0
+}
+
 # scan = hay with safe message-flag DATA removed. The quoted literal argument of -m / --message / -F
 # is message text, not an operation, so it must not be matched as one. Strip it ONLY when it is a
 # plain quoted literal with no command substitution / expansion ($(  `  ${ ) — so anything that can
 # execute stays fully matched. -c (e.g. `sh -c "git push"`) is NOT a message flag and is never stripped.
 scan="$hay"
 strip_literal_cat_heredoc_data "$hay"
+classify_literal_python_writer "$hay" || true
 case "$scan" in
   *-m* | *-F*)
     scan="$(printf '%s' "$scan" | sed -E "s/(--message|-m|-F)[[:space:]]*'[^'\$\`]*'/\1 /g")"
