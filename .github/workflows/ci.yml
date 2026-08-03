@@ -9,6 +9,7 @@ on:
   push:
     branches: [dev, flow, master, main]
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     branches: [dev, flow, master, main, 'work/**', 'group/**']
   merge_group:
     types: [checks_requested]
@@ -82,6 +83,89 @@ jobs:
             exit 1
           }
 
+      - name: Validate pull request evidence
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          evidence_state="$(mktemp -d)"
+          trap 'find "$evidence_state" -depth -delete >/dev/null 2>&1 || true' EXIT
+          body="$evidence_state/body"
+          old_body="$evidence_state/old-body"
+          if ! python3 - "$GITHUB_EVENT_PATH" "$body" "$old_body" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          event_path = pathlib.Path(sys.argv[1])
+          body_path = pathlib.Path(sys.argv[2])
+          old_body_path = pathlib.Path(sys.argv[3])
+          try:
+              payload = json.loads(event_path.read_text(encoding="utf-8"))
+              body = payload["pull_request"]["body"]
+              if not isinstance(body, str):
+                  raise TypeError("pull request body is not text")
+              body_path.write_text(body, encoding="utf-8")
+              prior_body = payload.get("changes", {}).get("body", {}).get("from")
+              if prior_body is not None:
+                  if not isinstance(prior_body, str):
+                      raise TypeError("prior pull request body is not text")
+                  old_body_path.write_text(prior_body, encoding="utf-8")
+          except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+              print(f"INFRA cannot read pull request evidence: {error}", file=sys.stderr)
+              raise SystemExit(125)
+          PY
+          then
+            exit 125
+          fi
+
+          if [ -f "$old_body" ]; then
+            ./scripts/dev/workflow-check evidence-append "$old_body" "$body"
+          fi
+
+          evidence_mode=pr-body
+          case "$PR_BASE_REF" in
+            flow | group/* | work/*) evidence_mode=pr-body-strict ;;
+          esac
+          case "$PR_HEAD_REF" in
+            flow | group/* | slice/group/*) evidence_mode=pr-body-strict ;;
+          esac
+
+          if [ "$evidence_mode" != pr-body-strict ]; then
+            policy_file="$evidence_state/protected.paths"
+            changed_file="$evidence_state/changed.paths"
+            if ! GIT_NO_REPLACE_OBJECTS=1 git show \
+              "$PR_BASE_SHA:policy/protected.paths" > "$policy_file" ||
+               ! GIT_NO_REPLACE_OBJECTS=1 git diff --name-only -z \
+              "$PR_BASE_SHA" "$PR_HEAD_SHA" -- > "$changed_file"; then
+              printf '::error title=Evidence applicability unknown::cannot classify changed paths\n'
+              exit 125
+            fi
+            is_protected_path() {
+              local changed="$1" entry
+              while IFS= read -r entry; do
+                case "$entry" in '' | \#*) continue ;; esac
+                case "$entry" in
+                  */) [[ "$changed" == "$entry"* ]] && return 0 ;;
+                  *) [ "$changed" = "$entry" ] && return 0 ;;
+                esac
+              done < "$policy_file"
+              return 1
+            }
+            while IFS= read -r -d '' changed; do
+              if is_protected_path "$changed"; then
+                evidence_mode=pr-body-strict
+                break
+              fi
+            done < "$changed_file"
+          fi
+
+          ./scripts/dev/workflow-check "$evidence_mode" "$body" \
+            "$PR_BASE_SHA" "$PR_HEAD_SHA" "$PR_HEAD_REF" "$PR_BASE_REF"
+
       - name: Resolve committed diff base
         id: diff-base
         env:
@@ -92,6 +176,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           EXPECTED_HEAD_SHA: ${{ github.sha }}
+          FLOW_R0_SHA: 9ef827c1b0c947babd90ed251deefcd50c04947c
         run: |
           sha_pattern='^([0-9a-f]{40}|[0-9a-f]{64})$'
           head="$(git rev-parse HEAD)"
@@ -113,11 +198,22 @@ jobs:
                   exit 125
                 fi
                 dev_head="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'origin/dev^{commit}')"
+                if [[ ! "$FLOW_R0_SHA" =~ $sha_pattern ]] ||
+                   [[ "$FLOW_R0_SHA" =~ ^0+$ ]] ||
+                   ! GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify \
+                     "${FLOW_R0_SHA}^{commit}" >/dev/null; then
+                  printf '::error title=Missing bootstrap authority::recorded R0 commit is unavailable\n'
+                  exit 125
+                fi
+                if ! GIT_NO_REPLACE_OBJECTS=1 git merge-base --is-ancestor "$FLOW_R0_SHA" "$dev_head"; then
+                  printf '::error title=Invalid bootstrap authority::current origin/dev does not contain R0\n'
+                  exit 125
+                fi
                 if [ "$REF_NAME" = flow ] && [ "$PUSH_AFTER_SHA" = "$head" ] &&
                    [ "$head" = "$dev_head" ]; then
                   base="$head"
                 else
-                  printf '::error title=Invalid branch creation::flow bootstrap must equal current origin/dev\n'
+                  printf '::error title=Invalid branch creation::flow bootstrap closure must equal current origin/dev\n'
                   exit 125
                 fi
               else

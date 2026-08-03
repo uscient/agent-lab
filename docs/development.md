@@ -58,8 +58,10 @@ For each writable branch:
 7. Preserve merge commits, branches, PR records, and evidence through final review. Humans merge every
    ordinary, workstream, or `flow` final PR into `dev`.
 
-The R0 maintenance PR must land in `dev` before `flow` exists. A human creates and protects `flow` at
-that exact R0-updated `dev` SHA, then installs current-head CI, CodeQL, review, retention, and merge
+The R0 maintenance PR must land in `dev` before `flow` exists. After all pre-bootstrap closure work
+lands, a human freezes `dev` integration and records the exact bootstrap-closure `dev` commit. That
+commit must contain immutable R0, and the human creates and protects `flow` at that exact SHA before
+another `dev` merge. The human then installs current-head CI, CodeQL, review, retention, and merge
 rules before program work begins. See [Agent-managed workstreams and programs](workstreams.md) for
 commands and the hosted-rules checklist.
 
@@ -83,9 +85,15 @@ merge boilerplate, branch reference, or generic update text. Plain imperative su
 Conventional Commit subjects are both valid. Do not add additional attribution trailers.
 
 Pull requests use the branch-derived base and an outcome-focused title under the same subject rules.
-The body keeps the template sections `Summary`, `Motivation / Context`, `Changes`, and `Testing` in
-that order. Testing entries name an exact command in backticks and its observed result. If no command
-ran, write `Not run — reason`. Check or remove every template checklist item before validation.
+The body keeps the template sections `Summary`, `Motivation / Context`, `Changes`, `Testing`, and
+`Evidence` in that order. Testing entries name an exact command in backticks and its observed result.
+If no command ran, write `Not run — reason`. The evidence section is an append-only sequence of the
+template's exact `Cycle` records. Each cycle binds the route, exact 40-hex base and head, behavior and
+security assertions, exact RED predecessor, RED/GREEN results, product and CI mutations, runner,
+duration, cleanup, artifacts, and uncertainty. Use `N/A — reason` only when a field genuinely does
+not apply. Program routes and protected-rail changes use strict validation and cannot waive the RED
+predecessor, RED, GREEN, or either mutation. Check or remove every template checklist item before
+validation.
 
 Run the local convention checks from the repository root:
 
@@ -96,12 +104,16 @@ Run the local convention checks from the repository root:
 ./scripts/dev/workflow-check pr-title 'Describe the pull request outcome'
 ./scripts/dev/workflow-check pr-base dev
 ./scripts/dev/workflow-check pr-route group/g0-operator-surface flow
-./scripts/dev/workflow-check pr-body .cache/dev/pr-body.md
+./scripts/dev/workflow-check pr-body .cache/dev/pr-body.md BASE_SHA HEAD_SHA HEAD_REF BASE_REF
+./scripts/dev/workflow-check evidence-append .cache/dev/old-body.md .cache/dev/pr-body.md
 ./scripts/dev/workflow-check all
 ```
 
 `commits` and `all` derive `origin/dev`, `origin/flow`, or the matching remote parent from the current
-branch. If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
+branch. `pr-body` validates the latest evidence cycle against the supplied current PR base, head, and
+route; CI supplies those identities from the event, and the intermediate merge helper rechecks them
+before integration. `evidence-append` proves every prior nonblank evidence line remains an exact
+prefix. If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
 the range to hide introduced commits. `all` checks only the branch and every introduced non-merge
 commit. Run the applicable `pr-*` commands separately; `pr-base` derives the expected base from the
 current branch, while `pr-route` can check an explicit head/base pair. The fast gate exercises this
