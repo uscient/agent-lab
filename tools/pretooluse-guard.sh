@@ -213,20 +213,79 @@ load_branch() {
   [ -n "$branch" ] && return 0
   branch="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
 }
-is_work_branch() {
+valid_group() {
+  [ "${#1}" -le 48 ] && [[ "$1" =~ ^[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$ ]]
+}
+is_writable_branch() {
   load_branch
-  case "$branch" in dev | master | main | DETACHED) return 1 ;; *) return 0 ;; esac
+  case "$branch" in
+    work/*) [[ "$branch" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] ;;
+    group/*) valid_group "${branch#group/}" ;;
+    slice/group/*/*)
+      [[ "$branch" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] &&
+        valid_group "${BASH_REMATCH[1]}"
+      ;;
+    slice/*/*)
+      [[ "$branch" =~ ^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$ ]]
+      ;;
+    slice/* | dev | flow | master | main | DETACHED) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+expected_rebase_target() {
+  load_branch
+  case "$branch" in
+    work/* | group/* | slice/group/*/*) return 1 ;;
+    slice/*/*)
+      [[ "$branch" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'origin/work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | flow | master | main | DETACHED) return 1 ;;
+    *) printf 'origin/dev\n' ;;
+  esac
+}
+
+expected_pr_base() {
+  local group=""
+  load_branch
+  case "$branch" in
+    flow) printf 'dev\n' ;;
+    work/*)
+      [[ "$branch" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] || return 1
+      printf 'dev\n'
+      ;;
+    group/*)
+      valid_group "${branch#group/}" || return 1
+      printf 'flow\n'
+      ;;
+    slice/group/*/*)
+      [[ "$branch" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      group="${BASH_REMATCH[1]}"
+      valid_group "$group" || return 1
+      printf 'group/%s\n' "$group"
+      ;;
+    slice/*/*)
+      [[ "$branch" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | master | main | DETACHED) return 1 ;;
+    *) printf 'dev\n' ;;
+  esac
 }
 
 validate_push() {
-  local words=() arg positional=()
+  local words=() arg positional=() lease=0
   read -r -a words <<<"$scan"
   [ "${words[0]:-}" = git ] && [ "${words[1]:-}" = push ] || return 1
-  is_work_branch || return 1
+  is_writable_branch || return 1
   for arg in "${words[@]:2}"; do
     case "$arg" in
       -u | --set-upstream | --porcelain | --progress | --no-progress | --no-verify) ;;
-      --force-with-lease) ;;
+      --force-with-lease) lease=1 ;;
       --force-with-lease=* | --force | -f | --mirror | --delete | -d) return 1 ;;
       -*) return 1 ;;
       *) positional+=("$arg") ;;
@@ -235,11 +294,14 @@ validate_push() {
   [ "${#positional[@]}" -eq 2 ] || return 1
   [ "${positional[0]}" = origin ] || return 1
   [ "${positional[1]}" = HEAD ] || [ "${positional[1]}" = "$branch" ] || return 1
+  case "$branch" in
+    work/* | group/* | slice/group/*/*) [ "$lease" -eq 0 ] || return 1 ;;
+  esac
   return 0
 }
 
 validate_gh() {
-  local words=() sub arg i base="" head=""
+  local words=() sub arg i base="" head="" required_base=""
   read -r -a words <<<"$scan"
   [ "${words[0]:-}" = gh ] || return 1
   if [ "${words[1]:-}" = run ]; then
@@ -259,7 +321,8 @@ validate_gh() {
     create) ;;
     *) return 1 ;;
   esac
-  is_work_branch || return 1
+  load_branch
+  required_base="$(expected_pr_base)" || return 1
   i=3
   while [ "$i" -lt "${#words[@]}" ]; do
     arg="${words[$i]}"
@@ -271,8 +334,17 @@ validate_gh() {
     esac
     i=$((i + 1))
   done
-  [ "$base" = dev ] || return 1
+  [ "$base" = "$required_base" ] || return 1
   [ -z "$head" ] || [ "$head" = "$branch" ] || return 1
+}
+
+validate_remote_rebase() {
+  local words=() expected=""
+  read -r -a words <<<"$scan"
+  [ "${#words[@]}" -eq 3 ] || return 1
+  [ "${words[0]}" = git ] && [ "${words[1]}" = rebase ] || return 1
+  expected="$(expected_rebase_target)" || return 1
+  [ "${words[2]}" = "$expected" ]
 }
 
 # is_nonexecuting_search_data <command>: true only for a single rg invocation whose
@@ -322,25 +394,42 @@ unsafe_protected_write_redirect() {
 }
 
 git_push_re='(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+push([^[:alnum:]_]|$)'
+git_alt_context_mutation_re='(^|[^[:alnum:]_])git[[:space:]]+(-C([[:space:]]+[^[:space:]]+|[^[:space:]]+)|--(git-dir|work-tree)(=|[[:space:]]+)[^[:space:]]+).*[[:space:]](commit|merge|rebase|push)([^[:alnum:]_]|$)'
 git_remote_rebase_re='(^|[^[:alnum:]_])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[^[:alnum:]_]+rebase([^[:alnum:]_]|$).*((origin|upstream)/|refs/remotes/)'
-origin_dev_re='^[[:space:]]*git[[:space:]]+rebase[[:space:]]+origin/dev[[:space:]]*$'
+git_integration_re='(^|[^[:alnum:]_])git([[:space:]]+[^[:space:]]+)*[[:space:]]+(merge|rebase)([^[:alnum:]_]|$)'
+git_slice_merge_re="(^|[^[:alnum:]_])git[[:space:]]+merge[[:space:]]+([^[:space:]]+[[:space:]]+)*[\"']?slice/"
 gh_command_re='(^|[^[:alnum:]_./-])gh([^[:alnum:]_./-]|$)|(^|[;&|][[:space:]]*)/[^[:space:]]*/gh([[:space:]]|$)'
 credential_path_re="(^|[[:space:]\"'=])(~?/)?(\\.gitconfig([^[:alnum:]]|$)|\\.config/(git|gh)/|\\.ssh/|\\.netrc([^[:alnum:]]|$))"
 token_env_re='(^|[^[:alnum:]_])(GH_TOKEN|GITHUB_TOKEN|GIT_ASKPASS|SSH_AUTH_SOCK)([^[:alnum:]_]|$)'
 bulk_env_re='^[[:space:]]*(printenv|env|set)[[:space:]]*$'
 mutating_rail_re='(^|[[:space:]])(tee|rm|mv|cp|ln|truncate|install)[[:space:]]|sed[[:space:]]+-i'
 
+if matches_line "$scan" "$git_alt_context_mutation_re"; then
+  block "Git mutations through an alternate worktree or Git directory are forbidden" "Autonomy boundary"
+fi
 if matches_line "$scan" "$git_push_re"; then
   validate_push || block "push is limited to the current non-protected branch on origin; plain force, deletion, mirrors, and protected targets are forbidden" "Autonomy boundary"
 fi
 if matches_line "$scan" "$git_remote_rebase_re"; then
-  if ! { is_work_branch && matches_line "$scan" "$origin_dev_re"; }; then
-    block "remote rebase is limited to rebasing the current work branch on origin/dev" "Autonomy boundary"
-  fi
+  validate_remote_rebase \
+    || block "remote rebase must use the exact base derived from the current branch" "Autonomy boundary"
 fi
+if matches_line "$scan" "$git_integration_re"; then
+  load_branch
+  case "$branch" in
+    dev | flow | master | main | DETACHED)
+      block "merge and rebase on a protected branch or detached HEAD are forbidden" "Autonomy boundary"
+      ;;
+    work/* | group/* | slice/group/*/*)
+      block "integration branch history is helper-managed; use scripts/dev/workstream sync or merge" "Autonomy boundary"
+      ;;
+  esac
+fi
+matches_line "$scan" "$git_slice_merge_re" \
+  && block "slice integration is permitted only through the verified workstream helper" "Autonomy boundary"
 if matches_line "$shell_scan" "$gh_command_re" \
   && ! is_nonexecuting_search_data "$scan"; then
-  validate_gh || block "GitHub access is limited to direct read-only PR/Actions commands and creating the current work branch PR with explicit base dev" "Autonomy boundary"
+  validate_gh || block "GitHub access is limited to direct read-only PR/Actions commands and the exact PR route derived from the current branch" "Autonomy boundary"
 fi
 
 match_any "$scan" "$pol/deny.patterns" \
@@ -383,14 +472,13 @@ if [ "$maint" != 1 ]; then
   fi
 fi
 
-# 5) branch backstop: never commit on dev/master/main (covers a skipped SessionStart bootstrap)
+# 5) branch backstop: never commit on protected branches (covers a skipped SessionStart bootstrap)
 git_commit_re='(^|[^[:alnum:]_])git([[:space:]]+[^[:space:]]+)*[[:space:]]+commit([^[:alnum:]_]|$)'
 if matches_line "$scan" "$git_commit_re"; then
   load_branch
   br="$branch"
-  case "$br" in
-    dev | master | main | DETACHED) block "refusing to commit on protected or detached branch '$br' — create a work branch from dev first (SessionStart normally does this)" "Prime directives" ;;
-  esac
+  is_writable_branch \
+    || block "refusing to commit on protected, detached, or invalid reserved branch '$br'" "Prime directives"
 fi
 
 exit 0

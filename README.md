@@ -193,8 +193,10 @@ to diagnose, not permission to bypass the control.
 
 ## Contributing, security, and license
 
-External pull requests and issues are not accepted. Organization members follow `AGENTS.md`, work on
-a branch from `dev`, and use human-reviewed pull requests to integrate changes.
+External pull requests and issues are not accepted. Organization members follow `AGENTS.md` and the
+[branch-derived integration workflow](docs/development.md#branch-and-integration-workflow). `dev`
+remains authoritative; `flow` is a protected program-integration branch, verified intermediate
+merges use the workstream helper, and humans own every final merge into `dev`.
 
 Organization members report suspected boundary bypasses or secret exposure through the private
 channel described in [SECURITY.md](SECURITY.md). This mirror publishes no external intake; never put

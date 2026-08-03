@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# agent-lab SessionStart hook: never work on dev/master/main. Idempotent; never blocks the session.
+# agent-lab SessionStart hook: never write protected branches. Idempotent; never blocks the session.
 # Usage (from each tool's SessionStart hook):  tools/session-bootstrap.sh <tool>   # claude|codex|grok
-# If HEAD is dev/master/main/detached, create agent/<tool>/<slug> from origin/dev (or local dev);
-# otherwise no-op.
+# If HEAD is dev/master/main/detached, create agent/<tool>/<slug> from origin/dev (or local dev).
+# A flow checkout remains read-only so the final PR can be inspected or opened deliberately.
 #   slug = ${AGENT_LAB_TASK_SLUG:-<UTC timestamp>}, sanitized to a valid ref component.
 set -uo pipefail
 
@@ -12,6 +12,9 @@ cd "$root" || exit 0
 
 branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
 case "$branch" in
+  flow)
+    echo "agent-lab: flow is protected and remains read-only; use a group/slice branch for changes" >&2
+    ;;
   dev | master | main | DETACHED)
     slug="${AGENT_LAB_TASK_SLUG:-$(date -u +%Y%m%d-%H%M%S)}"
     slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/[-.]+$//')"

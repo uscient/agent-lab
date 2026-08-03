@@ -2,14 +2,18 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+cd "$repo_root"
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
   scripts/dev/workstream start SLUG
+  scripts/dev/workstream group NAME
   scripts/dev/workstream slice NAME
+  scripts/dev/workstream sync
   scripts/dev/workstream pr [gh-pr-create options]
   scripts/dev/workstream merge PR_NUMBER
+  scripts/dev/workstream group-pr [gh-pr-create options]
   scripts/dev/workstream final [gh-pr-create options]
 EOF
   exit 2
@@ -22,20 +26,36 @@ valid_component() {
   [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]
 }
 
+valid_group() {
+  valid_component "$1" && [[ "$1" =~ ^[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$ ]]
+}
+
+real_git=""
 real_gh=""
-shim="$(readlink -f "$repo_root/tools/bin/gh" 2>/dev/null || true)"
-while IFS= read -r candidate; do
-  resolved="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
-  [ "$resolved" = "$shim" ] && continue
-  real_gh="$candidate"
-  break
-done < <(type -aP gh 2>/dev/null)
-[ -n "$real_gh" ] || die "gh is unavailable"
-command -v jq >/dev/null 2>&1 || die "jq is unavailable"
+real_jq=""
+for candidate in /usr/bin/git /usr/local/bin/git /bin/git; do
+  [ -x "$candidate" ] && { real_git="$candidate"; break; }
+done
+for candidate in /usr/bin/gh /usr/local/bin/gh; do
+  [ -x "$candidate" ] && { real_gh="$candidate"; break; }
+done
+for candidate in /usr/bin/jq /usr/local/bin/jq /bin/jq; do
+  [ -x "$candidate" ] && { real_jq="$candidate"; break; }
+done
+[ -n "$real_git" ] || die "git is unavailable from a trusted system path"
+[ -n "$real_gh" ] || die "gh is unavailable from a trusted system path"
+[ -n "$real_jq" ] || die "jq is unavailable from a trusted system path"
+repository="uscient/agent-lab"
+repository_target="github.com/$repository"
 
 current_branch() {
-  git -C "$repo_root" symbolic-ref --short -q HEAD 2>/dev/null \
+  "$real_git" -C "$repo_root" symbolic-ref --short -q HEAD 2>/dev/null \
     || die "the checkout is detached"
+}
+
+require_clean() {
+  [ -z "$("$real_git" -C "$repo_root" status --porcelain)" ] \
+    || refuse "the tracked checkout is not clean"
 }
 
 reject_routing_options() {
@@ -59,18 +79,29 @@ case "$command_name" in
     [ "$#" -eq 1 ] || usage
     slug="$1"
     valid_component "$slug" || refuse "invalid workstream slug: $slug"
-    [ -z "$(git -C "$repo_root" status --porcelain)" ] || refuse "the tracked checkout is not clean"
-    git -C "$repo_root" fetch origin dev
-    dev_sha="$(git -C "$repo_root" rev-parse --verify origin/dev)" \
+    require_clean
+    "$real_git" -C "$repo_root" fetch origin dev
+    dev_sha="$("$real_git" -C "$repo_root" rev-parse --verify origin/dev)" \
       || die "origin/dev is unavailable"
-    repository="$($real_gh repo view --json nameWithOwner --jq .nameWithOwner)" \
-      || die "cannot resolve the current GitHub repository"
-    [ -n "$repository" ] || die "GitHub returned an empty repository identity"
-    "$real_gh" api --method POST "repos/$repository/git/refs" \
+    "$real_gh" api "repos/$repository/git/refs" --hostname github.com --method POST \
       -f "ref=refs/heads/work/$slug" -f "sha=$dev_sha" >/dev/null \
       || die "cannot create work/$slug at origin/dev"
-    git -C "$repo_root" fetch origin "work/$slug"
-    git -C "$repo_root" switch -c "work/$slug" --track "origin/work/$slug"
+    "$real_git" -C "$repo_root" fetch origin "work/$slug"
+    "$real_git" -C "$repo_root" switch -c "work/$slug" --track "origin/work/$slug"
+    ;;
+  group)
+    [ "$#" -eq 1 ] || usage
+    group="$1"
+    valid_group "$group" || refuse "invalid group name: $group"
+    require_clean
+    "$real_git" -C "$repo_root" fetch origin flow
+    flow_sha="$("$real_git" -C "$repo_root" rev-parse --verify origin/flow)" \
+      || die "origin/flow is unavailable"
+    "$real_gh" api "repos/$repository/git/refs" --hostname github.com --method POST \
+      -f "ref=refs/heads/group/$group" -f "sha=$flow_sha" >/dev/null \
+      || die "cannot create group/$group at origin/flow"
+    "$real_git" -C "$repo_root" fetch origin "group/$group"
+    "$real_git" -C "$repo_root" switch -c "group/$group" --track "origin/group/$group"
     ;;
   slice)
     [ "$#" -eq 1 ] || usage
@@ -78,65 +109,209 @@ case "$command_name" in
     valid_component "$name" || refuse "invalid slice name: $name"
     branch="$(current_branch)"
     case "$branch" in
-      work/*) slug="${branch#work/}" ;;
-      *) refuse "slice creation requires the matching work/<slug> branch" ;;
+      work/*)
+        slug="${branch#work/}"
+        valid_component "$slug" || refuse "invalid current workstream branch"
+        base="work/$slug"
+        slice_branch="slice/$slug/$name"
+        ;;
+      group/*)
+        group="${branch#group/}"
+        valid_group "$group" || refuse "invalid current group branch"
+        base="group/$group"
+        slice_branch="slice/group/$group/$name"
+        ;;
+      *) refuse "slice creation requires a work/<slug> or group/<id>-<slug> branch" ;;
     esac
-    valid_component "$slug" || refuse "invalid current workstream branch"
-    [ -z "$(git -C "$repo_root" status --porcelain)" ] || refuse "the tracked checkout is not clean"
-    git -C "$repo_root" fetch origin "work/$slug"
-    git -C "$repo_root" switch -c "slice/$slug/$name" "origin/work/$slug"
+    require_clean
+    "$real_git" -C "$repo_root" fetch origin "$base"
+    "$real_git" -C "$repo_root" merge --ff-only "origin/$base" \
+      || refuse "$branch diverged from its integration ref; refusing to rewrite accepted history"
+    "$real_git" -C "$repo_root" switch -c "$slice_branch" "origin/$base"
+    ;;
+  sync)
+    [ "$#" -eq 0 ] || usage
+    require_clean
+    branch="$(current_branch)"
+    case "$branch" in
+      work/*)
+        slug="${branch#work/}"
+        valid_component "$slug" || refuse "invalid current workstream branch"
+        base="dev"
+        sync_mode="merge"
+        ;;
+      group/*)
+        group="${branch#group/}"
+        valid_group "$group" || refuse "invalid current group branch"
+        base="flow"
+        sync_mode="merge"
+        ;;
+      slice/group/*/*)
+        remainder="${branch#slice/group/}"
+        group="${remainder%%/*}"
+        name="${remainder#*/}"
+        valid_group "$group" && valid_component "$name" \
+          || refuse "invalid group slice branch"
+        base="group/$group"
+        sync_mode="merge"
+        ;;
+      slice/*/*)
+        remainder="${branch#slice/}"
+        slug="${remainder%%/*}"
+        name="${remainder#*/}"
+        valid_component "$slug" && valid_component "$name" \
+          || refuse "invalid workstream slice branch"
+        base="work/$slug"
+        sync_mode="rebase"
+        ;;
+      *) refuse "sync requires a workstream, group, or matching slice branch" ;;
+    esac
+    if [[ "$branch" == group/* || "$branch" == work/* ]]; then
+      "$real_git" -C "$repo_root" fetch origin "$branch" "$base"
+      "$real_git" -C "$repo_root" merge --ff-only "origin/$branch" \
+        || refuse "$branch diverged from its integration ref; refusing to rewrite accepted history"
+    else
+      "$real_git" -C "$repo_root" fetch origin "$base"
+    fi
+    case "$sync_mode" in
+      merge)
+        "$real_git" -C "$repo_root" merge --no-ff --no-edit "origin/$base"
+        ;;
+      rebase) "$real_git" -C "$repo_root" rebase "origin/$base" ;;
+    esac
     ;;
   pr)
     reject_routing_options "$@"
     branch="$(current_branch)"
     case "$branch" in
+      slice/group/*/*)
+        remainder="${branch#slice/group/}"
+        group="${remainder%%/*}"
+        name="${remainder#*/}"
+        valid_group "$group" && valid_component "$name" \
+          || refuse "invalid group slice branch"
+        base="group/$group"
+        ;;
       slice/*/*)
         remainder="${branch#slice/}"
         slug="${remainder%%/*}"
         name="${remainder#*/}"
+        valid_component "$slug" && valid_component "$name" \
+          || refuse "invalid workstream slice branch"
+        base="work/$slug"
         ;;
-      *) refuse "slice PR creation requires slice/<slug>/<name>" ;;
+      *) refuse "slice PR creation requires a matching slice branch" ;;
     esac
-    valid_component "$slug" && valid_component "$name" \
-      || refuse "invalid slice branch"
-    exec "$real_gh" pr create --base "work/$slug" --head "$branch" "$@"
+    exec "$real_gh" pr create --repo "$repository_target" --base "$base" --head "$branch" "$@"
     ;;
   merge)
     [ "$#" -eq 1 ] || usage
     pr_number="$1"
     [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || refuse "PR number must be a positive integer"
+    branch="$(current_branch)"
+    case "$branch" in
+      work/*) valid_component "${branch#work/}" || refuse "invalid current workstream branch" ;;
+      group/*) valid_group "${branch#group/}" || refuse "invalid current group branch" ;;
+      flow) ;;
+      *) refuse "merge requires a work/<slug>, group/<id>-<slug>, or flow integration branch" ;;
+    esac
+    require_clean
     metadata="$($real_gh pr view "$pr_number" \
-      --json number,state,isDraft,baseRefName,headRefName,headRefOid,mergeStateStatus,reviewDecision,statusCheckRollup)" \
+      --repo "$repository_target" \
+      --json number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository,mergeStateStatus,reviewDecision,statusCheckRollup)" \
       || die "cannot read PR $pr_number"
-    if ! printf '%s' "$metadata" | jq -e '
-      .state == "OPEN" and
+    if ! printf '%s' "$metadata" | "$real_jq" -e \
+      --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" '
+      (.number == $number) and
+      (.state == "OPEN") and
       (.isDraft == false) and
-      (.baseRefName | test("^work/[a-z0-9][a-z0-9-]{0,47}$")) and
-      (.headRefName | test("^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$")) and
-      ((.baseRefName | sub("^work/"; "")) ==
-       (.headRefName | capture("^slice/(?<slug>[^/]+)/").slug)) and
+      (.isCrossRepository == false) and
+      (.headRepository.nameWithOwner == $repository) and
+      (.baseRefName == $branch) and
+      (((.baseRefName | test("^work/[a-z0-9][a-z0-9-]{0,47}$")) and
+        (.headRefName | test("^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$")) and
+        ((.baseRefName | sub("^work/"; "")) ==
+         (.headRefName | capture("^slice/(?<slug>[^/]+)/").slug))) or
+       ((.baseRefName | test("^group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$")) and
+        (.headRefName | test("^slice/group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]{0,47}$")) and
+        ((.baseRefName | sub("^group/"; "")) ==
+         (.headRefName | capture("^slice/group/(?<group>[^/]+)/").group))) or
+       ((.baseRefName == "flow") and
+        (.headRefName | test("^group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$")) and
+        ((.headRefName | sub("^group/"; "") | length) <= 48))) and
+      (.baseRefOid | test("^[0-9a-f]{40}$")) and
       (.headRefOid | test("^[0-9a-f]{40}$")) and
       (.mergeStateStatus == "CLEAN") and
-      (.reviewDecision != "CHANGES_REQUESTED") and
+      (.reviewDecision == "APPROVED") and
       ((.statusCheckRollup | length) > 0) and
-      (any(.statusCheckRollup[]; .name == "Required gates" and
-        .status == "COMPLETED" and .conclusion == "SUCCESS")) and
+      ((.statusCheckRollup | map(.name) | unique | length) ==
+       (.statusCheckRollup | length)) and
+      (([.statusCheckRollup[] | select(.name == "Required gates" and
+        .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
+      (([.statusCheckRollup[] | select(.name == "CodeQL" and
+        .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
       (all(.statusCheckRollup[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
     ' >/dev/null; then
-      refuse "PR $pr_number is not a clean matching slice with every check successful"
+      refuse "PR $pr_number is not an approved current-base intermediate PR with every check successful"
     fi
-    head_sha="$(printf '%s' "$metadata" | jq -r .headRefOid)"
-    exec "$real_gh" pr merge "$pr_number" --merge --match-head-commit "$head_sha"
+    base_sha="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefOid)"
+    head_sha="$(printf '%s' "$metadata" | "$real_jq" -r .headRefOid)"
+    comparison="$($real_gh api "repos/$repository/compare/$base_sha...$head_sha" \
+      --hostname github.com --jq .status)" \
+      || die "cannot prove PR $pr_number contains its observed base"
+    case "$comparison" in
+      ahead | identical) ;;
+      *) refuse "PR $pr_number head does not contain its observed base" ;;
+    esac
+    if [ "$branch" = flow ]; then
+      base_checks="$($real_gh api "repos/$repository/commits/$base_sha/check-runs?per_page=100&filter=latest" \
+        --hostname github.com)" || die "cannot read checks for observed flow base $base_sha"
+      if ! printf '%s' "$base_checks" | "$real_jq" -e '
+        (.check_runs | type == "array") and
+        (([.check_runs[] | select(.name == "Required gates" and
+          .status == "completed" and .conclusion == "success")] | length) == 1) and
+        (([.check_runs[] | select(.name == "CodeQL" and
+          .status == "completed" and .conclusion == "success")] | length) == 1)
+      ' >/dev/null; then
+        refuse "observed flow base $base_sha is not green for Required gates and CodeQL"
+      fi
+    fi
+    "$real_gh" pr merge "$pr_number" --repo "$repository_target" \
+      --merge --match-head-commit "$head_sha" \
+      || die "merge request failed for PR $pr_number"
+    post_state="$($real_gh pr view "$pr_number" --repo "$repository_target" \
+      --json state --jq .state)" \
+      || die "cannot confirm PR $pr_number after merge request"
+    case "$post_state" in
+      MERGED) printf 'PASS workstream merged PR %s at head %s\n' "$pr_number" "$head_sha" ;;
+      OPEN) refuse "PR $pr_number is queued or still open; integration is not yet complete" ;;
+      *) die "PR $pr_number ended in unexpected state: ${post_state:-<empty>}" ;;
+    esac
+    ;;
+  group-pr)
+    reject_routing_options "$@"
+    branch="$(current_branch)"
+    case "$branch" in
+      group/*) group="${branch#group/}" ;;
+      *) refuse "group PR creation requires group/<id>-<slug>" ;;
+    esac
+    valid_group "$group" || refuse "invalid current group branch"
+    exec "$real_gh" pr create --repo "$repository_target" \
+      --base flow --head "$branch" --draft "$@"
     ;;
   final)
     reject_routing_options "$@"
     branch="$(current_branch)"
     case "$branch" in
-      work/*) slug="${branch#work/}" ;;
-      *) refuse "final PR creation requires work/<slug>" ;;
+      work/*)
+        slug="${branch#work/}"
+        valid_component "$slug" || refuse "invalid current workstream branch"
+        ;;
+      flow) ;;
+      *) refuse "final PR creation requires work/<slug> or protected flow" ;;
     esac
-    valid_component "$slug" || refuse "invalid current workstream branch"
-    exec "$real_gh" pr create --base dev --head "$branch" --draft "$@"
+    exec "$real_gh" pr create --repo "$repository_target" \
+      --base dev --head "$branch" --draft "$@"
     ;;
   *) usage ;;
 esac

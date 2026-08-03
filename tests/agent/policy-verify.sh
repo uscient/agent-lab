@@ -23,6 +23,9 @@ if ! mkdir -p "$policy_git_repo" ||
   exit 125
 fi
 policy_git_dir="$policy_git_repo/.git"
+set_policy_branch() {
+  git --git-dir="$policy_git_dir" symbolic-ref HEAD "refs/heads/$1"
+}
 
 P=0 F=0 S=0
 pass() { printf 'PASS %s\n' "$1"; P=$((P + 1)); }
@@ -51,6 +54,8 @@ for c in 'git push' 'git push --force origin HEAD' 'git push origin dev' 'git -C
          'git clean -fdx' 'rm -rf build'; do
   probe_cmd block "blocked: $c" "$c"
 done
+probe_cmd block "blocked: alternate-worktree commit" 'git -C /tmp/linked-dev commit -m bad'
+probe_cmd block "blocked: alternate-git-dir merge" 'git --git-dir=/tmp/linked-flow/.git merge feature'
 probe_cmd allow "control: local merge feature-x" 'git merge feature-x'
 probe_cmd allow "control: local rebase main"     'git rebase main'
 probe_cmd allow "control: rebase origin/dev"     'git rebase origin/dev'
@@ -58,43 +63,92 @@ probe_cmd allow "control: current-branch push"   'git push -u origin HEAD'
 probe_cmd allow "control: lease push"            'git push --force-with-lease origin HEAD'
 probe_cmd allow "control: PR read"               'gh pr view 1'
 probe_cmd allow "control: PR create to dev"      'gh pr create --base dev --title x --body-file /tmp/body'
+set_policy_branch group/g0-operator-surface
+probe_cmd block "blocked: group history rewrite"   'git rebase origin/flow'
+probe_cmd block "blocked: group local rewrite"     'git rebase flow'
+probe_cmd block "blocked: group lease rewrite"     'git push --force-with-lease origin HEAD'
+probe_cmd allow "control: group PR to flow"       'gh pr create --base flow --head group/g0-operator-surface --title x --body y'
+probe_cmd block "blocked: group PR skips flow"     'gh pr create --base dev --head group/g0-operator-surface --title x --body y'
+set_policy_branch slice/group/g0-operator-surface/cli
+probe_cmd block "blocked: group slice history rewrite" 'git rebase origin/group/g0-operator-surface'
+probe_cmd block "blocked: group slice sibling base" 'git rebase origin/group/g1-contract-growth'
+set_policy_branch flow
+probe_cmd allow "control: flow final PR"            'gh pr create --base dev --head flow --title x --body y'
+probe_cmd block "blocked: flow push"                 'git push origin HEAD'
+set_policy_branch work/demo
+probe_cmd block "blocked: workstream history rewrite" 'git rebase origin/dev'
+probe_cmd block "blocked: workstream helper bypass" 'git merge refs/heads/slice/demo/one'
+probe_cmd block "blocked: workstream lease rewrite" 'git push --force-with-lease origin HEAD'
+set_policy_branch agent/test/policy
 
 echo "== shim adversarial (variable indirection — argv level) =="
 if [ -x tools/bin/git ]; then
   shim_work="$policy_git_work/shim"
   shim_bin="$shim_work/bin"
-  if ! mkdir -p "$shim_bin"; then
+  shim_tools="$shim_work/tools"
+  if ! mkdir -p "$shim_bin" "$shim_tools"; then
     printf 'INFRA policy verification cannot create isolated shim state\n' >&2
     exit 125
   fi
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "${1:-}" = symbolic-ref ]; then echo agent/test/guard; exit 0; fi' \
+    'if [ "${1:-}" = symbolic-ref ]; then echo "${AGENT_LAB_SHIM_BRANCH:-agent/test/guard}"; exit 0; fi' \
     'printf "REAL-GIT %s\n" "$*"' > "$shim_bin/git"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'printf "REAL-GH %s\n" "$*"' > "$shim_bin/gh"
   chmod +x "$shim_bin/git" "$shim_bin/gh"
+  sed "s#/usr/bin/git#$shim_bin/git#" tools/bin/git > "$shim_tools/git"
+  sed -e "s#/usr/bin/gh#$shim_bin/gh#" -e "s#/usr/bin/git#$shim_bin/git#" \
+    tools/bin/gh > "$shim_tools/gh"
+  chmod +x "$shim_tools/git" "$shim_tools/gh"
   for c in 'g=push; git $g' 'm=merge; git $m origin/main'; do
-    rc=0; out="$(PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" bash -c "$c" 2>&1)" || rc=$?
+    rc=0; out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" bash -c "$c" 2>&1)" || rc=$?
     { [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'BLOCKED by agent-lab policy'; } \
       && pass "shim blocks: $c" || fail "shim should block: $c (rc=$rc)"
   done
-  out="$(PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" git push -u origin HEAD 2>&1 || true)"
+  out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" git push -u origin HEAD 2>&1 || true)"
   printf '%s' "$out" | grep -q '^REAL-GIT push -u origin HEAD$' \
     && pass "git shim allows scoped push" || fail "git shim blocked scoped push"
-  out="$(PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh pr create --base dev --title x --body-file /tmp/body 2>&1 || true)"
+  out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh pr create --base dev --title x --body-file /tmp/body 2>&1 || true)"
   printf '%s' "$out" | grep -q '^REAL-GH pr create --base dev' \
     && pass "gh shim allows PR creation to dev" || fail "gh shim blocked scoped PR creation"
-  out="$(PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh run view 123 --log 2>&1 || true)"
+  out="$(PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh run view 123 --log 2>&1 || true)"
   printf '%s' "$out" | grep -q '^REAL-GH run view 123 --log$' \
     && pass "gh shim allows read-only Actions logs" || fail "gh shim blocked Actions logs"
-  rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh run rerun 123 --failed >/dev/null 2>&1 || rc=$?
+  rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh run rerun 123 --failed >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks Actions mutation" || fail "gh shim allowed Actions mutation"
-  rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh -R uscient/agent-lab pr merge 1 >/dev/null 2>&1 || rc=$?
+  rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh -R uscient/agent-lab pr merge 1 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks PR mutation after global options" || fail "gh shim missed PR mutation after global options"
-  rc=0; PATH="$PWD/tools/bin:$shim_bin:/usr/bin:/bin" gh auth status >/dev/null 2>&1 || rc=$?
+  rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh -R other/repo pr create --base dev >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "gh shim blocks cross-repository PR creation" || fail "gh shim allowed cross-repository PR creation"
+  rc=0; PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh auth status >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] && pass "gh shim blocks authentication access" || fail "gh shim should block auth access"
+  rc=0
+  AGENT_LAB_SHIM_BRANCH=group/g0-operator-surface \
+    PATH="$shim_tools:$shim_bin:/usr/bin:/bin" git rebase origin/flow >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "git shim blocks group history rewrite" || fail "git shim allowed group history rewrite"
+  rc=0
+  AGENT_LAB_SHIM_BRANCH=slice/group/g0-operator-surface/cli \
+    PATH="$shim_tools:$shim_bin:/usr/bin:/bin" git push --force-with-lease origin HEAD >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "git shim blocks program-slice force update" || fail "git shim allowed program-slice force update"
+  out="$(AGENT_LAB_SHIM_BRANCH=slice/group/g0-operator-surface/cli \
+    PATH="$shim_tools:$shim_bin:/usr/bin:/bin" gh pr create \
+      --base group/g0-operator-surface --title x --body y 2>&1 || true)"
+  printf '%s' "$out" | grep -q '^REAL-GH pr create --base group/g0-operator-surface' \
+    && pass "gh shim allows matching group-slice PR" || fail "gh shim blocked matching group-slice PR"
+  rc=0
+  AGENT_LAB_SHIM_BRANCH=flow PATH="$shim_tools:$shim_bin:/usr/bin:/bin" \
+    git push origin HEAD >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "git shim blocks protected flow push" || fail "git shim allowed protected flow push"
+  rc=0
+  AGENT_LAB_SHIM_BRANCH=agent/test/guard PATH="$shim_tools:$shim_bin:/usr/bin:/bin" \
+    git -C /tmp/linked-dev commit -m bad >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "git shim blocks alternate-worktree mutation" || fail "git shim allowed alternate-worktree mutation"
+  rc=0
+  AGENT_LAB_SHIM_BRANCH=work/demo PATH="$shim_tools:$shim_bin:/usr/bin:/bin" \
+    git merge refs/heads/slice/demo/one >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && pass "git shim blocks alternate slice-ref integration" || fail "git shim allowed alternate slice-ref integration"
 else
   skip "tools/bin/git shim missing"
 fi

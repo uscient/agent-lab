@@ -222,7 +222,7 @@ gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY failures=0
 ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
 required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
 guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
-workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=114 fail=0
+workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=134 fail=0
 coordination tests/dev/coord-cases.sh SUMMARY assertions=58 expected=58 failures=0
 docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0
 guard-command tests/guard/pretooluse-cases.sh SUMMARY failures=0
@@ -244,7 +244,7 @@ dns-contract-unit tests/egress/dns-contract-cases.sh SUMMARY failures=0
 wrapper-context tests/wrap-image/context-cases.sh SUMMARY failures=0
 adapter-idempotence tests/agent/render-adapters-idempotence.sh PASS generated adapters match tracked files and are idempotent
 serena-config tests/serena/config-cases.sh SUMMARY failures=0
-policy-probe tests/agent/policy-verify.sh SUMMARY pass=46 fail=0 skip=0
+policy-probe tests/agent/policy-verify.sh SUMMARY pass=67 fail=0 skip=0
 containment-static tools/containment-lint.sh containment-lint: 0 fail, 0 warn
 EOF
 actual_suites="$work/actual-fast-suites"

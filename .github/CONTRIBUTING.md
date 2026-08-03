@@ -19,8 +19,12 @@ Pull requests and issues from anyone who is not a member of the organization wil
 ## For organization members
 
 - Follow the [branch, metadata, and integration workflow](../docs/development.md#branch-and-integration-workflow).
-- Publish only the current work branch and open its PR to `dev`.
-- Humans review and merge; agents never write protected branches or merge their own PRs.
+- Publish only the current branch and use its exact derived PR base: ordinary/workstream work targets
+  `dev`, program groups target `flow`, and slices target their matching parent.
+- Treat `dev`, `flow`, `master`, and `main` as protected. Agents may merge only an approved, current,
+  green intermediate PR through `scripts/dev/workstream`; humans merge every final PR into `dev`.
+- Preserve merge ancestry and branch/PR evidence. The required hosted protections and exact program
+  routes are in [Workstreams and programs](../docs/workstreams.md).
 
 If you have questions about using the lab locally, start with the
 [README](../README.md) and [documentation map](../docs/README.md). There is no

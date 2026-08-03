@@ -27,17 +27,42 @@ plane you are working on.
 
 ## Branch and integration workflow
 
-The integration branch is `dev`.
+`dev` is authoritative. The protected `flow` branch is a bounded program-integration base, not a
+replacement for `dev`. The exact route is derived from the branch:
 
-1. Create a work branch from current `dev`.
-2. Make and verify focused changes on that branch.
-3. Fetch remote state.
-4. Rebase only on `origin/dev`.
-5. Push the same-named work branch. After a rebase, use `--force-with-lease`, never plain force.
-6. Open a pull request with base `dev`.
-7. A human reviews and merges it.
+| Head branch | Rebase/sync base | Pull-request base | Integration owner |
+|---|---|---|---|
+| ordinary branch | `origin/dev` | `dev` | human |
+| `work/<work>` | merge `origin/dev` with `sync` | `dev` | human |
+| `slice/<work>/<slice>` | `origin/work/<work>` | `work/<work>` | verified helper |
+| `group/<group>` | merge `origin/flow` with `sync` | `flow` | verified helper after approval |
+| `slice/group/<group>/<slice>` | merge `origin/group/<group>` with `sync` | `group/<group>` | verified helper |
+| protected `flow` | none | `dev` | human |
 
-Do not commit on or push directly to `dev`, `master`, or `main`. Do not merge your own pull request.
+`<group>` matches `[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*`; `group` in the group-slice form is
+literal. `dev`, `flow`, `master`, and `main` are protected. Do not commit, push, Git-merge, or rebase
+them directly. An agent may inspect `flow`, use the verified helper to merge an approved group PR
+remotely, and open the final draft `flow` → `dev` PR; only a human merges that final PR.
+
+For each writable branch:
+
+1. Start at its current permitted base and make focused changes.
+2. Run applicable behavior, security, and mutation evidence.
+3. Fetch and incorporate only the exact base in the table. Use `scripts/dev/workstream sync` for a
+   reserved workstream, group, or slice branch.
+4. Replay invalidated evidence after a rebase, dependency merge, workflow change, or manifest change.
+5. Push only the same-named branch. Use `--force-with-lease` only after an allowed non-program
+   rebase; program groups and group slices are merge-preserving and never force-updated.
+6. Open only the derived PR route. Agents integrate only verified slice→work, group-slice→group, and
+   approved group→`flow` PRs through `scripts/dev/workstream merge`.
+7. Preserve merge commits, branches, PR records, and evidence through final review. Humans merge every
+   ordinary, workstream, or `flow` final PR into `dev`.
+
+The R0 maintenance PR must land in `dev` before `flow` exists. A human creates and protects `flow` at
+that exact R0-updated `dev` SHA, then installs current-head CI, CodeQL, review, retention, and merge
+rules before program work begins. See [Agent-managed workstreams and programs](workstreams.md) for
+commands and the hosted-rules checklist.
+
 Never inspect or change repository authentication, credentials, tokens, account settings, or Git
 attribution configuration.
 
@@ -46,10 +71,10 @@ maintenance session. Ordinary feature and documentation work does not mutate the
 
 ### Workflow metadata
 
-Branch naming is a review convention, not a new authorization rail. Prefer a descriptive
-`<lane>/<lower-kebab-topic>` name for manual work. The automated bootstrap form
-`agent/<tool>/<slug>` remains valid. The checker rejects protected, generic, invalid, and Git-magic
-names, but `AGENTS.md` remains authoritative about which branch operations are allowed.
+For ordinary work, prefer a descriptive `<lane>/<lower-kebab-topic>` name. The automated bootstrap
+form `agent/<tool>/<slug>` remains valid. Reserved `work/*`, `group/*`, and both slice forms carry the
+routing semantics in the table; malformed reserved names are refused. The checker also rejects
+protected, generic, invalid, and Git-magic names, but `AGENTS.md` remains authoritative.
 
 Introduced non-merge commits use the exact author
 `xormania <127287135+xormania@users.noreply.github.com>`. Subjects are one printable ASCII line,
@@ -57,9 +82,9 @@ Introduced non-merge commits use the exact author
 merge boilerplate, branch reference, or generic update text. Plain imperative subjects and scoped
 Conventional Commit subjects are both valid. Do not add additional attribution trailers.
 
-Pull requests use base `dev` and an outcome-focused title under the same subject rules. The body
-keeps the template sections `Summary`, `Motivation / Context`, `Changes`, and `Testing` in that
-order. Testing entries name an exact command in backticks and its observed result. If no command
+Pull requests use the branch-derived base and an outcome-focused title under the same subject rules.
+The body keeps the template sections `Summary`, `Motivation / Context`, `Changes`, and `Testing` in
+that order. Testing entries name an exact command in backticks and its observed result. If no command
 ran, write `Not run — reason`. Check or remove every template checklist item before validation.
 
 Run the local convention checks from the repository root:
@@ -67,17 +92,20 @@ Run the local convention checks from the repository root:
 ```bash
 ./scripts/dev/workflow-check branch
 ./scripts/dev/workflow-check commit 'Describe one reviewable outcome'
-./scripts/dev/workflow-check commits origin/dev
+./scripts/dev/workflow-check commits
 ./scripts/dev/workflow-check pr-title 'Describe the pull request outcome'
 ./scripts/dev/workflow-check pr-base dev
+./scripts/dev/workflow-check pr-route group/g0-operator-surface flow
 ./scripts/dev/workflow-check pr-body .cache/dev/pr-body.md
-./scripts/dev/workflow-check all origin/dev
+./scripts/dev/workflow-check all
 ```
 
-An explicit commit base must resolve to the current `origin/dev`; callers cannot narrow the range
-to hide introduced commits. `all` checks only the current branch and every introduced non-merge
-commit. Run the three `pr-*` commands separately. The fast gate exercises the checker's executable
-contract; it cannot inspect hosted pull-request metadata.
+`commits` and `all` derive `origin/dev`, `origin/flow`, or the matching remote parent from the current
+branch. If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
+the range to hide introduced commits. `all` checks only the branch and every introduced non-merge
+commit. Run the applicable `pr-*` commands separately; `pr-base` derives the expected base from the
+current branch, while `pr-route` can check an explicit head/base pair. The fast gate exercises this
+executable contract but cannot inspect hosted PR metadata or GitHub rulesets.
 
 ### Shared-checkout coordination
 
@@ -121,9 +149,10 @@ The three local gate entry points corresponding to the required-gates workers ar
 ./scripts/dev/docker-gate
 ```
 
-For agent-managed single- or multi-slice delivery, use the workstream workflow in
-[`docs/workstreams.md`](workstreams.md). It preserves per-slice PR and commit evidence while keeping
-the final merge into `dev` human-owned.
+For agent-managed single- or multi-slice work and `flow` delivery programs, use
+[`docs/workstreams.md`](workstreams.md). It preserves reviewed merge ancestry and per-head evidence,
+limits agents to verified intermediate integration, and keeps every final merge into `dev`
+human-owned.
 
 | Gate | What it establishes | Important prerequisites |
 |---|---|---|

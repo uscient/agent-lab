@@ -3,8 +3,8 @@
 # three adapters are never hand-maintained. Single policy source:
 #   - policy/allow.commands   -> the auto-approve allow set (translated per tool)
 #   - NATIVE_DENY below       -> unconditional native belt-and-suspenders rules. Scoped push,
-#                               origin/dev rebase, and PR-create decisions remain in the authoritative
-#                               guard because native prefix rules cannot express branch-aware policy.
+#                               branch-derived rebase, and PR-create decisions remain in the
+#                               authoritative guard because native rules cannot express branch policy.
 #
 # Generated files (do not hand-edit the marked/whole regions):
 #   .claude/settings.json          (whole file — strict JSON, no comments)

@@ -6,8 +6,8 @@ set -euo pipefail
 # implement a general YAML parser.
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
-ci="$repo_root/.github/workflows/ci.yml"
-codeql="$repo_root/.github/workflows/codeql.yml"
+ci="${AGENT_LAB_CI_WORKFLOW:-$repo_root/.github/workflows/ci.yml}"
+codeql="${AGENT_LAB_CODEQL_WORKFLOW:-$repo_root/.github/workflows/codeql.yml}"
 ci_fast="$repo_root/scripts/dev/ci-fast"
 failures=0
 
@@ -102,18 +102,23 @@ if [ "$(sed -n '1p' "$codeql")" = "name: CodeQL" ]; then
 else
   fail "CodeQL workflow keeps its stable check name"
 fi
-
-if [ "$(grep -Fxc '    branches: [dev, master, main]' "$ci")" -eq 1 ] &&
-   [ "$(grep -Fxc "    branches: [dev, master, main, 'work/**']" "$ci")" -eq 1 ]; then
-  pass "CI runs for protected pushes and workstream pull requests"
+if job_block "$codeql" analyze | grep -Fq '    name: CodeQL'; then
+  pass "CodeQL job keeps its stable rollup name"
 else
-  fail "CI runs for protected pushes and workstream pull requests"
+  fail "CodeQL job keeps its stable rollup name"
 fi
-if [ "$(grep -Fxc '    branches: [dev, master, main]' "$codeql")" -eq 1 ] &&
-   [ "$(grep -Fxc "    branches: [dev, master, main, 'work/**']" "$codeql")" -eq 1 ]; then
-  pass "CodeQL runs for protected pushes and workstream pull requests"
+
+if [ "$(grep -Fxc '    branches: [dev, flow, master, main]' "$ci")" -eq 1 ] &&
+   [ "$(grep -Fxc "    branches: [dev, flow, master, main, 'work/**', 'group/**']" "$ci")" -eq 1 ]; then
+  pass "CI runs for flow pushes and every authorized PR base"
 else
-  fail "CodeQL runs for protected pushes and workstream pull requests"
+  fail "CI runs for flow pushes and every authorized PR base"
+fi
+if [ "$(grep -Fxc '    branches: [dev, flow, master, main]' "$codeql")" -eq 1 ] &&
+   [ "$(grep -Fxc "    branches: [dev, flow, master, main, 'work/**', 'group/**']" "$codeql")" -eq 1 ]; then
+  pass "CodeQL runs for flow pushes and every authorized PR base"
+else
+  fail "CodeQL runs for flow pushes and every authorized PR base"
 fi
 if grep -Fxq '  merge_group:' "$ci" &&
    grep -Fxq '  merge_group:' "$codeql"; then
@@ -144,6 +149,10 @@ require_job_text fast '    name: Fast' "fast job has a stable display name"
 require_job_text fast '    timeout-minutes: 15' "fast job has a bounded runtime"
 require_job_text fast '      diff-base: ${{ steps.diff-base.outputs.base }}' \
   "fast job publishes its immutable base to the aggregate"
+require_job_text fast '      tested-head: ${{ steps.diff-base.outputs.head }}' \
+  "fast job publishes its tested head to the aggregate"
+require_job_text fast '      classification: ${{ steps.fast-gate.outputs.classification }}' \
+  "fast job publishes its result classification"
 require_job_text fast './scripts/dev/ci-fast' \
   "fast job exposes the canonical local replay command"
 require_job_text fast 'git merge-base --is-ancestor "$base" HEAD' \
@@ -152,6 +161,16 @@ require_job_text fast '^([0-9a-f]{40}|[0-9a-f]{64})$' \
   "fast job validates the event SHA grammar"
 require_job_text fast 'merge_group) base="$MERGE_GROUP_BASE_SHA"' \
   "fast job resolves the immutable merge-group base"
+require_job_text fast '[ "$head" = "$dev_head" ]' \
+  "fast job permits only the exact zero-base flow bootstrap neighbor"
+require_job_text fast 'cross-repository PRs are not accepted' \
+  "fast job rejects cross-repository evidence"
+require_job_text fast 'valid_group()' \
+  "fast job bounds the reserved group namespace"
+require_job_text fast '[ "$PR_HEAD_REF" = "group/$group_name" ] && valid_group "$group_name"' \
+  "fast job enforces group to flow topology"
+require_job_text fast '[[ "$PR_HEAD_REF" =~ ^slice/group/$group_name/$component$ ]]' \
+  "fast job enforces matching group-slice topology"
 if [ -x "$ci_fast" ] &&
    awk '
      /scripts\/dev\/cue-tool provision/ { cue=NR }
@@ -166,12 +185,20 @@ fi
 
 require_job_text static '    name: Static' "static job has a stable display name"
 require_job_text static '    timeout-minutes: 15' "static job has a bounded runtime"
+require_job_text static '      tested-head: ${{ steps.identity.outputs.head }}' \
+  "static job publishes its tested head"
+require_job_text static '      classification: ${{ steps.static-gate.outputs.classification }}' \
+  "static job publishes its result classification"
 require_job_text static './tools/validate.sh --strict' \
   "static job exposes the canonical local replay command"
 
 require_job_text docker '    name: Docker security' \
   "Docker job has a stable display name"
 require_job_text docker '    timeout-minutes: 45' "Docker job has a bounded runtime"
+require_job_text docker '      tested-head: ${{ steps.identity.outputs.head }}' \
+  "Docker job publishes its tested head"
+require_job_text docker '      classification: ${{ steps.docker-gate.outputs.classification }}' \
+  "Docker job publishes its result classification"
 require_job_text docker './scripts/dev/docker-gate' \
   "Docker job exposes the canonical local replay command"
 require_job_text docker 'docker/build-push-action@' \
@@ -208,6 +235,8 @@ require_job_text required-gates '    needs: [fast, static, docker]' \
   "aggregate job names every required worker"
 require_job_text required-gates 'CI_NEEDS_JSON: ${{ toJSON(needs) }}' \
   "aggregate job passes structured dependency state to the reducer"
+require_job_text required-gates 'CI_EXPECTED_HEAD: ${{ github.sha }}' \
+  "aggregate job binds every worker to the event head"
 require_job_text required-gates './scripts/dev/required-gates' \
   "aggregate job uses the versioned fail-closed reducer"
 
@@ -235,6 +264,65 @@ if ! grep -Fq 'git rev-parse HEAD^' "$ci"; then
   pass "diff-base selection has no implicit HEAD fallback"
 else
   fail "diff-base selection has no implicit HEAD fallback"
+fi
+if ! grep -Eq '^[[:space:]]*(paths|paths-ignore):' "$ci" "$codeql" &&
+   ! grep -Fq 'continue-on-error:' "$ci" "$codeql"; then
+  pass "required workflow scope has no path filter or continue-on-error escape"
+else
+  fail "required workflow scope has no path filter or continue-on-error escape"
+fi
+if [ "$(grep -Fxc '            125) classification=infrastructure ;;' "$ci")" -eq 3 ] &&
+   [ "$(grep -Fc 'classification=%s\n' "$ci")" -eq 3 ]; then
+  pass "every worker preserves assertion and infrastructure result classes"
+else
+  fail "every worker preserves assertion and infrastructure result classes"
+fi
+
+if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
+  run_ci_mutant() {
+    local name="$1" expression="$2" target="${3:-ci}"
+    local mutant="$work_dir/$name.yml"
+    local source="$ci" rc=0
+    if [ "$target" = codeql ]; then
+      source="$codeql"
+    fi
+    sed "$expression" "$source" > "$mutant"
+    if cmp -s "$source" "$mutant"; then
+      fail "$name mutation is calibrated"
+      return
+    fi
+    if [ "$target" = codeql ]; then
+      CI_WORKFLOW_MUTATION_PROBE=1 AGENT_LAB_CI_WORKFLOW="$ci" \
+        AGENT_LAB_CODEQL_WORKFLOW="$mutant" bash "$0" > "$work_dir/$name.out" 2>&1 || rc=$?
+    else
+      CI_WORKFLOW_MUTATION_PROBE=1 AGENT_LAB_CI_WORKFLOW="$mutant" \
+        AGENT_LAB_CODEQL_WORKFLOW="$codeql" bash "$0" > "$work_dir/$name.out" 2>&1 || rc=$?
+    fi
+    if [ "$rc" -eq 1 ] && grep -Eq 'SUMMARY failures=[1-9][0-9]*' "$work_dir/$name.out"; then
+      pass "$name mutation turns the workflow contract RED"
+    else
+      fail "$name mutation turns the workflow contract RED (rc=$rc)"
+    fi
+  }
+
+  work_dir="$(mktemp -d)"
+  trap 'find "$work_dir" -depth -delete >/dev/null 2>&1 || true' EXIT
+  run_ci_mutant omit-flow-trigger \
+    "s/branches: \[dev, flow, master, main\]/branches: [dev, master, main]/"
+  run_ci_mutant omit-group-trigger \
+    "s/, 'group\/\*\*'//"
+  run_ci_mutant allow-continue-on-error \
+    '/id: fast-gate/a\        continue-on-error: true'
+  run_ci_mutant drop-required-worker \
+    's/needs: \[fast, static, docker\]/needs: [fast, static]/'
+  run_ci_mutant erase-result-classification \
+    '0,/125) classification=infrastructure/s//125) classification=assertion-failure/'
+  run_ci_mutant weaken-flow-bootstrap \
+    's/\[ "$head" = "$dev_head" \]/[ "$head" != "$dev_head" ]/'
+  run_ci_mutant bypass-reducer \
+    's#run: ./scripts/dev/required-gates#run: true#'
+  run_ci_mutant codeql-omit-flow \
+    "s/branches: \[dev, flow, master, main\]/branches: [dev, master, main]/" codeql
 fi
 
 printf 'SUMMARY failures=%s\n' "$failures"

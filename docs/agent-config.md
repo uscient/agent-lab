@@ -1,8 +1,9 @@
 # Agent configuration — setup & maintenance
 
 How the three coding agents that **develop Agent Lab** (Claude Code, Codex, Grok) are configured to
-work autonomously inside the `AGENTS.md` boundary: develop on a branch, publish that branch, open a
-PR to `dev`, never merge it themselves, and never weaken containment.
+work autonomously inside the `AGENTS.md` boundary: develop on a writable branch, publish only that
+branch, follow its derived PR route, use the verified helper for allowed intermediate merges, leave
+every final merge into `dev` to a human, and never weaken containment.
 
 For the normal maintainer workflow and gates, start with
 [Development and verification](development.md). This page is the specialist reference for client
@@ -27,7 +28,7 @@ One operating policy, shared enforcement, and three generated thin adapters:
 ```text
 AGENTS.md  policy/                       # shared core (instruction + enforcement data)
 tools/pretooluse-guard.sh                # PreToolUse: command, read/write, and Serena mutations
-tools/session-bootstrap.sh               # SessionStart: protected branch -> dev-based work branch
+tools/session-bootstrap.sh               # SessionStart: dev/master/main -> work branch; flow read-only
 tools/render-adapters.sh                 # generates the adapter rule bodies
 tools/codex-permission-request.sh        # Codex PermissionRequest approver (mirrors policy)
 tools/bin/{git,gh}                        # optional argv-level PATH shims
@@ -58,10 +59,11 @@ regions** in `.claude/settings.json`, `.codex/rules/agent-lab.rules`, or `.grok/
 
 ## The `AGENT_LAB_MAINTENANCE=1` convention (and the self-lock)
 
-The rails (`AGENTS.md`, `policy/`, the guard scripts, `tools/bin/`, the adapter dirs)
-are in `policy/protected.paths`: the guard blocks Edit/Write and shell-mutation of them so an agent
-can't quietly change its own guardrails. To **deliberately** maintain them, run the session with
-`AGENT_LAB_MAINTENANCE=1` **exported in the launching shell** (so the hook subprocess inherits it):
+`policy/protected.paths` is the complete rail inventory. It includes `AGENTS.md`, policy, guards,
+shims, adapters, workflows, the workstream and workflow-check helpers, required-gate reducers and
+manifests, and their contract tests. The guard blocks Edit/Write and shell mutation of those paths so
+an agent can't quietly change its own guardrails. To **deliberately** maintain them, run the session
+with `AGENT_LAB_MAINTENANCE=1` **exported in the launching shell** (so the hook subprocess inherits it):
 
 ```bash
 AGENT_LAB_MAINTENANCE=1 claude        # or codex / grok
@@ -92,15 +94,33 @@ Codex runs `sandbox_mode = "workspace-write"` with network access enabled for th
 workflow. `AGENTS.md`, the guard, and protected-branch rules scope that access:
 
 ```bash
-git fetch origin
+# Ordinary branch:
+git fetch origin dev
 git rebase origin/dev
 git push -u origin HEAD
 gh pr create --base dev ...
+
+# Reserved workstream and program branches:
+./scripts/dev/workstream sync
+./scripts/dev/workstream pr ...       # matching slice -> parent
+./scripts/dev/workstream group-pr ... # group -> flow, draft
+./scripts/dev/workstream final ...    # work or flow -> dev, draft
+./scripts/dev/workstream merge 123    # approved intermediate only
 ```
 
-Direct protected-branch pushes, plain force pushes, PR merge/mutation, remote mutation, GitHub
-authentication access, and Git attribution changes remain forbidden. Runtime credentials are used
-implicitly by Git/GitHub tooling; agents must never inspect or modify them.
+Ordinary branches rebase on `origin/dev`; reusable workstreams, program groups, and group slices use
+merge-preserving `workstream sync` with their exact parent. Those integration branches are never
+rebased or force-updated. `dev`, `flow`, `master`, and `main` are protected, and a `flow`
+checkout stays read-only. Direct protected writes, plain force pushes, direct PR merge/mutation, remote
+mutation, GitHub authentication access, and Git attribution changes remain forbidden. The only
+agent merge exception is `scripts/dev/workstream merge` for a verified slice→work,
+group-slice→group, or approved group→`flow` PR. Humans alone merge final PRs into `dev`.
+
+The repository guards do not configure GitHub. Humans must install the required `CI / Required
+gates` and `CodeQL` checks, current-base or merge-queue rule, latest-push approval, merge-only history,
+branch retention, and trusted rail ownership described in [Workstreams and programs](workstreams.md).
+Runtime credentials are used implicitly by Git/GitHub tooling; agents must never inspect or modify
+them.
 
 ## Forbidden flags (never use these as the autonomy mechanism)
 
