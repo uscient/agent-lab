@@ -50,8 +50,8 @@ chmod +x "$fake_bin/gh"
 
 base_oid='1111111111111111111111111111111111111111'
 head_oid='0123456789abcdef0123456789abcdef01234567'
-valid_json='{"number":17,"state":"OPEN","isDraft":false,"baseRefName":"work/demo","baseRefOid":"1111111111111111111111111111111111111111","headRefName":"slice/demo/format","headRefOid":"0123456789abcdef0123456789abcdef01234567","isCrossRepository":false,"headRepository":{"nameWithOwner":"uscient/agent-lab"},"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"name":"Fast","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"Required gates","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"CodeQL","status":"COMPLETED","conclusion":"SUCCESS"}]}'
-valid_base_checks='{"check_runs":[{"name":"Required gates","status":"completed","conclusion":"success"},{"name":"CodeQL","status":"completed","conclusion":"success"}]}'
+valid_json='{"number":17,"state":"OPEN","isDraft":false,"baseRefName":"work/demo","baseRefOid":"1111111111111111111111111111111111111111","headRefName":"slice/demo/format","headRefOid":"0123456789abcdef0123456789abcdef01234567","isCrossRepository":false,"headRepository":{"nameWithOwner":"uscient/agent-lab"},"mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"name":"Fast","workflowName":"CI","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"Required gates","workflowName":"CI","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"CodeQL","workflowName":"CodeQL","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"CodeQL","workflowName":"","status":"COMPLETED","conclusion":"SUCCESS"}]}'
+valid_base_checks='{"check_runs":[{"name":"Required gates","app":{"slug":"github-actions"},"status":"completed","conclusion":"success"},{"name":"CodeQL","app":{"slug":"github-actions"},"status":"completed","conclusion":"success"},{"name":"CodeQL","app":{"slug":"github-code-scanning"},"status":"completed","conclusion":"success"}]}'
 
 route_fixture="$work/route"
 mkdir -p "$route_fixture/scripts/dev"
@@ -265,7 +265,7 @@ else
   fail "approved current-base group PR integrates into flow through the helper"
 fi
 
-missing_base_codeql='{"check_runs":[{"name":"Required gates","status":"completed","conclusion":"success"}]}'
+missing_base_codeql='{"check_runs":[{"name":"Required gates","app":{"slug":"github-actions"},"status":"completed","conclusion":"success"},{"name":"CodeQL","app":{"slug":"github-code-scanning"},"status":"completed","conclusion":"success"}]}'
 if run_merge "$flow_json" "$route_fixture/scripts/dev/workstream" ahead "$missing_base_codeql"; then
   fail "group integration waits for a green CodeQL result on the flow base"
 elif ! grep -q '^pr merge ' "$gh_log"; then
@@ -310,7 +310,7 @@ else
 fi
 
 missing_codeql="$(printf '%s' "$valid_json" | jq -c \
-  '.statusCheckRollup |= map(select(.name != "CodeQL"))')"
+  '.statusCheckRollup |= map(select(.name != "CodeQL" or .workflowName != "CodeQL"))')"
 if run_merge "$missing_codeql"; then
   fail "missing CodeQL PR result blocks integration"
 elif ! grep -q '^pr merge ' "$gh_log"; then

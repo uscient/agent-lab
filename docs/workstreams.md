@@ -127,8 +127,11 @@ its matching workstream. Replay invalidated evidence after any sync.
 `workstream merge` rereads hosted PR state immediately before acting. It accepts only a same-repository
 PR whose base is the current checkout and whose head is the exact matching slice or group route. The
 PR must be open, non-draft, cleanly mergeable, approved, contain its observed current base, report
-exactly one successful `Required gates` and `CodeQL` check, and have every reported check completed
-successfully. Group integration also requires those checks green on the observed `flow` base.
+exactly one successful `CI` workflow job named `Required gates` and one successful `CodeQL` workflow
+job named `CodeQL`, and have every reported check completed successfully. GitHub's separate
+code-scanning result may also be named `CodeQL`; it neither substitutes for nor conflicts with the
+workflow job. Group integration also requires the GitHub Actions jobs green on the observed `flow`
+base.
 Every GitHub read and write is pinned to `github.com/uscient/agent-lab`; ambient repository or host
 environment variables cannot redirect the helper.
 The command requests a merge commit pinned to the observed head SHA and confirms GitHub reports the

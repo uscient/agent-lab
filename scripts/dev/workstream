@@ -244,11 +244,13 @@ case "$command_name" in
       (.mergeStateStatus == "CLEAN") and
       (.reviewDecision == "APPROVED") and
       ((.statusCheckRollup | length) > 0) and
-      ((.statusCheckRollup | map(.name) | unique | length) ==
+      ((.statusCheckRollup | map([(.workflowName // ""), .name]) | unique | length) ==
        (.statusCheckRollup | length)) and
       (([.statusCheckRollup[] | select(.name == "Required gates" and
+        .workflowName == "CI" and
         .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
       (([.statusCheckRollup[] | select(.name == "CodeQL" and
+        .workflowName == "CodeQL" and
         .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
       (all(.statusCheckRollup[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
     ' >/dev/null; then
@@ -269,8 +271,10 @@ case "$command_name" in
       if ! printf '%s' "$base_checks" | "$real_jq" -e '
         (.check_runs | type == "array") and
         (([.check_runs[] | select(.name == "Required gates" and
+          .app.slug == "github-actions" and
           .status == "completed" and .conclusion == "success")] | length) == 1) and
         (([.check_runs[] | select(.name == "CodeQL" and
+          .app.slug == "github-actions" and
           .status == "completed" and .conclusion == "success")] | length) == 1)
       ' >/dev/null; then
         refuse "observed flow base $base_sha is not green for Required gates and CodeQL"

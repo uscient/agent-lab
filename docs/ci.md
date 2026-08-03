@@ -30,8 +30,9 @@ failures block with `1`; missing, extra, stale, skipped, cancelled, malformed,
 or infrastructure-uncertain evidence fails closed with `125`.
 
 CodeQL remains a separate check because GitHub does not expose cross-workflow
-jobs through `needs`. Its job name is fixed as `CodeQL` so the merge helper and
-hosted rules can require the same unambiguous result.
+jobs through `needs`. Its workflow and job names are fixed as `CodeQL` so the merge helper and
+hosted rules can require the same unambiguous Actions result. GitHub also emits a same-named
+code-scanning result; that result must succeed but cannot substitute for the workflow job.
 
 The Docker worker always runs the full runtime gate. Its cache-aware devbox
 build is a separate timed step, and the gate records runtime-suite timings so
