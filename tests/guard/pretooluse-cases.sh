@@ -134,8 +134,24 @@ expect_cmd allow "lint"                       './scripts/dev/lint-scripts'
 expect_cmd allow "read a protected file"      'cat AGENTS.md'
 expect_cmd allow "grep policy"                 'grep -r AGENTS.md policy/'
 
+echo "== allow: branch-derived flow/group/slice routes =="
+set_guard_branch group/g0-operator-surface
+expect_cmd allow "group PR targets flow"        'gh pr create --base flow --head group/g0-operator-surface --title x --body y'
+expect_cmd allow "group same-branch push"       'git push origin HEAD'
+set_guard_branch slice/group/g0-operator-surface/cli
+expect_cmd allow "group slice PR matches parent" \
+  'gh pr create --base group/g0-operator-surface --head slice/group/g0-operator-surface/cli --title x --body y'
+set_guard_branch slice/demo/one
+expect_cmd allow "legacy slice rebase matches parent" 'git rebase origin/work/demo'
+expect_cmd allow "legacy slice PR matches parent" \
+  'gh pr create --base work/demo --head slice/demo/one --title x --body y'
+set_guard_branch flow
+expect_cmd allow "flow final PR targets dev" \
+  'gh pr create --base dev --head flow --title x --body y'
+set_guard_branch agent/test/guard
+
 echo "== deny: commit on protected branches (branch backstop) =="
-for protected in dev master main; do
+for protected in dev flow master main; do
   set_guard_branch "$protected"
   expect_cmd block "git commit on $protected" 'git commit -m "wip"'
   expect_cmd block "git -C commit on $protected" 'git -C . commit -m "wip"'
@@ -165,6 +181,9 @@ expect_cmd block "rebase origin/main"         'git rebase origin/main'
 expect_cmd block "rebase upstream/dev"         'git rebase upstream/dev'
 expect_cmd block "merge refs/remotes"         'git merge refs/remotes/origin/main'
 expect_cmd block "git -C . merge origin"      'git -C . merge origin/main'
+expect_cmd block "alternate-worktree commit"   'git -C /tmp/linked-dev commit -m bad'
+expect_cmd block "alternate-git-dir merge"     'git --git-dir=/tmp/linked-flow/.git merge feature'
+expect_cmd block "direct slice merge"           'git merge slice/demo/one'
 expect_cmd block "PR create without base"       'gh pr create --title x --body y'
 expect_cmd block "PR create wrong base"         'gh pr create --base main --title x --body y'
 expect_cmd block "PR create wrong head"         'gh pr create --base dev --head other --title x --body y'
@@ -181,6 +200,51 @@ expect_cmd block "GitHub repo delete"           'gh repo delete uscient/agent-la
 expect_cmd block "absolute GitHub repo delete"  '/usr/bin/gh repo delete uscient/agent-lab --yes'
 expect_cmd block "GitHub issue close"           'gh issue close 1'
 expect_cmd block "GitHub global-option PR merge" 'gh --repo uscient/agent-lab pr merge 10'
+
+echo "== deny: wrong flow/group/slice routes and invalid reserved names =="
+set_guard_branch work/demo
+expect_cmd block "workstream remote rebase cannot erase accepted merges" 'git rebase origin/dev'
+expect_cmd block "workstream local rebase cannot erase accepted merges" 'git rebase dev'
+expect_cmd block "workstream alternate slice ref cannot bypass helper" \
+  'git merge refs/heads/slice/demo/one'
+expect_cmd block "workstream commit-id merge cannot bypass helper" \
+  'git merge 0123456789abcdef0123456789abcdef01234567'
+expect_cmd block "workstream lease push cannot rewrite history" \
+  'git push --force-with-lease origin HEAD'
+set_guard_branch group/g0-operator-surface
+expect_cmd block "group alternate slice ref cannot bypass helper" \
+  'git merge refs/heads/slice/group/g0-operator-surface/cli'
+expect_cmd block "group remote rebase cannot rewrite history" 'git rebase origin/flow'
+expect_cmd block "group local rebase cannot rewrite history" 'git rebase flow'
+expect_cmd block "group lease push cannot rewrite history" 'git push --force-with-lease origin HEAD'
+expect_cmd block "group cannot rebase on dev"    'git rebase origin/dev'
+expect_cmd block "group cannot PR to dev"         'gh pr create --base dev --head group/g0-operator-surface --title x --body y'
+set_guard_branch slice/group/g0-operator-surface/cli
+expect_cmd block "group slice remote rebase cannot rewrite history" \
+  'git rebase origin/group/g0-operator-surface'
+expect_cmd block "group slice local rebase cannot rewrite history" \
+  'git rebase group/g0-operator-surface'
+expect_cmd block "group slice lease push cannot rewrite history" \
+  'git push --force-with-lease origin HEAD'
+expect_cmd block "group slice cannot rebase on flow" 'git rebase origin/flow'
+expect_cmd block "group slice cannot rebase sibling" 'git rebase origin/group/g1-contract-growth'
+expect_cmd block "group slice cannot PR to flow" \
+  'gh pr create --base flow --head slice/group/g0-operator-surface/cli --title x --body y'
+set_guard_branch slice/demo/one
+expect_cmd block "legacy slice cannot rebase on dev" 'git rebase origin/dev'
+expect_cmd block "legacy slice cannot PR to dev" \
+  'gh pr create --base dev --head slice/demo/one --title x --body y'
+set_guard_branch flow
+expect_cmd block "merge on protected flow"        'git merge group/g0-operator-surface'
+expect_cmd block "rebase on protected flow"       'git rebase dev'
+expect_cmd block "push from protected flow"        'git push origin HEAD'
+set_guard_branch group/not-valid
+expect_cmd block "invalid reserved group cannot push" 'git push origin HEAD'
+expect_cmd block "invalid reserved group cannot create PR" \
+  'gh pr create --base dev --head group/not-valid --title x --body y'
+set_guard_branch group/g0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect_cmd block "overlong reserved group cannot push" 'git push origin HEAD'
+set_guard_branch agent/test/guard
 expect_cmd block "GitHub hostname auth"          'gh --hostname github.com auth token'
 expect_cmd block "GitHub auth access"           'gh auth status'
 expect_cmd block "Git identity access"          'git config --get user.email'
@@ -224,6 +288,9 @@ echo "== protected-path edits (Edit/Write matcher) =="
 expect_edit block "edit AGENTS.md (no maint)"        'AGENTS.md'
 expect_edit block "edit guard (no maint)"            'tools/pretooluse-guard.sh'
 expect_edit block "edit policy (no maint)"           'policy/deny.patterns'
+expect_edit block "edit CI workflow (no maint)"      '.github/workflows/ci.yml'
+expect_edit block "edit gate reducer (no maint)"     'scripts/dev/required-gates'
+expect_edit block "edit gate oracle (no maint)"      'tests/dev/required-gates-cases.sh'
 expect_edit block "edit .codex (no maint)"           '.codex/config.toml'
 expect_edit block "edit Claude MCP registration"     '.mcp.json'
 expect_edit block "edit Serena project config"       '.serena/project.yml'
@@ -241,7 +308,7 @@ expect_read block "read GitHub credential file"       '/home/agent/.config/gh/ho
 expect_read allow "read normal source file"           'tools/validate.sh'
 expect_edit allow "edit AGENTS.md (maint=1)"         'AGENTS.md' 1
 expect_edit allow "edit .grok (maint=1)"             '.grok/config.toml' 1
-expect_edit allow "edit normal file"                 'scripts/dev/test'
+expect_edit allow "edit normal file"                 'scripts/dev/brief'
 expect_edit allow "edit README"                      'README.md'
 
 echo "== Serena vendor hook envelopes and semantic mutators =="

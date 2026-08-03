@@ -31,16 +31,117 @@ require_absent() {
   fi
 }
 
-require_text .serena/project.yml 'project_name: "agent-lab-dev"' \
+top_level_line_is_exact() {
+  local file="$1" key="$2" expected="$3" key_count line_count
+  key_count="$(awk -v prefix="$key:" \
+    'index($0, prefix) == 1 { count++ } END { print count + 0 }' \
+    "$file")"
+  line_count="$(grep -Fxc -- "$expected" "$file" || true)"
+  [ "$key_count" -eq 1 ] && [ "$line_count" -eq 1 ]
+}
+
+require_top_level_line() {
+  local file="$1" key="$2" expected="$3" label="$4"
+  if top_level_line_is_exact "$repo_root/$file" "$key" "$expected"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
+project_indented_block() {
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    index($0, key ":") == 1 {
+      count++
+      capture = 1
+      next
+    }
+    capture && /^[^[:space:]]/ { capture = 0 }
+    capture { print }
+    END { if (count != 1) exit 1 }
+  ' "$file"
+}
+
+project_block_contains() {
+  local file="$1" key="$2" expected="$3" block
+  block="$(project_indented_block "$file" "$key")" &&
+    [[ "$block" == *"$expected"* ]]
+}
+
+require_project_block_text() {
+  local key="$1" expected="$2" label="$3"
+  if project_block_contains \
+       "$repo_root/.serena/project.yml" "$key" "$expected"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
+require_top_level_line .serena/project.yml project_name \
+  'project_name: "agent-lab-dev"' \
   "Serena project has an unambiguous logical name"
 require_text .serena/project.yml 'language_servers:' \
   "Serena project uses the current language_servers schema"
 require_text .serena/project.yml '- bash' \
   "Serena project selects the actual Bash language"
-require_text .serena/project.yml 'language_backend: LSP' \
+require_top_level_line .serena/project.yml language_backend \
+  'language_backend: LSP' \
   "Serena project explicitly selects the LSP backend"
-require_text .serena/project.yml 'ls_workspace_folders: ["."]' \
+require_top_level_line .serena/project.yml ignore_all_files_in_gitignore \
+  'ignore_all_files_in_gitignore: true' \
+  "Serena keeps ignored local material outside semantic search"
+require_top_level_line .serena/project.yml activation_command \
+  'activation_command:' \
+  "Serena activation runs no repository command"
+require_top_level_line .serena/project.yml ls_workspace_folders \
+  'ls_workspace_folders: ["."]' \
   "Serena indexes exactly the Agent Lab project root"
+require_project_block_text ls_specific_settings \
+  'bash_language_server_version: "5.6.0"' \
+  "Serena project selects the preseeded Bash language server version"
+for workflow_guidance in \
+  './scripts/dev/brief' \
+  './scripts/dev/changed' \
+  'docs/workstreams.md' \
+  './scripts/dev/workstream'; do
+  require_project_block_text initial_prompt "$workflow_guidance" \
+    "Serena activation prompt includes $workflow_guidance"
+done
+require_project_block_text initial_prompt \
+  'Serena does not' \
+  "Serena activation prompt disclaims Git and GitHub authority"
+
+mutant_config="$work/project-mutant.yml"
+sed \
+  -e 's#bash_language_server_version: "5.6.0"#bash_language_server_version: "9.9.9"#' \
+  -e 's#\./scripts/dev/workstream#./scripts/dev/forged#' \
+  "$repo_root/.serena/project.yml" > "$mutant_config"
+printf '%s\n' \
+  '# project_name: "agent-lab-dev"' \
+  '# bash_language_server_version: "5.6.0"' \
+  '# ./scripts/dev/workstream' \
+  'project_name: "attacker-controlled"' >> "$mutant_config"
+if top_level_line_is_exact \
+     "$mutant_config" project_name 'project_name: "agent-lab-dev"'; then
+  fail "Serena config checks reject duplicate-key comment decoys"
+else
+  pass "Serena config checks reject duplicate-key comment decoys"
+fi
+if project_block_contains \
+     "$mutant_config" ls_specific_settings \
+     'bash_language_server_version: "5.6.0"'; then
+  fail "Serena config checks reject out-of-block version decoys"
+else
+  pass "Serena config checks reject out-of-block version decoys"
+fi
+if project_block_contains \
+     "$mutant_config" initial_prompt './scripts/dev/workstream'; then
+  fail "Serena config checks reject out-of-block workflow decoys"
+else
+  pass "Serena config checks reject out-of-block workflow decoys"
+fi
 
 require_text compose.serena.yaml 'network_mode: none' \
   "Serena runtime has no network namespace"

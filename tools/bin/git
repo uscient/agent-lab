@@ -7,24 +7,49 @@
 # Agent Lab's contained-workload runtime (scripts/agent) — that is data plane, governed by containment.
 set -uo pipefail
 
-self="$(readlink -f "${BASH_SOURCE[0]}")"
-selfdir="$(dirname "$self")"
 real=""
-while IFS= read -r cand; do
-  rcand="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
-  [ "$rcand" = "$self" ] && continue
-  [ "$(dirname "$rcand")" = "$selfdir" ] && continue
-  real="$cand"; break
-done < <(type -aP git 2>/dev/null)
-if [ -z "$real" ]; then
-  for c in /usr/bin/git /usr/local/bin/git /bin/git; do [ -x "$c" ] && { real="$c"; break; }; done
-fi
+for c in /usr/bin/git /usr/local/bin/git /bin/git; do [ -x "$c" ] && { real="$c"; break; }; done
 [ -z "$real" ] && { echo "agent-lab git-shim: cannot locate the real git" >&2; exit 127; }
 
 block() { echo "BLOCKED by agent-lab policy: $1 (see AGENTS.md — Autonomy boundary)" >&2; exit 2; }
 
+valid_group() {
+  [ "${#1}" -le 48 ] && [[ "$1" =~ ^[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$ ]]
+}
+
+expected_rebase_target() {
+  local branch="$1"
+  case "$branch" in
+    work/* | group/* | slice/group/*/*) return 1 ;;
+    slice/*/*)
+      [[ "$branch" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'origin/work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | flow | master | main | DETACHED) return 1 ;;
+    *) printf 'origin/dev\n' ;;
+  esac
+}
+
+is_writable_branch() {
+  local branch="$1"
+  case "$branch" in
+    work/*) [[ "$branch" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] ;;
+    group/*) valid_group "${branch#group/}" ;;
+    slice/group/*/*)
+      [[ "$branch" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] &&
+        valid_group "${BASH_REMATCH[1]}"
+      ;;
+    slice/*/*)
+      [[ "$branch" =~ ^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$ ]]
+      ;;
+    slice/* | dev | flow | master | main | DETACHED) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Locate the subcommand, skipping git's global options (some carry a value).
-args=("$@"); n=${#args[@]}; i=0; sub=""
+args=("$@"); n=${#args[@]}; i=0; sub="" alternate_context=0
 while [ "$i" -lt "$n" ]; do
   a="${args[$i]}"
   case "$a" in
@@ -44,9 +69,11 @@ while [ "$i" -lt "$n" ]; do
       i=$((i + 2)); continue ;;
     --config-env=user.name=* | --config-env=user.email=* | --config-env=user.signingkey=* | --config-env=commit.gpgsign=* | --config-env=alias.*)
       block "Git attribution, signing identity, and alias overrides are forbidden" ;;
-    -C | --git-dir | --work-tree | --namespace | --super-prefix | --exec-path)
-      i=$((i + 2)); continue ;;
-    --git-dir=* | --work-tree=* | --namespace=* | --exec-path=* | -c*) i=$((i + 1)); continue ;;
+    -C | --git-dir | --work-tree)
+      alternate_context=1; i=$((i + 2)); continue ;;
+    -C?* | --git-dir=* | --work-tree=*) alternate_context=1; i=$((i + 1)); continue ;;
+    --namespace | --super-prefix | --exec-path) i=$((i + 2)); continue ;;
+    --namespace=* | --exec-path=* | -c*) i=$((i + 1)); continue ;;
     -*) i=$((i + 1)); continue ;;
     *) sub="$a"; break ;;
   esac
@@ -54,11 +81,11 @@ done
 
 case "$sub" in
   commit)
+    [ "$alternate_context" -eq 0 ] \
+      || block "commit through an alternate worktree or Git directory is forbidden"
     branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
-    case "$branch" in
-      dev | master | main | DETACHED)
-        block "commit on a protected branch or detached HEAD is forbidden" ;;
-    esac
+    is_writable_branch "$branch" \
+      || block "commit on a protected, detached, or invalid reserved branch is forbidden"
     for a in "${args[@]:$((i + 1))}"; do
       case "$a" in
         --author | --author=* | --reset-author)
@@ -68,16 +95,15 @@ case "$sub" in
   push)
     [ "$i" -eq 0 ] || block "push through an alternate Git working directory is forbidden"
     branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
-    case "$branch" in
-      dev | master | main | DETACHED)
-        block "push from protected or detached HEAD is forbidden" ;;
-    esac
+    is_writable_branch "$branch" \
+      || block "push from a protected, detached, or invalid reserved branch is forbidden"
     positional=()
+    lease=0
     j=$((i + 1))
     while [ "$j" -lt "$n" ]; do
       case "${args[$j]}" in
         -u | --set-upstream | --porcelain | --progress | --no-progress | --no-verify) ;;
-        --force-with-lease) ;;
+        --force-with-lease) lease=1 ;;
         --force-with-lease=* | --force | -f | --mirror | --delete | -d)
           block "plain force, deletion, and mirror pushes are forbidden" ;;
         -*) block "unsupported push option is outside the scoped workflow: ${args[$j]}" ;;
@@ -91,26 +117,47 @@ case "$sub" in
       || block "push is limited to origin"
     { [ "${positional[1]}" = HEAD ] || [ "${positional[1]}" = "$branch" ]; } \
       || block "push target must be the current same-named branch"
+    case "$branch" in
+      work/* | group/* | slice/group/*/*)
+        [ "$lease" -eq 0 ] || block "integration branches retain published history and cannot be force-updated"
+        ;;
+    esac
     ;;
   pull) block "git pull is forbidden — fetch (where available) + local merge of a LOCAL ref instead" ;;
   merge | rebase)
+    [ "$alternate_context" -eq 0 ] \
+      || block "integration through an alternate worktree or Git directory is forbidden"
+    branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+    case "$branch" in
+      dev | flow | master | main | DETACHED)
+        block "merge and rebase on a protected branch or detached HEAD are forbidden" ;;
+    esac
+    case "$branch" in
+      work/* | group/* | slice/group/*/*)
+        block "integration branch history is helper-managed; use scripts/dev/workstream sync or merge"
+        ;;
+    esac
+    if [ "$sub" = merge ]; then
+      for a in "${args[@]:$((i + 1))}"; do
+        case "$a" in slice/*) block "slice integration requires the verified workstream helper" ;; esac
+      done
+    fi
     if [ "$sub" = rebase ] && [ "$i" -ne 0 ]; then
       block "remote rebase through an alternate Git working directory is forbidden"
     fi
+    expected="$(expected_rebase_target "$branch" 2>/dev/null || true)"
     j=$((i + 1))
     while [ "$j" -lt "$n" ]; do
       case "${args[$j]}" in
         origin/* | upstream/* | refs/remotes/*)
           if [ "$sub" = rebase ] \
-            && [ "${args[$j]}" = origin/dev ] \
+            && [ -n "$expected" ] \
+            && [ "${args[$j]}" = "$expected" ] \
+            && [ "$j" -eq $((i + 1)) ] \
             && [ "$j" -eq $((n - 1)) ]; then
-            branch="$("$real" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
-            case "$branch" in
-              dev | master | main | DETACHED)
-                block "origin/dev rebase requires a non-protected work branch" ;;
-            esac
+            :
           else
-            block "remote integration is limited to rebasing the current work branch on origin/dev"
+            block "remote integration is limited to rebasing on the exact base derived from the current branch"
           fi
           ;;
       esac

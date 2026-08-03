@@ -97,12 +97,14 @@ expect_usage "unknown command fails closed" unknown
 expect_usage "missing commit subject fails closed" commit
 expect_usage "missing PR body path fails closed" pr-body
 expect_usage "missing PR base fails closed" pr-base
+expect_usage "missing PR route fails closed" pr-route
 expect_usage "branch rejects extra arguments" branch xor/dev-lane extra
 expect_usage "commit rejects extra arguments" commit "Implement workflow checks" extra
 expect_usage "commits rejects extra arguments" commits origin/dev extra
 expect_usage "PR title rejects extra arguments" pr-title "Implement workflow checks" extra
 expect_usage "PR body rejects extra arguments" pr-body body.md extra
 expect_usage "PR base rejects extra arguments" pr-base dev extra
+expect_usage "PR route rejects extra arguments" pr-route flow dev extra
 expect_usage "all rejects extra arguments" all origin/dev extra
 
 echo "== commit subjects =="
@@ -143,12 +145,20 @@ expect_ok "existing work-now branch remains policy-valid" branch work/now
 expect_ok "uppercase work branch remains policy-valid" branch Xor/Dev-Lane
 expect_ok "manual underscore branch remains policy-valid" branch xor/dev_lane
 expect_reject "protected dev is rejected" "protected" branch dev
+expect_reject "protected flow is rejected" "protected" branch flow
 expect_reject "protected master is rejected" "protected" branch master
 expect_reject "protected main is rejected" "protected" branch main
 expect_reject "empty branch is rejected" "detached or empty" branch ""
 expect_reject "invalid Git ref is rejected" "invalid Git branch" branch "bad branch"
 expect_reject "generic branch name is rejected" "generic" branch work
 expect_reject "Git previous-branch syntax is rejected" "magic syntax" branch '@{-1}'
+expect_ok "group branch is accepted" branch group/g0-operator-surface
+expect_ok "group slice branch is accepted" branch slice/group/g0-operator-surface/cli
+expect_ok "legacy slice branch is accepted" branch slice/demo/one
+expect_reject "invalid reserved group is rejected" "invalid reserved" branch group/not-valid
+expect_reject "overlong reserved group is rejected" "invalid reserved" branch \
+  group/g0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect_reject "invalid reserved slice is rejected" "invalid reserved" branch slice/group/not-valid/cli
 
 echo "== pull request metadata =="
 expect_ok "outcome PR title is accepted" pr-title \
@@ -172,9 +182,18 @@ expect_reject "merge boilerplate PR title is rejected" "merge boilerplate" pr-ti
 expect_reject "task-only PR title is rejected" "task-only" pr-title \
   "Task 42 changes"
 expect_ok "dev PR base is accepted" pr-base dev
-expect_reject "master PR base is rejected" "PR base must be dev" pr-base master
-expect_reject "main PR base is rejected" "PR base must be dev" pr-base main
-expect_reject "arbitrary PR base is rejected" "PR base must be dev" pr-base release
+expect_reject "master PR base is rejected" "must be dev" pr-base master
+expect_reject "main PR base is rejected" "must be dev" pr-base main
+expect_reject "arbitrary PR base is rejected" "must be dev" pr-base release
+expect_ok "flow final PR route is accepted" pr-route flow dev
+expect_ok "group PR route is accepted" pr-route group/g0-operator-surface flow
+expect_ok "group slice PR route is accepted" pr-route \
+  slice/group/g0-operator-surface/cli group/g0-operator-surface
+expect_ok "legacy slice PR route is accepted" pr-route slice/demo/one work/demo
+expect_ok "workstream final PR route is accepted" pr-route work/demo dev
+expect_reject "group cannot skip flow" "must be flow" pr-route group/g0-operator-surface dev
+expect_reject "group slice cannot skip parent" "must be group/g0-operator-surface" pr-route \
+  slice/group/g0-operator-surface/cli flow
 
 good_body="$work/good-body.md"
 cat > "$good_body" <<'EOF'
@@ -548,6 +567,41 @@ else
   printf '%s\n' "$checker_out"
 fi
 
+derived_repo="$work/derived-base-repo"
+make_repo "$derived_repo"
+git -C "$derived_repo" switch -q dev
+commit_file "$derived_repo" "Advance flow integration fixture"
+git -C "$derived_repo" update-ref refs/remotes/origin/flow HEAD
+git -C "$derived_repo" switch -qc group/g0-operator-surface
+commit_file "$derived_repo" "Implement operator surface fixture"
+run_in_repo "$derived_repo" commits origin/flow
+if [ "$checker_rc" -eq 0 ] && printf '%s\n' "$checker_out" | grep -Fq "commits=1"; then
+  pass "group commit range derives origin/flow"
+else
+  fail "group commit range derives origin/flow (rc=$checker_rc)"
+fi
+run_in_repo "$derived_repo" commits origin/dev
+if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "must resolve to origin/flow"; then
+  pass "group cannot narrow or redirect its flow base"
+else
+  fail "group cannot narrow or redirect its flow base (rc=$checker_rc)"
+fi
+git -C "$derived_repo" update-ref refs/remotes/origin/group/g0-operator-surface HEAD
+git -C "$derived_repo" switch -qc slice/group/g0-operator-surface/cli
+commit_file "$derived_repo" "Implement group slice fixture"
+run_in_repo "$derived_repo" commits origin/group/g0-operator-surface
+if [ "$checker_rc" -eq 0 ] && printf '%s\n' "$checker_out" | grep -Fq "commits=1"; then
+  pass "group slice commit range derives its matching group"
+else
+  fail "group slice commit range derives its matching group (rc=$checker_rc)"
+fi
+run_in_repo "$derived_repo" commits origin/flow
+if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "must resolve to origin/group/g0-operator-surface"; then
+  pass "group slice cannot skip its matching group base"
+else
+  fail "group slice cannot skip its matching group base (rc=$checker_rc)"
+fi
+
 run_in_repo "$valid_repo" commits HEAD
 if [ "$checker_rc" -eq 1 ] && printf '%s\n' "$checker_out" | grep -Fq "must resolve to origin/dev"; then
   pass "caller cannot exclude introduced commits with a HEAD base"
@@ -805,7 +859,7 @@ else
   printf '%s\n' "$checker_out"
 fi
 
-expected_passes=114
+expected_passes=134
 if [ "$passes" -ne "$expected_passes" ]; then
   fail "contract executed the exact expected assertions ($passes/$expected_passes)"
 fi

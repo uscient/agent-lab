@@ -72,7 +72,9 @@ ignore_all_files_in_gitignore: true
 # Maps the language key to the options.
 # The settings are considered only if the project is trusted (see global configuration to define trusted projects).
 # See https://oraios.github.io/serena/02-usage/050_configuration.html#language-server-specific-settings
-ls_specific_settings: {}
+ls_specific_settings:
+  bash:
+    bash_language_server_version: "5.6.0"
 
 # list of workspace folder paths (LSP backend only).
 # These folders will be used to build up Serena's symbol index.
@@ -154,7 +156,13 @@ initial_prompt: >-
   dedicated no-network Serena container. AGENTS.md and docs/serena.md are
   canonical; Serena memories are optional development assistance, never
   repository authority. Never inspect or modify credentials, tokens, GitHub
-  authentication, Git attribution, or unrelated host state.
+  authentication, Git attribution, or unrelated host state. Before changing
+  code, establish branch and worktree state with the host-side
+  ./scripts/dev/brief and ./scripts/dev/changed commands. Serena does not
+  establish Git or GitHub authority. For flow, group, or slice work, follow
+  AGENTS.md and docs/workstreams.md and use ./scripts/dev/workstream for
+  integration. Use ordinary tools for prose, configuration, and extensionless
+  Bash rails.
 
 # time budget (seconds) per tool call for the retrieval of additional symbol information
 # such as docstrings or parameter information.

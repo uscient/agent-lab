@@ -7,9 +7,9 @@ concurrency:
 
 on:
   push:
-    branches: [dev, master, main]
+    branches: [dev, flow, master, main]
   pull_request:
-    branches: [dev, master, main, 'work/**']
+    branches: [dev, flow, master, main, 'work/**', 'group/**']
   merge_group:
     types: [checks_requested]
   schedule:
@@ -17,7 +17,7 @@ on:
 
 jobs:
   analyze:
-    name: Analyze
+    name: CodeQL
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

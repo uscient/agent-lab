@@ -1,24 +1,50 @@
 #!/usr/bin/env bash
-# PATH shim for `gh` — allows read-only PR and Actions diagnosis plus PR creation to dev while
-# blocking authentication, integration, release mutation, and other remote writes. Slice integration
-# is available only through scripts/dev/workstream. Defense-in-depth; AGENTS.md is authoritative.
+# PATH shim for `gh` — allows read-only PR and Actions diagnosis plus the branch-derived PR-create
+# route while blocking authentication, integration, release mutation, and other remote writes.
+# Verified intermediate integration is available only through scripts/dev/workstream.
 set -uo pipefail
 
-self="$(readlink -f "${BASH_SOURCE[0]}")"
-selfdir="$(dirname "$self")"
 real=""
-while IFS= read -r cand; do
-  rcand="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
-  [ "$rcand" = "$self" ] && continue
-  [ "$(dirname "$rcand")" = "$selfdir" ] && continue
-  real="$cand"; break
-done < <(type -aP gh 2>/dev/null)
-if [ -z "$real" ]; then
-  for c in /usr/bin/gh /usr/local/bin/gh; do [ -x "$c" ] && { real="$c"; break; }; done
-fi
+for c in /usr/bin/gh /usr/local/bin/gh; do [ -x "$c" ] && { real="$c"; break; }; done
 [ -z "$real" ] && { echo "agent-lab gh-shim: cannot locate the real gh" >&2; exit 127; }
+real_git=""
+for c in /usr/bin/git /usr/local/bin/git /bin/git; do [ -x "$c" ] && { real_git="$c"; break; }; done
+[ -z "$real_git" ] && { echo "agent-lab gh-shim: cannot locate the real git" >&2; exit 127; }
 
 block() { echo "BLOCKED by agent-lab policy: $1 (see AGENTS.md — Autonomy boundary)" >&2; exit 2; }
+
+valid_group() {
+  [ "${#1}" -le 48 ] && [[ "$1" =~ ^[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$ ]]
+}
+
+expected_pr_base() {
+  local branch="$1" group=""
+  case "$branch" in
+    flow) printf 'dev\n' ;;
+    work/*)
+      [[ "$branch" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] || return 1
+      printf 'dev\n'
+      ;;
+    group/*)
+      valid_group "${branch#group/}" || return 1
+      printf 'flow\n'
+      ;;
+    slice/group/*/*)
+      [[ "$branch" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      group="${BASH_REMATCH[1]}"
+      valid_group "$group" || return 1
+      printf 'group/%s\n' "$group"
+      ;;
+    slice/*/*)
+      [[ "$branch" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | master | main | DETACHED) return 1 ;;
+    *) printf 'dev\n' ;;
+  esac
+}
 
 args=("$@")
 n=${#args[@]}
@@ -46,11 +72,10 @@ case "$sub" in
     case "${args[$((i + 1))]:-}" in
       list | view | status | checks | diff) ;;
       create)
-        branch="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
-        case "$branch" in
-          dev | master | main | DETACHED)
-            block "PR creation requires a non-protected work branch" ;;
-        esac
+        [ "$i" -eq 0 ] || block "PR creation must target the current repository directly"
+        branch="$("$real_git" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+        required_base="$(expected_pr_base "$branch")" \
+          || block "PR creation is not authorized from branch $branch"
         base="" head="" j=$((i + 2))
         while [ "$j" -lt "$n" ]; do
           a="${args[$j]}"
@@ -64,11 +89,12 @@ case "$sub" in
           esac
           j=$((j + 1))
         done
-        [ "$base" = dev ] || block "PR creation requires explicit --base dev"
+        [ "$base" = "$required_base" ] \
+          || block "PR creation requires explicit --base $required_base from $branch"
         [ -z "$head" ] || [ "$head" = "$branch" ] \
           || block "PR head must be the current work branch"
         ;;
-      *) block "PR mutation is forbidden; only reads and create --base dev are allowed" ;;
+      *) block "PR mutation is forbidden; only reads and the derived create route are allowed" ;;
     esac ;;
   run)
     [ "$i" -eq 0 ] || block "GitHub Actions commands must target the current repository directly"

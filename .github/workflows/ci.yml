@@ -7,9 +7,9 @@ concurrency:
 
 on:
   push:
-    branches: [dev, master, main]
+    branches: [dev, flow, master, main]
   pull_request:
-    branches: [dev, master, main, 'work/**']
+    branches: [dev, flow, master, main, 'work/**', 'group/**']
   merge_group:
     types: [checks_requested]
 
@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 15
     outputs:
       diff-base: ${{ steps.diff-base.outputs.base }}
+      tested-head: ${{ steps.diff-base.outputs.head }}
+      classification: ${{ steps.fast-gate.outputs.classification }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -31,17 +33,97 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
+      - name: Validate pull request topology
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ]; then
+            exit 0
+          fi
+          if [ "$PR_HEAD_REPOSITORY" != "$REPOSITORY" ]; then
+            printf '::error title=Invalid PR repository::cross-repository PRs are not accepted\n'
+            exit 1
+          fi
+
+          component='[a-z0-9][a-z0-9-]{0,47}'
+          group='[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*'
+          valid_group() {
+            [ "${#1}" -le 48 ] && [[ "$1" =~ ^$group$ ]]
+          }
+          case "$PR_BASE_REF" in
+            flow)
+              group_name="${PR_HEAD_REF#group/}"
+              [ "$PR_HEAD_REF" = "group/$group_name" ] && valid_group "$group_name"
+              ;;
+            group/*)
+              group_name="${PR_BASE_REF#group/}"
+              valid_group "$group_name" &&
+                [[ "$PR_HEAD_REF" =~ ^slice/group/$group_name/$component$ ]]
+              ;;
+            work/*)
+              work_name="${PR_BASE_REF#work/}"
+              [[ "$work_name" =~ ^$component$ ]] &&
+                [[ "$PR_HEAD_REF" =~ ^slice/$work_name/$component$ ]]
+              ;;
+            dev)
+              [[ ! "$PR_HEAD_REF" =~ ^(group|slice)/ ]]
+              ;;
+            master | main)
+              [[ ! "$PR_HEAD_REF" =~ ^(group|slice)/ ]]
+              ;;
+            *) false ;;
+          esac || {
+            printf '::error title=Invalid PR topology::%s cannot target %s\n' \
+              "$PR_HEAD_REF" "$PR_BASE_REF"
+            exit 1
+          }
+
       - name: Resolve committed diff base
         id: diff-base
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.event.after }}
+          REF_NAME: ${{ github.ref_name }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          EXPECTED_HEAD_SHA: ${{ github.sha }}
         run: |
+          sha_pattern='^([0-9a-f]{40}|[0-9a-f]{64})$'
+          head="$(git rev-parse HEAD)"
+          if [[ ! "$EXPECTED_HEAD_SHA" =~ $sha_pattern ]] ||
+             [[ "$EXPECTED_HEAD_SHA" =~ ^0+$ ]] ||
+             [ "$head" != "$EXPECTED_HEAD_SHA" ]; then
+            printf '::error title=Unexpected tested head::expected %s, checked out %s\n' \
+              "${EXPECTED_HEAD_SHA:-<empty>}" "${head:-<empty>}"
+            exit 125
+          fi
+
           case "$EVENT_NAME" in
             pull_request) base="$PR_BASE_SHA" ;;
-            push) base="$PUSH_BEFORE_SHA" ;;
+            push)
+              if [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+                if ! git fetch --no-tags origin \
+                  '+refs/heads/dev:refs/remotes/origin/dev'; then
+                  printf '::error title=Missing bootstrap authority::cannot resolve origin/dev\n'
+                  exit 125
+                fi
+                dev_head="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'origin/dev^{commit}')"
+                if [ "$REF_NAME" = flow ] && [ "$PUSH_AFTER_SHA" = "$head" ] &&
+                   [ "$head" = "$dev_head" ]; then
+                  base="$head"
+                else
+                  printf '::error title=Invalid branch creation::flow bootstrap must equal current origin/dev\n'
+                  exit 125
+                fi
+              else
+                base="$PUSH_BEFORE_SHA"
+              fi
+              ;;
             merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
             *)
               printf '::error title=Unsupported CI event::%s has no deterministic diff base\n' \
@@ -50,7 +132,6 @@ jobs:
               ;;
           esac
 
-          sha_pattern='^([0-9a-f]{40}|[0-9a-f]{64})$'
           if [[ ! "$base" =~ $sha_pattern ]] || [[ "$base" =~ ^0+$ ]]; then
             printf '::error title=Invalid CI diff base::event supplied %s\n' \
               "${base:-<empty>}"
@@ -67,18 +148,28 @@ jobs:
             exit 125
           fi
 
-          head="$(git rev-parse HEAD)"
           printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
           printf 'head=%s\n' "$head" >> "$GITHUB_OUTPUT"
 
       - name: Fast security gate
+        id: fast-gate
         env:
           AGENT_LAB_DIFF_BASE: ${{ steps.diff-base.outputs.base }}
           CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
+          set +e
           set -o pipefail
           mkdir -p "$CI_LOG_DIR"
           ./scripts/dev/ci-fast 2>&1 | tee "$CI_LOG_DIR/fast.log"
+          rc=$?
+          case "$rc" in
+            0) classification=success ;;
+            1) classification=assertion-failure ;;
+            125) classification=infrastructure ;;
+            *) classification=unexpected ;;
+          esac
+          printf 'classification=%s\n' "$classification" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Summarize fast gate
         if: ${{ always() }}
@@ -109,16 +200,43 @@ jobs:
     name: Static
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      tested-head: ${{ steps.identity.outputs.head }}
+      classification: ${{ steps.static-gate.outputs.classification }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      - name: Bind tested checkout
+        id: identity
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.sha }}
+        run: |
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$EXPECTED_HEAD_SHA" ]; then
+            printf '::error title=Unexpected tested head::expected %s, checked out %s\n' \
+              "$EXPECTED_HEAD_SHA" "$head"
+            exit 125
+          fi
+          printf 'head=%s\n' "$head" >> "$GITHUB_OUTPUT"
+
       - name: Static configuration gate
+        id: static-gate
         env:
           CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
+          set +e
           set -o pipefail
           mkdir -p "$CI_LOG_DIR"
           ./tools/validate.sh --strict 2>&1 | tee "$CI_LOG_DIR/static.log"
+          rc=$?
+          case "$rc" in
+            0) classification=success ;;
+            1) classification=assertion-failure ;;
+            125) classification=infrastructure ;;
+            *) classification=unexpected ;;
+          esac
+          printf 'classification=%s\n' "$classification" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Summarize static gate
         if: ${{ always() }}
@@ -144,8 +262,24 @@ jobs:
     name: Docker security
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      tested-head: ${{ steps.identity.outputs.head }}
+      classification: ${{ steps.docker-gate.outputs.classification }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Bind tested checkout
+        id: identity
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.sha }}
+        run: |
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$EXPECTED_HEAD_SHA" ]; then
+            printf '::error title=Unexpected tested head::expected %s, checked out %s\n' \
+              "$EXPECTED_HEAD_SHA" "$head"
+            exit 125
+          fi
+          printf 'head=%s\n' "$head" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
@@ -165,9 +299,19 @@ jobs:
           AGENT_LAB_DEVBOX_PREBUILT: 1
           CI_LOG_DIR: ${{ runner.temp }}/agent-lab-ci
         run: |
+          set +e
           set -o pipefail
           mkdir -p "$CI_LOG_DIR"
           ./scripts/dev/docker-gate 2>&1 | tee "$CI_LOG_DIR/docker.log"
+          rc=$?
+          case "$rc" in
+            0) classification=success ;;
+            1) classification=assertion-failure ;;
+            125) classification=infrastructure ;;
+            *) classification=unexpected ;;
+          esac
+          printf 'classification=%s\n' "$classification" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Summarize Docker gate
         if: ${{ always() }}
@@ -201,4 +345,5 @@ jobs:
       - name: Reduce required gate results
         env:
           CI_NEEDS_JSON: ${{ toJSON(needs) }}
+          CI_EXPECTED_HEAD: ${{ github.sha }}
         run: ./scripts/dev/required-gates

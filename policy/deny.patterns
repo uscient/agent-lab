@@ -1,7 +1,7 @@
 # policy/deny.patterns — unconditional control-plane denials (extended regex; one per line).
 # Read by tools/pretooluse-guard.sh; tools/codex-permission-request.sh delegates to that guard.
-# AGENTS.md is the operating-policy source. Scoped workflow decisions (origin/dev rebase,
-# same-branch push, and PR creation to dev) are implemented by the guard and argv shims.
+# AGENTS.md is the operating-policy source. Branch-derived rebase and PR routes, same-branch push,
+# and protected integration decisions are implemented by the guard, argv shims, and workstream helper.
 #
 # The git<->subcommand separator is [^[:alnum:]_]+ (not just whitespace) so the common quoted/
 # bracketed argv forms are caught too (e.g. subprocess(["git","push"])). The leading anchor

@@ -1,15 +1,16 @@
 # CI as an agent-facing gate
 
 Agent Lab CI is a versioned contract, not an advisory test counter. It runs on
-pull requests, merge-queue candidates, and pushes to `dev`, `master`, and
-`main`, and exposes one stable branch-protection result:
+merge-queue candidates, pushes to `dev`, `flow`, `master`, and `main`, and pull
+requests targeting those branches plus `work/**` and `group/**`. It exposes one stable result:
 **`CI / Required gates`**.
 
-`dev` is the repository's integration and pull-request base. The additional
-`master` and `main` workflow triggers protect those names if they are retained
-as publication or compatibility branches; a trigger does not make either one
-an agent integration target. See [Development and verification](development.md)
-for the branch workflow.
+`dev` remains authoritative. `flow` is the protected program base, `group/**`
+receives only its matching `slice/group/**`, and `work/**` receives only its
+matching legacy slice. Fast CI rejects cross-repository or level-skipping PR
+topologies. The `master` and `main` triggers protect retained publication or
+compatibility names; a trigger grants no integration authority. See
+[Development and verification](development.md) for the exact routes.
 
 ## Required workers
 
@@ -21,13 +22,17 @@ for the branch workflow.
 
 The `Required gates` job consumes GitHub's structured `needs` result, compares
 it with `tests/security/ci.manifest`, and succeeds only when the exact required
-set is present and every result is `success`. It combines the Fast worker's
-validated event base with the versioned replay command, so its summary contains
-a concrete command rather than a guessed Git ref. A missing, extra, skipped,
-cancelled, malformed, or unknown result fails closed.
+set is present, every result is `success`, every worker classifies that result
+as success, and every worker binds evidence to the exact event head. It combines
+the Fast worker's validated event base with the versioned replay command, so its
+summary contains a concrete command rather than a guessed Git ref. Assertion
+failures block with `1`; missing, extra, stale, skipped, cancelled, malformed,
+or infrastructure-uncertain evidence fails closed with `125`.
 
 CodeQL remains a separate check because GitHub does not expose cross-workflow
-jobs through `needs`.
+jobs through `needs`. Its workflow and job names are fixed as `CodeQL` so the merge helper and
+hosted rules can require the same unambiguous Actions result. GitHub also emits a same-named
+code-scanning result; that result must succeed but cannot substitute for the workflow job.
 
 The Docker worker always runs the full runtime gate. Its cache-aware devbox
 build is a separate timed step, and the gate records runtime-suite timings so
@@ -44,9 +49,11 @@ optional check. The optional OpenClaw image is not built by CI.
 5. Fix the source defect; do not weaken assertions, convert failures to skips,
    or add blanket retries.
 
-The fast job records and validates the immutable event diff base. It rejects
-missing, zero, malformed, unfetched, or non-ancestor SHAs rather than guessing
-`HEAD^`.
+The fast job records and validates the immutable event diff base and checked-out
+head. It rejects missing, malformed, unfetched, non-ancestor, or mismatched SHAs
+rather than guessing `HEAD^`. The sole zero-predecessor exception is the human
+creation of literal `flow` at the exact R0-updated `dev` commit; that push still
+runs the complete gates and CodeQL.
 
 ## Trust boundary
 
@@ -65,11 +72,12 @@ write access.
 
 ## Repository ruleset
 
-After the workflow has emitted its first check, require `CI / Required gates`
-on `dev` and on every retained publication branch (`master` or `main`) that can
-receive changes. Require CodeQL through the repository's code-scanning rule.
-Enable the up-to-date-branch requirement or a merge queue so the tested
-synthetic merge commit includes the current integration branch.
+After each base has emitted its first check, require `CI / Required gates` and
+CodeQL on `dev`, `flow`, every `group/**` base, and any retained publication
+branch. Require current-base testing or a merge queue, approval of the latest
+push, and stale-approval dismissal. Deny force updates and deletion for
+`flow`, `work/**`, `group/**`, and `slice/group/**`; keep merge commits and disable
+automatic program-branch deletion through final review.
 
 Do not require worker or matrix names individually. The stable aggregate is the
 public contract; its versioned manifest defines the internal required set.

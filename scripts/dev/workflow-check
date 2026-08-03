@@ -12,6 +12,7 @@ usage: scripts/dev/workflow-check branch [name]
        scripts/dev/workflow-check pr-title <title>
        scripts/dev/workflow-check pr-body <file>
        scripts/dev/workflow-check pr-base <base>
+       scripts/dev/workflow-check pr-route <head> <base>
        scripts/dev/workflow-check all [base]
 EOF
   return 2
@@ -91,8 +92,31 @@ check_branch() {
     return
   fi
   case "$branch_name" in
-    dev | master | main)
+    dev | flow | master | main)
       fail "branch is protected: $branch_name"
+      return
+      ;;
+  esac
+  case "$branch_name" in
+    work/*)
+      [[ "$branch_name" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || { fail "invalid reserved workstream branch: $branch_name"; return; }
+      ;;
+    group/*)
+      valid_group "${branch_name#group/}" \
+        || { fail "invalid reserved group branch: $branch_name"; return; }
+      ;;
+    slice/group/*/*)
+      [[ "$branch_name" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] &&
+        valid_group "${BASH_REMATCH[1]}" \
+        || { fail "invalid reserved group slice branch: $branch_name"; return; }
+      ;;
+    slice/*/*)
+      [[ "$branch_name" =~ ^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || { fail "invalid reserved workstream slice branch: $branch_name"; return; }
+      ;;
+    slice/*)
+      fail "invalid reserved branch: $branch_name"
       return
       ;;
   esac
@@ -121,6 +145,10 @@ check_branch() {
   fi
 
   printf 'PASS workflow branch=%s\n' "$branch_name"
+}
+
+valid_group() {
+  [ "${#1}" -le 48 ] && [[ "$1" =~ ^[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$ ]]
 }
 
 check_current_or_named_branch() {
@@ -175,14 +203,86 @@ check_pr_title() {
   printf 'PASS workflow PR title\n'
 }
 
-check_pr_base() {
-  local base="$1"
+expected_pr_base() {
+  local head="$1" group=""
+  case "$head" in
+    flow) printf 'dev\n' ;;
+    work/*)
+      [[ "$head" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] || return 1
+      printf 'dev\n'
+      ;;
+    group/*)
+      valid_group "${head#group/}" || return 1
+      printf 'flow\n'
+      ;;
+    slice/group/*/*)
+      [[ "$head" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      group="${BASH_REMATCH[1]}"
+      valid_group "$group" || return 1
+      printf 'group/%s\n' "$group"
+      ;;
+    slice/*/*)
+      [[ "$head" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | master | main) return 1 ;;
+    *) printf 'dev\n' ;;
+  esac
+}
 
-  if [[ "$base" != dev ]]; then
-    fail "PR base must be dev"
+expected_commit_base() {
+  local head="$1" group=""
+  case "$head" in
+    flow) printf 'origin/dev\n' ;;
+    work/*)
+      [[ "$head" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] || return 1
+      printf 'origin/dev\n'
+      ;;
+    group/*)
+      valid_group "${head#group/}" || return 1
+      printf 'origin/flow\n'
+      ;;
+    slice/group/*/*)
+      [[ "$head" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      group="${BASH_REMATCH[1]}"
+      valid_group "$group" || return 1
+      printf 'origin/group/%s\n' "$group"
+      ;;
+    slice/*/*)
+      [[ "$head" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'origin/work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | master | main) return 1 ;;
+    *) printf 'origin/dev\n' ;;
+  esac
+}
+
+check_pr_route() {
+  local head="$1" base="$2" expected=""
+
+  expected="$(expected_pr_base "$head")" || {
+    fail "PR head is not an authorized workflow branch: $head"
+    return
+  }
+  if [[ "$base" != "$expected" ]]; then
+    fail "PR base for $head must be $expected"
     return
   fi
-  printf 'PASS workflow PR base=dev\n'
+  printf 'PASS workflow PR route=%s->%s\n' "$head" "$base"
+}
+
+check_pr_base() {
+  local base="$1" head=""
+
+  if ! head="$(git branch --show-current 2>/dev/null)" || [[ -z "$head" ]]; then
+    infra "cannot inspect the head branch for the PR base"
+    return
+  fi
+  check_pr_route "$head" "$base"
 }
 
 strip_nonprose_markdown() {
@@ -354,23 +454,34 @@ check_pr_body() {
 }
 
 check_commits() {
-  local base="$1" base_oid integration_oid revisions hash author_name author_email
+  local base="$1" branch_name expected_base base_oid integration_oid revisions hash author_name author_email
   local subject message trailers ancestry_rc=0 count=0
 
   if ! command -v git >/dev/null 2>&1; then
     infra "cannot inspect commits without git"
     return
   fi
+  if ! branch_name="$(git branch --show-current 2>/dev/null)" || [[ -z "$branch_name" ]]; then
+    infra "cannot inspect current branch"
+    return
+  fi
+  expected_base="$(expected_commit_base "$branch_name")" || {
+    fail "commit range is not authorized from branch: $branch_name"
+    return
+  }
+  if [[ -z "$base" ]]; then
+    base="$expected_base"
+  fi
   if ! base_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify "${base}^{commit}" 2>/dev/null)"; then
     infra "invalid base: $base"
     return
   fi
-  if ! integration_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'origin/dev^{commit}' 2>/dev/null)"; then
-    infra "cannot resolve origin/dev"
+  if ! integration_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify "${expected_base}^{commit}" 2>/dev/null)"; then
+    infra "cannot resolve $expected_base"
     return
   fi
   if [[ "$base_oid" != "$integration_oid" ]]; then
-    fail "commit base must resolve to origin/dev: $base"
+    fail "commit base must resolve to $expected_base: $base"
     return
   fi
   if ! GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
@@ -458,7 +569,7 @@ main() {
       ;;
     commits)
       (($# <= 1)) || { usage; return; }
-      check_commits "${1:-origin/dev}"
+      check_commits "${1:-}"
       ;;
     pr-title)
       (($# == 1)) || { usage; return; }
@@ -472,9 +583,13 @@ main() {
       (($# == 1)) || { usage; return; }
       check_pr_base "$1"
       ;;
+    pr-route)
+      (($# == 2)) || { usage; return; }
+      check_pr_route "$1" "$2"
+      ;;
     all)
       (($# <= 1)) || { usage; return; }
-      check_all "${1:-origin/dev}"
+      check_all "${1:-}"
       ;;
     *)
       usage

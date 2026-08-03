@@ -7,6 +7,7 @@ manifest="$repo_root/tests/security/ci.manifest"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 failures=0
+tested_head="2222222222222222222222222222222222222222"
 
 pass() {
   printf 'PASS %s\n' "$1"
@@ -17,12 +18,33 @@ fail() {
   failures=$((failures + 1))
 }
 
+attach_evidence() {
+  local json="$1" prepared=""
+  prepared="$(printf '%s' "$json" | jq -c --arg head "$tested_head" '
+    if type != "object" then . else
+      with_entries(
+        if (.value | type) == "object" then
+          .value.outputs =
+            ((if (.value.outputs | type) == "object" then .value.outputs else {} end) +
+             {"tested-head": $head,
+              "classification":
+                (if .value.result == "success" then "success"
+                 elif .value.result == "failure" then "assertion-failure"
+                 else "infrastructure" end)})
+        else . end)
+    end
+  ' 2>/dev/null)" || prepared="$json"
+  printf '%s' "$prepared"
+}
+
 run_reducer() {
   local json="$1" summary_path="${2:-}"
+  json="$(attach_evidence "$json")"
   if [ -n "$summary_path" ]; then
-    CI_NEEDS_JSON="$json" GITHUB_STEP_SUMMARY="$summary_path" "$reducer"
+    CI_NEEDS_JSON="$json" CI_EXPECTED_HEAD="$tested_head" \
+      GITHUB_STEP_SUMMARY="$summary_path" "$reducer"
   else
-    CI_NEEDS_JSON="$json" "$reducer"
+    CI_NEEDS_JSON="$json" CI_EXPECTED_HEAD="$tested_head" "$reducer"
   fi
 }
 
@@ -41,6 +63,7 @@ capture_reducer() {
   local case_id="$1" json="$2" summary_path="${3:-}" manifest_path="${4:-}"
   local path_override="${5:-$PATH}"
   local -a args=()
+  json="$(attach_evidence "$json")"
 
   CAPTURE_STDOUT="$work/$case_id.stdout"
   CAPTURE_STDERR="$work/$case_id.stderr"
@@ -50,11 +73,12 @@ capture_reducer() {
   fi
 
   if [ -n "$summary_path" ]; then
-    env PATH="$path_override" CI_NEEDS_JSON="$json" \
+    env PATH="$path_override" CI_NEEDS_JSON="$json" CI_EXPECTED_HEAD="$tested_head" \
       GITHUB_STEP_SUMMARY="$summary_path" \
       "$reducer" "${args[@]}" > "$CAPTURE_STDOUT" 2> "$CAPTURE_STDERR" || CAPTURE_RC=$?
   else
     env -u GITHUB_STEP_SUMMARY PATH="$path_override" CI_NEEDS_JSON="$json" \
+      CI_EXPECTED_HEAD="$tested_head" \
       "$reducer" "${args[@]}" > "$CAPTURE_STDOUT" 2> "$CAPTURE_STDERR" || CAPTURE_RC=$?
   fi
 }
@@ -162,12 +186,58 @@ fi
 expect_rc 1 "failure blocks the required gate" \
   '{"fast":{"result":"failure"},"static":{"result":"success"},"docker":{"result":"success"}}' \
   "REQUIRED GATES FAIL"
-expect_rc 1 "cancelled blocks the required gate" \
+expect_rc 125 "cancelled is infrastructure uncertainty" \
   '{"fast":{"result":"success"},"static":{"result":"cancelled"},"docker":{"result":"success"}}' \
-  "REQUIRED GATES FAIL"
-expect_rc 1 "skipped blocks the required gate" \
+  "REQUIRED GATES INFRA"
+expect_rc 125 "skipped is infrastructure uncertainty" \
   '{"fast":{"result":"success"},"static":{"result":"success"},"docker":{"result":"skipped"}}' \
-  "REQUIRED GATES FAIL"
+  "REQUIRED GATES INFRA"
+
+expect_raw_rc() {
+  local expected="$1" name="$2" json="$3" expected_head="$4" marker="$5" rc=0 out
+  out="$(CI_NEEDS_JSON="$json" CI_EXPECTED_HEAD="$expected_head" "$reducer" 2>&1)" || rc=$?
+  if [ "$rc" -eq "$expected" ] && printf '%s\n' "$out" | grep -Fq "$marker"; then
+    pass "$name"
+  else
+    fail "$name (rc=$rc, expected=$expected, marker=$marker)"
+    printf '%s\n' "$out"
+  fi
+}
+
+evidenced_success="$(attach_evidence "$success_json")"
+stale_head_json="$(printf '%s' "$evidenced_success" | jq -c \
+  '.static.outputs["tested-head"]="3333333333333333333333333333333333333333"')"
+expect_raw_rc 125 "stale worker head is infrastructure uncertainty" \
+  "$stale_head_json" "$tested_head" "REQUIRED GATES INFRA"
+missing_class_json="$(printf '%s' "$evidenced_success" | jq -c \
+  'del(.docker.outputs.classification)')"
+expect_raw_rc 125 "missing worker classification is infrastructure uncertainty" \
+  "$missing_class_json" "$tested_head" "REQUIRED GATES INFRA"
+infra_failure_json="$(printf '%s' "$evidenced_success" | jq -c \
+  '.docker.result="failure" | .docker.outputs.classification="infrastructure"')"
+expect_raw_rc 125 "worker infrastructure failure retains exit 125" \
+  "$infra_failure_json" "$tested_head" "REQUIRED GATES INFRA"
+mixed_failure_json="$(printf '%s' "$infra_failure_json" | jq -c \
+  '.static.result="failure" | .static.outputs.classification="assertion-failure"')"
+expect_raw_rc 125 "infrastructure takes precedence over mixed assertion failure" \
+  "$mixed_failure_json" "$tested_head" "REQUIRED GATES INFRA"
+forged_success_json="$(printf '%s' "$evidenced_success" | jq -c \
+  '.fast.outputs.classification="assertion-failure"')"
+expect_raw_rc 125 "success with forged failure classification is not green" \
+  "$forged_success_json" "$tested_head" "REQUIRED GATES INFRA"
+
+head_mutant="$work/required-gates-head-mutant"
+sed 's/if \[ "$gate_head" != "$CI_EXPECTED_HEAD" \]; then/if false; then/' \
+  "$reducer" > "$head_mutant"
+chmod +x "$head_mutant"
+head_mutant_rc=0
+CI_NEEDS_JSON="$stale_head_json" CI_EXPECTED_HEAD="$tested_head" \
+  "$head_mutant" --manifest "$manifest" >/dev/null 2>&1 || head_mutant_rc=$?
+if ! cmp -s "$reducer" "$head_mutant" && [ "$head_mutant_rc" -eq 0 ]; then
+  pass "tested-head sensitivity mutation turns the stale-head case RED"
+else
+  fail "tested-head sensitivity mutation turns the stale-head case RED"
+fi
 
 expect_rc 125 "missing required job is infrastructure failure" \
   '{"fast":{"result":"success"},"static":{"result":"success"}}' \
@@ -203,6 +273,18 @@ if [ "$unset_rc" -eq 125 ] &&
 else
   fail "unset CI_NEEDS_JSON is infrastructure failure (rc=$unset_rc)"
   printf '%s\n' "$unset_out"
+fi
+
+unset_head_rc=0
+unset_head_out="$(env -u CI_EXPECTED_HEAD CI_NEEDS_JSON="$evidenced_success" \
+  "$reducer" 2>&1)" || unset_head_rc=$?
+if [ "$unset_head_rc" -eq 125 ] &&
+  printf '%s\n' "$unset_head_out" | grep -Fq 'REQUIRED GATES INFRA' &&
+  printf '%s\n' "$unset_head_out" | grep -Fq '`CI_EXPECTED_HEAD` is unset.'; then
+  pass "unset CI_EXPECTED_HEAD is infrastructure failure"
+else
+  fail "unset CI_EXPECTED_HEAD is infrastructure failure (rc=$unset_head_rc)"
+  printf '%s\n' "$unset_head_out"
 fi
 
 empty_file="$work/empty"

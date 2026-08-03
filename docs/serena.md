@@ -6,11 +6,12 @@ helper, not a service used by workloads launched through `scripts/agent`.
 
 ## The 30-second version
 
-Remember these five facts:
+Remember these facts:
 
 - the Serena project is `agent-lab-dev`;
 - Serena sees this repository at `/workspace`;
 - semantic analysis covers `.sh` and `.bash` files;
+- Git and GitHub branch state come from host-side repository commands, not Serena;
 - build the contained toolchain once with `./scripts/dev/serena-build`;
 - at the start of a coding session, activate `/workspace` explicitly and prove readiness with a
   live symbol query.
@@ -168,6 +169,18 @@ is active.
 
 Serena supplements ordinary search and the repository checks. It replaces neither.
 
+### Branch-workflow orientation
+
+Serena's project prompt tells agents to establish branch and worktree state with the host-side
+`./scripts/dev/brief` and `./scripts/dev/changed` commands before editing. For `flow`, group, or
+slice work, [the workstream contract](workstreams.md) and `scripts/dev/workstream` remain the
+integration authority. Serena cannot establish the current GitHub PR state, required-check state,
+or permission to mutate a protected branch.
+
+Keep workflow prose, YAML, and extensionless Bash rails on the ordinary search/edit path. Serena is
+still useful for supported `.sh` and `.bash` helpers reached from those rails, but its result is
+semantic evidence only; the repository gates supply behavioral and security evidence.
+
 ## What a healthy integration proves
 
 Keep these states separate:
@@ -268,10 +281,10 @@ SERENA_HOME="$(mktemp -d)" serena project create . \
   --ls bash
 ```
 
-The tracked `.serena/project.yml` selects Bash, UTF-8, the LSP backend, Git-ignore handling, and the
-single workspace root `.`. It adds no external workspace folders and does not over-ignore source or
-tests. No project memories are currently persisted; repository guidance is sufficient and remains
-canonical.
+The tracked `.serena/project.yml` selects Bash, UTF-8, the LSP backend, Git-ignore handling, the
+preseeded Bash-language-server version, and the single workspace root `.`. It adds no external
+workspace folders and does not over-ignore source or tests. No project memories are currently
+persisted; repository guidance is sufficient and remains canonical.
 
 `scripts/serena-mcp` starts the one-shot `compose.serena.yaml` service. Every bind is private and
 non-recursive. Startup fails closed on child mounts, visible nested `.git` objects, nested
