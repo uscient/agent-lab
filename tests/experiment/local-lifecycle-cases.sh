@@ -2,10 +2,17 @@
 set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+# Leaf subcases in frozen assertion-identity order. The catalog block is listed
+# by leaf rather than through an intermediate aggregate: a nested scheduler
+# hides its own long pole from this router, and only this router can place that
+# pole in a public route of its own.
 all_subcases=(
   "$repo_root/tests/install/local-install-cases.sh"
   "$repo_root/tests/experiment/local-config-cases.sh"
-  "$repo_root/tests/experiment/local-image-catalog-cases.sh"
+  "$repo_root/tests/image/catalog-cases.sh"
+  "$repo_root/tests/image/catalog-state-cases.py"
+  "$repo_root/tests/experiment/catalog-resolution-cases.sh"
+  "$repo_root/tests/image/catalog-mutation-cases.py"
   "$repo_root/tests/experiment/install-store-cases.sh"
   "$repo_root/tests/experiment/install-state-cases.py"
   "$repo_root/tests/experiment/install-integrity-cases.py"
@@ -18,42 +25,67 @@ if [ "$#" -eq 0 ]; then
 elif [ "$#" -eq 1 ]; then
   route="$1"
 else
-  printf 'Usage: %s [local|install]\n' "${BASH_SOURCE[0]}" >&2
+  printf 'Usage: %s [local|catalog-state|catalog-resolution|install]\n' \
+    "${BASH_SOURCE[0]}" >&2
   exit 2
 fi
 
+# Every public route carries a bounded share of the frozen 133 identities, and
+# the two indivisible poles - catalog state and install state - never share a
+# route with movable work.
 case "$route" in
   all)
     selected_start=0
-    selected_count=7
+    selected_count=10
     expected_start=1
     expected_count=133
     lane_count=3
-    lane_map=(0 1 2 0 1 2 0)
+    lane_map=(1 1 1 0 2 2 2 1 2 2)
     final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
     ;;
   local)
     selected_start=0
     selected_count=3
     expected_start=1
-    expected_count=86
+    expected_count=28
     lane_count=2
     lane_map=(0 0 1)
     final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
     ;;
-  install)
+  catalog-state)
+    # The catalog state subcase is a strictly serial long pole. It is the whole
+    # route, so no movable work competes with it for the frozen deadline.
     selected_start=3
+    selected_count=1
+    expected_start=29
+    expected_count=34
+    lane_count=1
+    lane_map=(0)
+    final_marker='EXPERIMENT CATALOG STATE LIFECYCLE PASS'
+    ;;
+  catalog-resolution)
+    selected_start=4
+    selected_count=2
+    expected_start=63
+    expected_count=24
+    lane_count=2
+    lane_map=(0 1)
+    final_marker='EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS'
+    ;;
+  install)
+    selected_start=6
     selected_count=4
     expected_start=87
     expected_count=47
-    # The long-pole subcase owns a lane, as the local route already does for the
-    # catalog aggregate; the three short subcases share the other lane.
+    # The long-pole subcase owns a lane; the three short subcases share the
+    # other lane.
     lane_count=2
     lane_map=(0 1 0 0)
     final_marker='EXPERIMENT INSTALL LIFECYCLE PASS'
     ;;
   *)
-    printf 'Usage: %s [local|install]\n' "${BASH_SOURCE[0]}" >&2
+    printf 'Usage: %s [local|catalog-state|catalog-resolution|install]\n' \
+      "${BASH_SOURCE[0]}" >&2
     exit 2
     ;;
 esac
@@ -69,7 +101,7 @@ infrastructure_exit() {
   exit 125
 }
 
-if [ "${#all_subcases[@]}" -ne 7 ] ||
+if [ "${#all_subcases[@]}" -ne 10 ] ||
    [ "${#subcases[@]}" -ne "$selected_count" ] ||
    [ "${#lane_map[@]}" -ne "$selected_count" ]; then
   infrastructure_exit
