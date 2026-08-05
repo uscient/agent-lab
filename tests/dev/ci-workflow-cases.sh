@@ -44,7 +44,9 @@ job_block() {
 require_job_text() {
   local job="$1" text="$2" name="$3" block
   block="$(job_block "$ci" "$job")"
-  if [ -n "$block" ] && printf '%s\n' "$block" | grep -Fq -- "$text"; then
+  # Avoid `producer | grep -q` under pipefail: an early match may SIGPIPE the
+  # producer and turn a true assertion into a scheduler-dependent failure.
+  if [ -n "$block" ] && grep -Fq -- "$text" <<<"$block"; then
     pass "$name"
   else
     fail "$name"

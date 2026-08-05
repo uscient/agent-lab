@@ -328,10 +328,8 @@ if GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
   && [ "$(git -C "$sync_fixture" branch --show-current)" = "$sync_branch" ] \
   && [ "$(git -C "$sync_fixture" rev-parse HEAD^1)" = "$accepted_oid" ] \
   && [ "$(git -C "$sync_fixture" rev-parse HEAD^2)" = "$flow_oid" ] \
-  && grep -Fq 'merge --ff-only origin/group/g0-operator-surface' "$sync_trace" \
-  && grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace" \
-  && ! grep -Fq ' push ' "$sync_trace" \
-  && ! grep -Fq 'rebase origin/flow' "$sync_trace"; then
+  && [ "$(git --git-dir="$sync_origin" rev-parse refs/heads/group/g0-operator-surface)" = "$accepted_oid" ] \
+  && ! git --git-dir="$sync_origin" show-ref --verify --quiet "refs/heads/$sync_branch"; then
   pass "PR-only Group sync preserves accepted merges and both moving-parent histories"
 else
   fail "PR-only Group sync preserves accepted merges and both moving-parent histories"
