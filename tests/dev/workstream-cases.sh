@@ -144,7 +144,7 @@ git -C "$route_fixture" add scripts/dev/workstream scripts/dev/workflow-check
 git -C "$route_fixture" -c user.name=test -c user.email=test@example.invalid \
   commit -qm fixture
 fixture_oid="$(git -C "$route_fixture" rev-parse HEAD)"
-printf 'scripts/dev/workstream-*\n' > "$route_fixture/.git/info/exclude"
+printf 'scripts/dev/workstream-*\nscripts/dev/workflow-check-*\n' > "$route_fixture/.git/info/exclude"
 git -C "$route_fixture" update-ref refs/heads/slice/demo/format "$fixture_oid"
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/slice/demo/format
 : > "$gh_log"
@@ -548,6 +548,169 @@ if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$strict_mutant"; printf 
   pass "strict current-evidence sensitivity mutation turns RED"
 else
   fail "strict current-evidence sensitivity mutation turns RED"
+fi
+
+# An opened PR body reaches GitHub before any validation, so its published Cycle 1 can end a
+# canonical result with comma-adjacent prose. Strict validation then rejects that published cycle
+# and append-only rejects every correction, so exactly that class needs one bounded repair.
+published_suffix_body="$work/published-suffix-body.md"
+sed -e '/^- RED:/s/$/, including WORKSTREAM-EVIDENCE-CURRENT/' \
+  -e '/^- GREEN:/s/$/, 39\/39 assertions/' "$valid_body" > "$published_suffix_body"
+published_suffix_json="$(jq -c --rawfile body "$published_suffix_body" '.body = $body' \
+  <<<"$valid_json")"
+if run_evidence "$published_suffix_json" "$valid_body" \
+  && cmp -s "$valid_body" "$updated_body_marker" \
+  && grep -Fxq "pr edit 17 --repo github.com/uscient/agent-lab --body-file $valid_body" "$gh_log" \
+  && [ "$(grep -c '^pr edit ' "$gh_log")" -eq 1 ] \
+  && grep -Fq 'PASS workstream repaired the invalid published evidence cycle for PR 17' \
+    "$work/stdout"; then
+  pass "bounded repair corrects two comma-suffixed results in the published latest cycle"
+else
+  fail "bounded repair corrects two comma-suffixed results in the published latest cycle"
+fi
+# A correction inside the bound is not an append-only violation, so the captured append attempt
+# must stay unreported on the accepted route and must still be replayed on every refused one.
+if ! grep -Fq 'FAIL workflow PR evidence update changed or erased a prior cycle' \
+  "$work/stderr"; then
+  pass "an accepted bounded repair never reports a misleading append-only failure"
+else
+  fail "an accepted bounded repair never reports a misleading append-only failure"
+fi
+
+capture_mutant="$route_fixture/scripts/dev/workstream-capture-mutant"
+sed 's#evidence-append "$old_body" "$body_file" >/dev/null 2>"$append_log"#evidence-append "$old_body" "$body_file"#' \
+  "$route_fixture/scripts/dev/workstream" > "$capture_mutant"
+chmod +x "$capture_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$capture_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$published_suffix_json" "$valid_body" "$capture_mutant" \
+  && grep -Fq 'FAIL workflow PR evidence update changed or erased a prior cycle' \
+    "$work/stderr"; then
+  pass "append-attempt capture sensitivity mutation turns RED"
+else
+  fail "append-attempt capture sensitivity mutation turns RED"
+fi
+
+# A published body that already passes the same strict validation keeps the append-only path, even
+# when the replacement has the exact shape of a bounded repair.
+strict_suffix_body="$work/strict-suffix-body.md"
+sed '/^- GREEN:/s/$/, rc=0 classification=success/' "$valid_body" > "$strict_suffix_body"
+strict_suffix_json="$(jq -c --rawfile body "$strict_suffix_body" '.body = $body' <<<"$valid_json")"
+if run_evidence "$strict_suffix_json" "$valid_body"; then
+  fail "already-strict published evidence stays on the append-only path"
+elif ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'changed or erased prior cycles' "$work/stderr" \
+  && grep -Fq 'FAIL workflow PR evidence update changed or erased a prior cycle' \
+    "$work/stderr"; then
+  pass "already-strict published evidence stays on the append-only path"
+else
+  fail "already-strict published evidence stays on the append-only path"
+fi
+
+forged_repair_body="$work/forged-repair-body.md"
+sed 's/WORKSTREAM-EVIDENCE-CURRENT/WORKSTREAM-EVIDENCE-FORGED/' \
+  "$valid_body" > "$forged_repair_body"
+if run_evidence "$published_suffix_json" "$forged_repair_body"; then
+  fail "bounded repair refuses a non-result field rewrite"
+elif ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'is not a bounded repair of its invalid published cycle' "$work/stderr"; then
+  pass "bounded repair refuses a non-result field rewrite"
+else
+  fail "bounded repair refuses a non-result field rewrite"
+fi
+
+earlier_suffix_body="$work/earlier-suffix-body.md"
+{
+  cat "$published_suffix_body"
+  sed -n '/^### Cycle 1$/,$p' "$valid_body" | sed 's/^### Cycle 1$/### Cycle 2/'
+} > "$earlier_suffix_body"
+earlier_suffix_json="$(jq -c --rawfile body "$earlier_suffix_body" '.body = $body' \
+  <<<"$valid_json")"
+if run_evidence "$earlier_suffix_json" "$appended_body"; then
+  fail "bounded repair refuses an earlier published cycle"
+elif ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'is not a bounded repair of its invalid published cycle' "$work/stderr"; then
+  pass "bounded repair refuses an earlier published cycle"
+else
+  fail "bounded repair refuses an earlier published cycle"
+fi
+
+repair_mutant="$route_fixture/scripts/dev/workstream-repair-mutant"
+sed 's#PATH=/usr/bin:/bin "$real_bash" "$workflow_check" evidence-repair "$old_body" "$body_file" >/dev/null 2>"$repair_log"#true#' \
+  "$route_fixture/scripts/dev/workstream" > "$repair_mutant"
+chmod +x "$repair_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$repair_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$published_suffix_json" "$forged_repair_body" "$repair_mutant"; then
+  pass "bounded repair sensitivity mutation turns RED"
+else
+  fail "bounded repair sensitivity mutation turns RED"
+fi
+
+published_strict_mutant="$route_fixture/scripts/dev/workstream-published-strict-mutant"
+sed 's#PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$old_body" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null 2>&1#false#' \
+  "$route_fixture/scripts/dev/workstream" > "$published_strict_mutant"
+chmod +x "$published_strict_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$published_strict_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$strict_suffix_json" "$valid_body" "$published_strict_mutant"; then
+  pass "published-invalid precondition sensitivity mutation turns RED"
+else
+  fail "published-invalid precondition sensitivity mutation turns RED"
+fi
+
+append_infra_check="$route_fixture/scripts/dev/workflow-check-append-infra"
+cat > "$append_infra_check" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = evidence-append ]; then
+  printf 'INFRA workflow synthetic append infrastructure failure\n' >&2
+  exit 125
+fi
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+exec "$script_dir/workflow-check" "$@"
+EOF
+chmod +x "$append_infra_check"
+append_infra_workstream="$route_fixture/scripts/dev/workstream-append-infra"
+sed 's#workflow_check="$repo_root/scripts/dev/workflow-check"#workflow_check="$repo_root/scripts/dev/workflow-check-append-infra"#' \
+  "$route_fixture/scripts/dev/workstream" > "$append_infra_workstream"
+chmod +x "$append_infra_workstream"
+append_infra_rc=0
+run_evidence "$published_suffix_json" "$valid_body" "$append_infra_workstream" \
+  || append_infra_rc=$?
+if [ "$append_infra_rc" -eq 125 ] \
+  && ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'INFRA workflow synthetic append infrastructure failure' "$work/stderr" \
+  && grep -Fq 'INFRA workstream: cannot validate append-only evidence for PR 17' "$work/stderr"; then
+  pass "append infrastructure cannot enter the bounded repair fallback"
+else
+  fail "append infrastructure cannot enter the bounded repair fallback"
+fi
+
+repair_infra_check="$route_fixture/scripts/dev/workflow-check-repair-infra"
+cat > "$repair_infra_check" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = evidence-repair ]; then
+  printf 'INFRA workflow synthetic repair infrastructure failure\n' >&2
+  exit 125
+fi
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+exec "$script_dir/workflow-check" "$@"
+EOF
+chmod +x "$repair_infra_check"
+repair_infra_workstream="$route_fixture/scripts/dev/workstream-repair-infra"
+sed 's#workflow_check="$repo_root/scripts/dev/workflow-check"#workflow_check="$repo_root/scripts/dev/workflow-check-repair-infra"#' \
+  "$route_fixture/scripts/dev/workstream" > "$repair_infra_workstream"
+chmod +x "$repair_infra_workstream"
+repair_infra_rc=0
+run_evidence "$published_suffix_json" "$valid_body" "$repair_infra_workstream" \
+  || repair_infra_rc=$?
+if [ "$repair_infra_rc" -eq 125 ] \
+  && ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'INFRA workflow synthetic repair infrastructure failure' "$work/stderr" \
+  && grep -Fq 'INFRA workstream: cannot verify the bounded evidence repair for PR 17' "$work/stderr" \
+  && ! grep -Fq 'REFUSE workstream:' "$work/stderr"; then
+  pass "bounded-repair infrastructure remains infrastructure"
+else
+  fail "bounded-repair infrastructure remains infrastructure"
 fi
 
 if run_merge "$valid_json" \

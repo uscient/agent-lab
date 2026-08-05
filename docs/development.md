@@ -107,6 +107,7 @@ Run the local convention checks from the repository root:
 ./scripts/dev/workflow-check pr-route group/g0-operator-surface flow
 ./scripts/dev/workflow-check pr-body .cache/dev/pr-body.md BASE_SHA HEAD_SHA HEAD_REF BASE_REF
 ./scripts/dev/workflow-check evidence-append .cache/dev/old-body.md .cache/dev/pr-body.md
+./scripts/dev/workflow-check evidence-repair .cache/dev/old-body.md .cache/dev/pr-body.md
 ./scripts/dev/workflow-check all
 ```
 
@@ -114,7 +115,15 @@ Run the local convention checks from the repository root:
 branch. `pr-body` validates the latest evidence cycle against the supplied current PR base, head, and
 route; CI supplies those identities from the event, and the intermediate merge helper rechecks them
 before integration. `evidence-append` proves every prior nonblank evidence line remains an exact
-prefix. If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
+prefix. `evidence-repair` recognizes only the bounded correction of a published invalid latest
+cycle: identical cycle and field topology, byte-identical lines through the latest cycle heading,
+and one to four `RED`, `GREEN`, `Product mutation`, or `CI mutation` lines that drop a comma and its
+nonempty trailing prose from behind an exact canonical terminal result token. It proves nothing
+about the replacement, so `scripts/dev/workstream evidence` pairs it with strict validation of the
+replacement and uses it only while the published body still fails that same validation. The required
+workflow applies that identical pairing to the `pull_request` `edited` event against the event base,
+head, and route, so a repair edit completes its own exact-head hosted campaign in that one run.
+If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
 the range to hide introduced commits. `all` checks only the branch and every introduced non-merge
 commit. Run the applicable `pr-*` commands separately; `pr-base` derives the expected base from the
 current branch, while `pr-route` can check an explicit head/base pair. The fast gate exercises this
