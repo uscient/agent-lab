@@ -35,13 +35,13 @@ replacement for `dev`. The exact route is derived from the branch:
 | ordinary branch | `origin/dev` | `dev` | human |
 | `work/<work>` | merge `origin/dev` with `sync` | `dev` | human |
 | `slice/<work>/<slice>` | `origin/work/<work>` | `work/<work>` | verified helper |
-| `group/<group>` | merge `origin/flow` with `sync` | `flow` | verified helper after approval |
+| `group/<group>` | PR-only `group-sync` slice from `origin/flow` | `flow` | verified helper |
 | `slice/group/<group>/<slice>` | merge `origin/group/<group>` with `sync` | `group/<group>` | verified helper |
 | protected `flow` | none | `dev` | human |
 
 `<group>` matches `[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*`; `group` in the group-slice form is
 literal. `dev`, `flow`, `master`, and `main` are protected. Do not commit, push, Git-merge, or rebase
-them directly. An agent may inspect `flow`, use the verified helper to merge an approved group PR
+them directly. An agent may inspect `flow`, use the verified helper to merge an accepted Group PR
 remotely, and open the final draft `flow` → `dev` PR; only a human merges that final PR.
 
 For each writable branch:
@@ -49,12 +49,13 @@ For each writable branch:
 1. Start at its current permitted base and make focused changes.
 2. Run applicable behavior, security, and mutation evidence.
 3. Fetch and incorporate only the exact base in the table. Use `scripts/dev/workstream sync` for a
-   reserved workstream, group, or slice branch.
+   reserved workstream or slice branch. For a Group, use `group-sync` and integrate its derived
+   synchronization slice by PR because Group branches are PR-only.
 4. Replay invalidated evidence after a rebase, dependency merge, workflow change, or manifest change.
 5. Push only the same-named branch. Use `--force-with-lease` only after an allowed non-program
-   rebase; program groups and group slices are merge-preserving and never force-updated.
+   rebase; program Groups and Group slices are merge-preserving and never force-updated.
 6. Open only the derived PR route. Agents integrate only verified slice→work, group-slice→group, and
-   approved group→`flow` PRs through `scripts/dev/workstream merge`.
+   accepted group→`flow` PRs through `scripts/dev/workstream merge`.
 7. Preserve merge commits, branches, PR records, and evidence through final review. Humans merge every
    ordinary, workstream, or `flow` final PR into `dev`.
 

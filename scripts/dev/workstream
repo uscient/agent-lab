@@ -11,6 +11,7 @@ Usage:
   scripts/dev/workstream start SLUG
   scripts/dev/workstream group NAME
   scripts/dev/workstream slice NAME
+  scripts/dev/workstream group-sync
   scripts/dev/workstream sync
   scripts/dev/workstream pr [gh-pr-create options]
   scripts/dev/workstream evidence PR_NUMBER BODY_FILE
@@ -167,6 +168,62 @@ case "$command_name" in
       || refuse "$branch diverged from its integration ref; refusing to rewrite accepted history"
     "$real_git" -C "$repo_root" switch -c "$slice_branch" "origin/$base"
     ;;
+  group-sync)
+    [ "$#" -eq 0 ] || usage
+    require_clean
+    branch="$(current_branch)"
+    case "$branch" in
+      group/*)
+        group="${branch#group/}"
+        valid_group "$group" || refuse "invalid current group branch"
+        ;;
+      *) refuse "group-sync requires a group/<id>-<slug> branch" ;;
+    esac
+    "$real_git" -C "$repo_root" fetch origin "$branch" flow
+    "$real_git" -C "$repo_root" merge --ff-only "origin/$branch" \
+      || refuse "$branch diverged from its integration ref; refusing to rewrite accepted history"
+    group_sha="$($real_git -C "$repo_root" rev-parse HEAD)" \
+      || die "cannot resolve the current Group head"
+    flow_sha="$($real_git -C "$repo_root" rev-parse --verify origin/flow)" \
+      || die "origin/flow is unavailable"
+    ancestor_rc=0
+    "$real_git" -C "$repo_root" merge-base --is-ancestor "$flow_sha" "$group_sha" \
+      || ancestor_rc=$?
+    case "$ancestor_rc" in
+      0) refuse "$branch already contains current origin/flow" ;;
+      1) ;;
+      *) die "cannot compare $branch with current origin/flow" ;;
+    esac
+    sync_branch="slice/group/$group/sync-flow-${flow_sha:0:12}"
+    if "$real_git" -C "$repo_root" show-ref --verify --quiet "refs/heads/$sync_branch"; then
+      refuse "local synchronization branch already exists: $sync_branch"
+    fi
+    remote_rc=0
+    "$real_git" -C "$repo_root" ls-remote --exit-code --heads origin \
+      "refs/heads/$sync_branch" >/dev/null 2>&1 || remote_rc=$?
+    case "$remote_rc" in
+      0) refuse "remote synchronization branch already exists: $sync_branch" ;;
+      2) ;;
+      *) die "cannot check remote synchronization branch: $sync_branch" ;;
+    esac
+    "$real_git" -C "$repo_root" switch -c "$sync_branch" "$group_sha"
+    if ! "$real_git" -C "$repo_root" merge --no-ff --no-edit "origin/flow"; then
+      refuse "flow synchronization has conflicts; resolve only on $sync_branch and preserve both parents"
+    fi
+    sync_sha="$($real_git -C "$repo_root" rev-parse HEAD)" \
+      || die "cannot resolve the synchronization merge"
+    read -r commit_parent first_parent second_parent extra_parent < <(
+      "$real_git" -C "$repo_root" rev-list --parents -n 1 "$sync_sha"
+    )
+    if [ "$commit_parent" != "$sync_sha" ] ||
+       [ "$first_parent" != "$group_sha" ] ||
+       [ "$second_parent" != "$flow_sha" ] ||
+       [ -n "${extra_parent:-}" ]; then
+      refuse "synchronization did not create the exact retained-history Group/flow merge"
+    fi
+    printf 'PASS workstream prepared PR-only Group sync %s at %s\n' \
+      "$sync_branch" "$sync_sha"
+    ;;
   sync)
     [ "$#" -eq 0 ] || usage
     require_clean
@@ -179,10 +236,7 @@ case "$command_name" in
         sync_mode="merge"
         ;;
       group/*)
-        group="${branch#group/}"
-        valid_group "$group" || refuse "invalid current group branch"
-        base="flow"
-        sync_mode="merge"
+        refuse "Group branches are PR-only; run group-sync to prepare a derived synchronization slice"
         ;;
       slice/group/*/*)
         remainder="${branch#slice/group/}"
@@ -202,7 +256,7 @@ case "$command_name" in
         base="work/$slug"
         sync_mode="rebase"
         ;;
-      *) refuse "sync requires a workstream, group, or matching slice branch" ;;
+      *) refuse "sync requires a workstream or matching slice branch" ;;
     esac
     if [[ "$branch" == group/* || "$branch" == work/* ]]; then
       "$real_git" -C "$repo_root" fetch origin "$branch" "$base"

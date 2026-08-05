@@ -110,20 +110,23 @@ gh run list --repo uscient/agent-lab
 gh api --method GET repos/uscient/agent-lab/branches/dev
 
 # Reserved workstream and program branches:
-./scripts/dev/workstream sync
+./scripts/dev/workstream sync       # workstreams and slices
+./scripts/dev/workstream group-sync # Group -> derived synchronization slice
 ./scripts/dev/workstream pr ...       # matching slice -> parent
 ./scripts/dev/workstream group-pr ... # group -> flow, draft
 ./scripts/dev/workstream final ...    # work or flow -> dev, draft
-./scripts/dev/workstream merge 123    # approved intermediate only
+./scripts/dev/workstream merge 123    # verified intermediate only
 ```
 
-Ordinary branches rebase on `origin/dev`; reusable workstreams, program groups, and group slices use
-merge-preserving `workstream sync` with their exact parent. Those integration branches are never
-rebased or force-updated. `dev`, `flow`, `master`, and `main` are protected, and a `flow`
+Ordinary branches rebase on `origin/dev`; reusable workstreams and Group slices use
+merge-preserving `workstream sync` with their exact parent. PR-only Groups use `group-sync` to
+prepare a matching synchronization slice from current `flow`. Those integration branches are never
+rebased or force-updated. Direct Group commits and pushes are denied; only verified PR integration
+may advance a Group. `dev`, `flow`, `master`, and `main` are protected, and a `flow`
 checkout stays read-only. Direct protected writes, plain force pushes, direct PR merge/mutation, remote
 mutation, GitHub authentication access, and Git attribution changes remain forbidden. The only
 agent merge exception is `scripts/dev/workstream merge` for a verified slice→work,
-group-slice→group, or approved group→`flow` PR. Humans alone merge final PRs into `dev`.
+group-slice→group, or accepted group→`flow` PR. Humans alone merge final PRs into `dev`.
 
 The repository guards do not configure GitHub. Humans must install the required `CI / Required
 gates` and `CodeQL` checks, current-base or merge-queue rule, latest-push approval, merge-only history,

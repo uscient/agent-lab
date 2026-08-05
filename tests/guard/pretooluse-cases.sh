@@ -220,7 +220,9 @@ expect_cmd block "read secrets environment example" 'cat secrets/.env.example'
 echo "== allow: branch-derived flow/group/slice routes =="
 set_guard_branch group/g0-operator-surface
 expect_cmd allow "group PR targets flow"        'gh pr create --base flow --head group/g0-operator-surface --title x --body y'
-expect_cmd allow "group same-branch push"       'git push origin HEAD'
+expect_cmd block "group same-branch push"       'git push origin HEAD'
+expect_cmd block "group direct commit"          'git commit -m "bypass slice PR"'
+expect_cmd allow "group-sync helper route"      './scripts/dev/workstream group-sync'
 set_guard_branch slice/group/g0-operator-surface/cli
 expect_cmd allow "group slice PR matches parent" \
   'gh pr create --base group/g0-operator-surface --head slice/group/g0-operator-surface/cli --title x --body y'

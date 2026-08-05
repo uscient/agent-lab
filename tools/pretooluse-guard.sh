@@ -661,7 +661,10 @@ is_writable_branch() {
   load_branch
   case "$branch" in
     work/*) [[ "$branch" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] ;;
-    group/*) valid_group "${branch#group/}" ;;
+    # Group branches are hosted PR-only integration parents. The verified
+    # helper may refresh one locally while preparing a derived sync slice, but
+    # ordinary commit/push commands must never advance the Group itself.
+    group/*) return 1 ;;
     slice/group/*/*)
       [[ "$branch" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] &&
         valid_group "${BASH_REMATCH[1]}"

@@ -22,7 +22,7 @@ dev
 | ordinary branch | `origin/dev` | `dev` | human |
 | `work/<work>` | merge `origin/dev` via `sync` | `dev` | human |
 | `slice/<work>/<slice>` | `origin/work/<work>` | `work/<work>` | verified helper |
-| `group/<group>` | merge `origin/flow` via `sync` | `flow` | verified helper after approval |
+| `group/<group>` | PR-only `group-sync` slice from `origin/flow` | `flow` | verified helper |
 | `slice/group/<group>/<slice>` | merge `origin/group/<group>` via `sync` | `group/<group>` | verified helper |
 | protected `flow` | no agent sync or write | `dev` | human |
 
@@ -87,7 +87,11 @@ After the human bootstrap closure, create a group at the fetched `origin/flow` c
 ./scripts/dev/workstream group g0-operator-surface
 ```
 
-A group may be developed directly or split into reviewable slices. From the group branch:
+Every Group after G0 is an integration parent, not a direct implementation branch. Before product
+work begins, divide it into at least two independently GREEN vertical slices with explicit scenario
+ownership and minimal overlap. A process-only synchronization or gate-registration slice does not
+count toward that minimum. Give each active slice its own clean checkout and complete local workflow
+packet; ignored packet state is never shared between checkouts. From the group branch:
 
 ```bash
 ./scripts/dev/workstream slice cli
@@ -95,9 +99,24 @@ A group may be developed directly or split into reviewable slices. From the grou
 ./scripts/dev/workstream pr --title "..." --body-file /tmp/pr-body.md
 ```
 
-Each group slice must be approved, current, and green before the helper merges it from the matching
-group checkout. When the group is complete, sync it with `flow`, replay the complete evidence, push
-it, and open its fixed draft PR:
+Each Group slice owns a falsifiable contract, intended RED, unchanged GREEN, relevant mutation
+evidence, audit, exact-head CI, and concise handoff. Integrate accepted slices one at a time from the
+matching Group checkout. Sync remaining slices with the moving Group parent and replay any evidence
+invalidated by that merge. After all vertical slices integrate, run the complete Group custody,
+coverage, GREEN, mutation, audit, and repository campaign.
+
+Group branches cannot be pushed directly. When current `flow` is not already an ancestor, prepare
+the deterministic retained-history synchronization slice, publish it, and send it through the same
+Group-slice PR gates:
+
+```bash
+./scripts/dev/workstream group-sync
+git push origin "$(git branch --show-current)"
+./scripts/dev/workstream pr --title "chore: synchronize current flow" --body-file /tmp/pr-body.md
+```
+
+The generated branch is `slice/group/<group>/sync-flow-<12-hex-flow-sha>`. Once every slice and any
+required synchronization PR is integrated, open the Group's fixed draft PR:
 
 ```bash
 ./scripts/dev/workstream group-pr --title "..." --body-file /tmp/pr-body.md
@@ -142,22 +161,25 @@ Only a human merges that final non-squash `flow` → `dev` PR.
 
 ## Synchronization and verified merge
 
-Run `./scripts/dev/workstream sync` only from a clean `work/*`, `group/*`, or matching slice branch.
-For `work/*` and `group/*`, it fetches both the branch's own remote integration ref and its derived
-`dev`/`flow` parent, then fast-forwards the local branch to its remote ref. It refuses local/remote
-divergence instead of rewriting accepted history. Slice creation performs the same refresh before it
-branches. Reusable `work/*`, program `group/*`, and `slice/group/*/*` always merge their moving
-parent; none may be rebased or force-updated after publication. A legacy slice may rebase only on
-its matching workstream. Replay invalidated evidence after any sync.
+Run `./scripts/dev/workstream sync` only from a clean `work/*` or matching slice branch. A workstream
+first fast-forwards to its own remote integration ref and then merges `origin/dev`; a Group slice
+merges `origin/group/<group>`. The command refuses a Group branch because hosted rules require every
+Group update to arrive by PR. `group-sync` first fast-forwards the local Group to its remote ref,
+derives a collision-resistant branch from the exact `origin/flow` SHA, and creates one exact
+two-parent merge without pushing it. Slice creation performs the same Group refresh before it
+branches. Reusable workstreams, program Groups, and Group slices are never rebased or force-updated
+after publication. A legacy slice may rebase only on its matching workstream. Replay invalidated
+evidence after any sync.
 
 `workstream merge` rereads hosted PR state immediately before acting. It accepts only a same-repository
 PR whose base is the current checkout and whose head is the exact matching slice or group route. The
-PR must be open, non-draft, cleanly mergeable, approved, contain its observed current base, report
+PR must be open, non-draft, cleanly mergeable, contain its observed current base, report
 exactly one successful `CI` workflow job named `Required gates` and one successful `CodeQL` workflow
 job named `CodeQL`, and have every reported check completed successfully. GitHub's separate
 code-scanning result may also be named `CodeQL`; it neither substitutes for nor conflicts with the
-workflow job. Group integration also requires the GitHub Actions jobs green on the observed `flow`
-base.
+workflow job. Legacy slice integration requires approval. Agent-owned Group-slice and Group
+integration accepts no-review or approved state but always rejects changes-requested state. Group
+integration also requires the GitHub Actions jobs green on the observed `flow` base.
 Every GitHub read and write is pinned to `github.com/uscient/agent-lab`; ambient repository or host
 environment variables cannot redirect the helper.
 The command requests an immediate merge commit through GitHub's head-pinned merge endpoint and
@@ -175,8 +197,9 @@ Repository files test the client-side route, but humans must install and audit t
   changes. Require the PR head to contain the current base. The helper pins the head, but only this
   hosted rule closes a base movement between validation and merge. Do not require a merge queue on
   an intermediate program base.
-- Require approval, dismiss stale approval after new commits, and require approval of the latest
-  reviewable push. Rules for intermediate bases must preserve the helper's same guarantees.
+- Require human approval, stale-approval dismissal, and approval of the latest reviewable push for
+  final PRs into `dev`. Intermediate Group and Group-slice rules must permit the verified agent-owned
+  route while preserving changes-requested blocking and every current-head check.
 - Permit merge commits and disable squash/rebase merging. Disable automatic head-branch deletion;
   retain program branches and PR records through final `flow` review.
 - Require trusted human ownership for every rail in `policy/protected.paths`, including workflows,
@@ -195,6 +218,18 @@ authority and cannot weaken `AGENTS.md`, hosted rules, the helper, required chec
 The cadence is Behavior-Driven, Test-Driven, and Security-Driven: start from behavior scenarios, make
 their behavior and security assertions RED, implement to GREEN, then run product and test/CI
 sensitivity mutations before final gates.
+
+For unattended Flow packets, keep Codex at `xhigh`, Claude Opus 5 at `max` when the client supports
+it, and Grok 4.5 at `medium`. Stream a worker's own output when safe; otherwise poll that same
+process. Never launch a status worker or alter a worker's configuration to observe it. Bash/Python
+test workers do not start Serena unless semantic tooling is genuinely needed. Correction packets
+contain only unresolved issue keys, controlling contract clauses, affected test functions, the
+required patch, exact coverage validation, one intended RED, and concise per-issue disposition.
+Repeat broader stubs, mutation matrices, aggregate harnesses, or registration proofs only when the
+correction changes something they measure. The coordinator owns deterministic custody, lint,
+coverage, and state-machine checks and avoids duplicating an authoritative state-machine run. None
+of these latency rules weakens the full post-GREEN mutation campaign, exact-head CI, CodeQL,
+custody, containment, or security gates.
 Record exact base and head commits, the PR route, commands and results, approvals, mutations,
 artifacts, cleanup, superseding runs, and remaining uncertainty. Append new evidence; do not erase
 the record a later run supersedes.
@@ -223,7 +258,7 @@ and its independently authored exact inventory:
 | Docker | `tests/security/docker.manifest` | `tests/dev/docker-harness-cases.sh` |
 | CI workers | `tests/security/ci.manifest` | `tests/dev/required-gates-cases.sh` |
 
-`AGENT_LAB_MAINTENANCE=1` only unlocks the local guard; it does not grant approval. A trusted human
-rail owner approves the current registration head, and complete current-head CI and CodeQL are
-replayed. Never derive the independent inventory from its manifest or add an unprotected discovery
-registry: either change would let product code silently choose its own required evidence.
+`AGENT_LAB_MAINTENANCE=1` only unlocks the local guard; it does not waive the intermediate helper or
+final human authority. Complete current-head CI and CodeQL are replayed. Never derive the independent
+inventory from its manifest or add an unprotected discovery registry: either change would let
+product code silently choose its own required evidence.

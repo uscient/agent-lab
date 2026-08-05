@@ -304,16 +304,137 @@ git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
 accepted_oid="$(git -C "$sync_producer" rev-parse HEAD)"
 git -C "$sync_producer" push -q origin group/g0-operator-surface \
   || infra "cannot publish accepted merge fixture"
+git -C "$sync_producer" switch -q -c flow --track origin/flow \
+  || infra "cannot prepare moving flow fixture"
+git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
+  commit --allow-empty -qm flow || infra "cannot advance flow fixture"
+flow_oid="$(git -C "$sync_producer" rev-parse HEAD)"
+git -C "$sync_producer" push -q origin flow || infra "cannot publish moving flow fixture"
+stale_group_oid="$(git -C "$sync_fixture" rev-parse HEAD)"
+: > "$sync_trace"
 if GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
-  "$sync_fixture/scripts/dev/workstream" sync >/dev/null 2>&1 \
-  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$accepted_oid" ] \
+  "$sync_fixture/scripts/dev/workstream" sync >/dev/null 2>&1; then
+  fail "Group sync cannot update a PR-only Group branch directly"
+elif [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$stale_group_oid" ] &&
+     ! grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace"; then
+  pass "Group sync cannot update a PR-only Group branch directly"
+else
+  fail "Group sync cannot update a PR-only Group branch directly"
+fi
+: > "$sync_trace"
+sync_branch="slice/group/g0-operator-surface/sync-flow-${flow_oid:0:12}"
+if GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
+  "$sync_fixture/scripts/dev/workstream" group-sync >/dev/null 2>&1 \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = "$sync_branch" ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD^1)" = "$accepted_oid" ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD^2)" = "$flow_oid" ] \
   && grep -Fq 'merge --ff-only origin/group/g0-operator-surface' "$sync_trace" \
   && grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace" \
+  && ! grep -Fq ' push ' "$sync_trace" \
   && ! grep -Fq 'rebase origin/flow' "$sync_trace"; then
-  pass "sync recovers accepted remote merges before preserving parent ancestry"
+  pass "PR-only Group sync preserves accepted merges and both moving-parent histories"
 else
-  fail "sync recovers accepted remote merges before preserving parent ancestry"
+  fail "PR-only Group sync preserves accepted merges and both moving-parent histories"
 fi
+
+sync_stdout="$work/group-sync.out"
+sync_stderr="$work/group-sync.err"
+group_sync_refuses() {
+  local expected="$1" rc=0
+  : > "$sync_trace"
+  GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
+    "$sync_fixture/scripts/dev/workstream" group-sync \
+    > "$sync_stdout" 2> "$sync_stderr" || rc=$?
+  [ "$rc" -eq 1 ] && grep -Fq "REFUSE workstream: $expected" "$sync_stderr"
+}
+local_branch_absent() {
+  ! git -C "$sync_fixture" show-ref --verify --quiet "refs/heads/$1"
+}
+advance_flow_fixture() {
+  git -C "$sync_producer" switch -q flow || infra "cannot return to the flow fixture"
+  git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
+    commit --allow-empty -qm "$1" || infra "cannot advance flow fixture"
+  git -C "$sync_producer" push -q origin flow || infra "cannot publish flow fixture"
+  git -C "$sync_producer" rev-parse HEAD
+}
+# Each refusal below owns a distinct flow head and starts from a restored Group
+# checkout so one broken refusal cannot cascade into the others.
+restore_group_checkout() {
+  git -C "$sync_fixture" checkout -q --force group/g0-operator-surface \
+    || infra "cannot return to the group fixture"
+}
+
+# The synchronization slice is not a Group branch, so it may not re-enter group-sync.
+if group_sync_refuses 'group-sync requires a group/<id>-<slug> branch' \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = "$sync_branch" ]; then
+  pass "Group sync preparation refuses any branch that is not the exact Group"
+else
+  fail "Group sync preparation refuses any branch that is not the exact Group"
+fi
+restore_group_checkout
+
+flow2_oid="$(advance_flow_fixture flow-contained)"
+git -C "$sync_producer" switch -q group/g0-operator-surface \
+  || infra "cannot switch the producer to the group fixture"
+git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
+  merge --no-ff -qm 'Merge synchronized flow' flow \
+  || infra "cannot contain flow in the group fixture"
+contained_oid="$(git -C "$sync_producer" rev-parse HEAD)"
+git -C "$sync_producer" push -q origin group/g0-operator-surface \
+  || infra "cannot publish the contained group fixture"
+contained_branch="slice/group/g0-operator-surface/sync-flow-${flow2_oid:0:12}"
+if group_sync_refuses 'group/g0-operator-surface already contains current origin/flow' \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ] \
+  && local_branch_absent "$contained_branch" \
+  && ! grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace"; then
+  pass "Group sync refuses an already-contained flow instead of forging an empty merge"
+else
+  fail "Group sync refuses an already-contained flow instead of forging an empty merge"
+fi
+
+restore_group_checkout
+flow3_oid="$(advance_flow_fixture flow-precondition)"
+dirty_branch="slice/group/g0-operator-surface/sync-flow-${flow3_oid:0:12}"
+printf '\n# dirty\n' >> "$sync_fixture/scripts/dev/workflow-check"
+if group_sync_refuses 'the tracked checkout is not clean' \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ] \
+  && local_branch_absent "$dirty_branch"; then
+  pass "Group sync preparation requires a clean Group checkout"
+else
+  fail "Group sync preparation requires a clean Group checkout"
+fi
+
+restore_group_checkout
+flow4_oid="$(advance_flow_fixture flow-local-collision)"
+collision_branch="slice/group/g0-operator-surface/sync-flow-${flow4_oid:0:12}"
+git -C "$sync_fixture" branch "$collision_branch" flow \
+  || infra "cannot seed the local synchronization collision"
+collision_oid="$(git -C "$sync_fixture" rev-parse "$collision_branch")"
+if group_sync_refuses "local synchronization branch already exists: $collision_branch" \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse "$collision_branch")" = "$collision_oid" ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ]; then
+  pass "Group sync refuses a colliding local synchronization branch without rewriting it"
+else
+  fail "Group sync refuses a colliding local synchronization branch without rewriting it"
+fi
+
+restore_group_checkout
+flow5_oid="$(advance_flow_fixture flow-remote-collision)"
+remote_collision_branch="slice/group/g0-operator-surface/sync-flow-${flow5_oid:0:12}"
+git -C "$sync_producer" push -q origin "flow:refs/heads/$remote_collision_branch" \
+  || infra "cannot seed the remote synchronization collision"
+if group_sync_refuses "remote synchronization branch already exists: $remote_collision_branch" \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ] \
+  && local_branch_absent "$remote_collision_branch"; then
+  pass "Group sync refuses a colliding published synchronization branch"
+else
+  fail "Group sync refuses a colliding published synchronization branch"
+fi
+
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/flow
 : > "$gh_log"
 if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
