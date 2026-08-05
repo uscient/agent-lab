@@ -283,6 +283,10 @@ cp "$repo_root/scripts/dev/workflow-check" "$sync_fixture/scripts/dev/workflow-c
 chmod +x "$sync_fixture/scripts/dev/workstream"
 chmod +x "$sync_fixture/scripts/dev/workflow-check"
 git -C "$sync_fixture" init -q || infra "cannot create sync fixture"
+git -C "$sync_fixture" config user.name fixture \
+  || infra "cannot set disposable sync fixture name"
+git -C "$sync_fixture" config user.email fixture@example.invalid \
+  || infra "cannot set disposable sync fixture email"
 git -C "$sync_fixture" add scripts/dev/workstream scripts/dev/workflow-check
 git -C "$sync_fixture" -c user.name=test -c user.email=test@example.invalid \
   commit -qm base || infra "cannot commit sync fixture"
