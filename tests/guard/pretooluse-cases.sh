@@ -209,6 +209,8 @@ expect_cmd allow "PR create to dev"            'gh pr create --base dev --head a
 expect_cmd allow "git branch -d (safe)"       'git branch -d old'
 expect_cmd allow "run tests"                  './scripts/dev/test quick'
 expect_cmd allow "lint"                       './scripts/dev/lint-scripts'
+expect_cmd allow "verified Group PR readiness" './scripts/dev/workstream ready 55'
+expect_cmd allow "verified intermediate merge" './scripts/dev/workstream merge 55'
 expect_cmd allow "read a protected file"      'cat AGENTS.md'
 expect_cmd allow "grep policy"                 'grep -r AGENTS.md policy/'
 expect_cmd allow "read tracked environment example" 'cat .env.example'

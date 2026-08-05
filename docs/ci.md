@@ -41,13 +41,33 @@ optional check. The optional OpenClaw image is not built by CI.
 
 ## Agent navigation loop
 
-1. Open `CI / Required gates` for the compact result table and replay commands.
-2. Open the failed worker for its focused step summary and annotation.
-3. Download its seven-day failure artifact, when produced, if the normal log is
-   too noisy.
-4. Reproduce with the exact command from the table.
-5. Fix the source defect; do not weaken assertions, convert failures to skips,
+After publishing a PR head, run the read-only observer with that exact head:
+
+```bash
+./scripts/dev/hosted-ci-watch --repo uscient/agent-lab --pr PR_NUMBER \
+  --expected-head FULL_PR_HEAD_SHA
+```
+
+The observer polls the PR-bound `CI` and `CodeQL` workflow jobs. As soon as any
+required job reaches a terminal non-success conclusion, it fetches direct check
+annotations or that job's direct log with bounded retries and reports the exact
+PR head, workflow, job ID/name, conclusion, failing step, and a bounded redacted
+excerpt. It does not wait for unrelated jobs or the overall workflow run to
+finish, cancel or rerun the obsolete run, or reuse its results for a later head.
+
+Diagnosis is not acceptance. The observer reports `HOSTED CI ACCEPTED` only
+after the full exact-head set—Fast, Static, Docker security, Required gates, and
+Actions CodeQL—is terminal and successful. A missing, partial, pending,
+cancelled, stale-head, or mismatched-merge result remains non-green. The fixed
+custody collector and protected rules remain authoritative acceptance evidence.
+
+1. Use the emitted failed-job excerpt and exact local replay command.
+2. Download the seven-day failure artifact, when produced, only if the bounded
+   direct diagnosis is insufficient.
+3. Fix the source defect; do not weaken assertions, convert failures to skips,
    or add blanket retries.
+4. Push a new head and run the complete CI/CodeQL campaign again. Let the
+   obsolete run finish naturally; none of its results apply to the new head.
 
 The fast job records and validates the immutable event diff base and checked-out
 head. It rejects missing, malformed, unfetched, non-ancestor, or mismatched SHAs

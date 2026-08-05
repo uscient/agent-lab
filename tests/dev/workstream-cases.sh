@@ -22,6 +22,7 @@ fake_bin="$work/bin"
 mkdir -p "$fake_bin"
 gh_log="$work/gh.log"
 merged_marker="$work/merged"
+ready_marker="$work/ready"
 cat > "$fake_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -34,9 +35,15 @@ case "$1 $2" in
     elif [ -n "${WORKSTREAM_UPDATED_BODY:-}" ] && [ -f "$WORKSTREAM_UPDATED_BODY" ]; then
       /usr/bin/jq -c --rawfile body "$WORKSTREAM_UPDATED_BODY" '.body = $body' \
         <<<"$WORKSTREAM_PR_JSON"
+    elif [ -n "${WORKSTREAM_READY_MARKER:-}" ] && [ -f "$WORKSTREAM_READY_MARKER" ]; then
+      /usr/bin/jq -c '.isDraft = false' <<<"$WORKSTREAM_PR_JSON"
     else
       printf '%s\n' "$WORKSTREAM_PR_JSON"
     fi
+    ;;
+  "pr ready")
+    [ -n "${WORKSTREAM_READY_MARKER:-}" ] || exit 97
+    : > "$WORKSTREAM_READY_MARKER"
     ;;
   "pr merge") exit 96 ;;
   "pr edit")
@@ -165,6 +172,7 @@ if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
 else
   fail "group slice PR routing derives the matching group base"
 fi
+git -C "$route_fixture" update-ref refs/heads/group/g0-operator-surface "$fixture_oid"
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/group/g0-operator-surface
 : > "$gh_log"
 if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
@@ -174,6 +182,31 @@ if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
   pass "group PR routing is fixed to flow and remains draft"
 else
   fail "group PR routing is fixed to flow and remains draft"
+fi
+group_ready_json="$(printf '%s' "$valid_json" | jq -c \
+  '.baseRefName="flow" | .headRefName="group/g0-operator-surface" | .isDraft=true')"
+find "$ready_marker" -maxdepth 0 -delete >/dev/null 2>&1 || true
+: > "$gh_log"
+if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
+  WORKSTREAM_PR_JSON="$group_ready_json" WORKSTREAM_READY_MARKER="$ready_marker" \
+  WORKSTREAM_MERGED_MARKER="$merged_marker" \
+  "$route_fixture/scripts/dev/workstream" ready 17 >/dev/null \
+  && grep -Fxq 'pr ready 17 --repo github.com/uscient/agent-lab' "$gh_log"; then
+  pass "verified helper makes only the exact current Group PR ready"
+else
+  fail "verified helper makes only the exact current Group PR ready"
+fi
+git -C "$route_fixture" symbolic-ref HEAD refs/heads/work/demo
+: > "$gh_log"
+if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
+  WORKSTREAM_PR_JSON="$group_ready_json" WORKSTREAM_READY_MARKER="$ready_marker" \
+  WORKSTREAM_MERGED_MARKER="$merged_marker" \
+  "$route_fixture/scripts/dev/workstream" ready 17 >/dev/null 2>&1; then
+  fail "ready helper rejects non-Group branches"
+elif ! grep -q '^pr ready ' "$gh_log"; then
+  pass "ready helper rejects non-Group branches"
+else
+  fail "ready helper rejects non-Group branches"
 fi
 git -C "$route_fixture" symbolic-ref HEAD \
   refs/heads/group/g0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -440,6 +473,20 @@ if run_merge "$flow_json"; then
 else
   fail "approved current-base group PR integrates into flow through the helper"
 fi
+unreviewed_flow_json="$(printf '%s' "$flow_json" | jq -c '.reviewDecision="REVIEW_REQUIRED"')"
+if run_merge "$unreviewed_flow_json"; then
+  pass "current-base Group PR integrates without intermediate human approval"
+else
+  fail "current-base Group PR integrates without intermediate human approval"
+fi
+changes_requested_flow_json="$(printf '%s' "$flow_json" | jq -c '.reviewDecision="CHANGES_REQUESTED"')"
+if run_merge "$changes_requested_flow_json"; then
+  fail "changes-requested Group PR remains blocked"
+elif ! grep -q '^api repos/uscient/agent-lab/pulls/17/merge ' "$gh_log"; then
+  pass "changes-requested Group PR remains blocked"
+else
+  fail "changes-requested Group PR remains blocked"
+fi
 
 missing_base_codeql='{"check_runs":[{"name":"Required gates","app":{"slug":"github-actions"},"status":"completed","conclusion":"success"},{"name":"CodeQL","app":{"slug":"github-code-scanning"},"status":"completed","conclusion":"success"}]}'
 if run_merge "$flow_json" "$route_fixture/scripts/dev/workstream" ahead "$missing_base_codeql"; then
@@ -515,6 +562,17 @@ if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$evidence_mutant"; print
   pass "evidence-validation sensitivity mutation turns RED"
 else
   fail "evidence-validation sensitivity mutation turns RED"
+fi
+
+review_mutant="$route_fixture/scripts/dev/workstream-review-mutant"
+sed 's/\.reviewDecision == "REVIEW_REQUIRED"/.reviewDecision == "CHANGES_REQUESTED"/' \
+  "$route_fixture/scripts/dev/workstream" > "$review_mutant"
+chmod +x "$review_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$review_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_merge "$changes_requested_flow_json" "$review_mutant"; then
+  pass "changes-requested Group sensitivity mutation turns RED"
+else
+  fail "changes-requested Group sensitivity mutation turns RED"
 fi
 
 squash_mutant="$route_fixture/scripts/dev/workstream-squash-mutant"
