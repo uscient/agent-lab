@@ -54,6 +54,7 @@ tests/dev/hosted-ci-watch-cases.py
 tests/dev/security-gate-cases.sh
 tests/dev/docker-harness-cases.sh
 tests/docker/security-fixture.sh
+tests/docker/fixtures/
 tests/dev/guard-diff-cases.sh
 tests/guard/
 tests/agent/policy-verify.sh

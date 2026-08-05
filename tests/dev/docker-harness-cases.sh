@@ -104,35 +104,166 @@ else
 fi
 
 security_fixture="$repo_root/tests/docker/security-fixture.sh"
+security_fixture_image="$repo_root/tests/docker/fixtures/security-canary.Dockerfile"
+# Full-line comments are stripped before the ownership checks below: prose may name
+# the product images this canary must stay away from, executable lines may not.
+security_fixture_code="$(
+  grep -Ev '^[[:space:]]*(#|$)' "$security_fixture" 2>/dev/null || true
+)"
+security_fixture_image_code="$(
+  grep -Ev '^[[:space:]]*(#|$)' "$security_fixture_image" 2>/dev/null || true
+)"
+
+# The canary owns a purpose-built fixture image; the broader suites keep product-image
+# ownership. Loose substrings would still pass a canary that had gone back to running a
+# product image, so the evidence chain is checked as a relationship instead: the tag that
+# is built is the tag that is inspected, and the identity that inspect captured is the
+# image that is executed.
+fixture_run_block="$(
+  awk 'index($0, "docker run ") { capturing = 1 }
+       capturing { print; if ($0 !~ /\\$/) exit }' "$security_fixture"
+)"
+fixture_cleanup_block="$(
+  awk 'index($0, "cleanup() {") == 1 { capturing = 1 }
+       capturing { print; if ($0 == "}") exit }' "$security_fixture"
+)"
+fixture_build_tag="$(
+  awk -F'"' 'index($0, "docker build ") { print $2; exit }' "$security_fixture"
+)"
+fixture_inspect_ref="$(
+  awk -F'"' 'index($0, "docker image inspect ") { print $2; exit }' "$security_fixture"
+)"
+fixture_id_var="$(
+  awk '
+    index($0, "=\"$(") > 1 { assigned = substr($0, 1, index($0, "=\"$(") - 1) }
+    index($0, "docker image inspect ") { print assigned; exit }
+  ' "$security_fixture"
+)"
+fixture_run_image="$(
+  printf '%s\n' "$fixture_run_block" | tail -n 1 | awk -F'"' '{ print $2 }'
+)"
+fixture_run_container="$(
+  printf '%s\n' "$fixture_run_block" |
+    awk -F'"' 'index($0, "--name ") { print $2; exit }'
+)"
 if [ -x "$security_fixture" ] &&
-   grep -Fq 'docker image inspect --format' "$security_fixture" &&
-   grep -Fq -- '--network none' "$security_fixture" &&
-   grep -Fq -- '--read-only' "$security_fixture" &&
-   grep -Fq -- '--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m' "$security_fixture" &&
-   grep -Fq -- '--cap-drop ALL' "$security_fixture" &&
-   grep -Fq -- '--security-opt no-new-privileges' "$security_fixture" &&
-   grep -Fq -- '--user 1000:1000' "$security_fixture" &&
-   grep -Fq -- '"$image_id" -c' "$security_fixture" &&
-   ! grep -Eq -- '--privileged|--network (host|container:)|docker\.sock' \
-     "$security_fixture"; then
-  pass "simple Docker fixture is content-pinned and least-privilege"
+   [ -n "$fixture_build_tag" ] &&
+   [ "$fixture_inspect_ref" = "$fixture_build_tag" ] &&
+   [ -n "$fixture_id_var" ] &&
+   [ "$fixture_run_image" = "\$$fixture_id_var" ] &&
+   git -C "$repo_root" ls-files --error-unmatch \
+     -- tests/docker/fixtures/security-canary.Dockerfile >/dev/null 2>&1 &&
+   grep -Fq 'tests/docker/fixtures' "$security_fixture" &&
+   grep -Fq 'security-canary.Dockerfile' "$security_fixture"; then
+  pass "Docker security canary runs the image it built from its own tracked fixture"
 else
-  fail "simple Docker fixture is content-pinned and least-privilege"
+  fail "Docker security canary runs the image it built from its own tracked fixture"
 fi
-if grep -Fxq 'tests/docker/security-fixture.sh' \
-     "$repo_root/policy/protected.paths"; then
-  pass "simple Docker fixture is maintenance-protected"
+
+# The canary is runner-level evidence. If it could consume agent-lab/devbox, the Docker
+# gate's built image identity, or any other product or dev image, a product-image
+# regression and a runner regression could mask one another.
+if [ -n "$security_fixture_code" ] &&
+   [ -n "$security_fixture_image_code" ] &&
+   ! printf '%s\n%s\n' "$security_fixture_code" "$security_fixture_image_code" |
+     grep -Eq \
+       'agent-lab/(devbox|serena|egress-test|openclaw)|AGENT_LAB_[A-Z_]*IMAGE[A-Z_]*|LAB_DEVBOX[A-Z_]*|DOCKER_TEST_[A-Z_]*|tests/docker/lib\.sh'; then
+  pass "Docker security canary never consumes a product or dev image identity"
 else
-  fail "simple Docker fixture is maintenance-protected"
+  fail "Docker security canary never consumes a product or dev image identity"
+fi
+
+fixture_image_bases="$(
+  awk '$1 == "FROM" { print $2 }' "$security_fixture_image" 2>/dev/null || true
+)"
+fixture_image_base_count="$(printf '%s' "$fixture_image_bases" | grep -c . || true)"
+if [ "$fixture_image_base_count" = 1 ] &&
+   printf '%s\n' "$fixture_image_bases" |
+     grep -Eq '^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$' &&
+   awk '$1 == "USER" && $2 != "0" && $2 != "0:0" && $2 != "root" { exit 1 }' \
+     "$security_fixture_image"; then
+  pass "Docker security canary fixture image is content-pinned and leaves identity to the runner"
+else
+  fail "Docker security canary fixture image is content-pinned and leaves identity to the runner"
+fi
+
+# The marker is the runtime half of image ownership: the canary must assert exactly the
+# marker its own Dockerfile bakes in, so a container started from any other image fails.
+fixture_marker_path="$(
+  awk 'index($0, "RUN printf ") == 1 {
+         for (i = 1; i < NF; i++) if ($i == ">") { print $(i + 1); exit }
+       }' "$security_fixture_image" 2>/dev/null || true
+)"
+fixture_marker_value="$(
+  awk -F"'" 'index($0, "RUN printf ") == 1 { print $4; exit }' \
+    "$security_fixture_image" 2>/dev/null || true
+)"
+if [ -n "$fixture_marker_path" ] &&
+   [ -n "$fixture_marker_value" ] &&
+   grep -Fq -- "check test \"\$(cat $fixture_marker_path)\" = $fixture_marker_value" \
+     "$security_fixture"; then
+  pass "Docker security canary proves at runtime that it ran its own fixture image"
+else
+  fail "Docker security canary proves at runtime that it ran its own fixture image"
+fi
+
+fixture_controls_ok=1
+for fixture_control in \
+  '--network none' \
+  '--read-only' \
+  '--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m' \
+  '--cap-drop ALL' \
+  '--security-opt no-new-privileges' \
+  '--user 1000:1000'; do
+  printf '%s\n' "$fixture_run_block" |
+    grep -Fq -- "$fixture_control" || fixture_controls_ok=0
+done
+# Scoped to the single extracted invocation: a control mentioned elsewhere in the file is
+# not a control the container was actually started with.
+if [ -n "$fixture_run_block" ] &&
+   [ "$fixture_controls_ok" -eq 1 ] &&
+   ! printf '%s\n' "$fixture_run_block" |
+     grep -Eq -- '--privileged|--cap-add|--network[= ](host|container:)|--pid[= ]host|--(volume|mount)[= ]|--security-opt[= ](seccomp|apparmor)=unconfined|--user[= ](0|root)([: ]|$)|docker\.sock'; then
+  pass "Docker security canary requests every required runtime control in one invocation"
+else
+  fail "Docker security canary requests every required runtime control in one invocation"
+fi
+
+fixture_trap_line="$(
+  awk '/^trap cleanup EXIT/ { print NR; exit }' "$security_fixture"
+)"
+fixture_build_line="$(
+  awk 'index($0, "docker build ") { print NR; exit }' "$security_fixture"
+)"
+if [ -n "$fixture_run_container" ] &&
+   [ -n "$fixture_build_tag" ] &&
+   [ -n "$fixture_trap_line" ] &&
+   [ -n "$fixture_build_line" ] &&
+   [ "$fixture_trap_line" -lt "$fixture_build_line" ] &&
+   printf '%s\n' "$fixture_cleanup_block" |
+     grep -Fq -- "docker rm -f \"$fixture_run_container\"" &&
+   printf '%s\n' "$fixture_cleanup_block" |
+     grep -Fq -- "docker image rm -f \"$fixture_build_tag\""; then
+  pass "Docker security canary installs cleanup for its container and image before building"
+else
+  fail "Docker security canary installs cleanup for its container and image before building"
+fi
+
+if grep -Fxq 'tests/docker/security-fixture.sh' \
+     "$repo_root/policy/protected.paths" &&
+   grep -Fxq 'tests/docker/fixtures/' "$repo_root/policy/protected.paths"; then
+  pass "Docker security canary and its fixture asset are maintenance-protected"
+else
+  fail "Docker security canary and its fixture asset are maintenance-protected"
 fi
 # Requested runtime flags only describe intent; the fixture must also observe the
 # kernel-enforced result of each one from inside the container.
 if grep -Fq -- 'check test "$(id -u)" = 1000' "$security_fixture" &&
    grep -Fq -- 'check test "$(id -g)" = 1000' "$security_fixture" &&
-   grep -Fq -- 'NoNewPrivs:/ { print \$2 }" /proc/self/status)" = 1' \
+   grep -Fq -- 'check grep -Eq "^NoNewPrivs:[[:space:]]+1$" /proc/self/status' \
      "$security_fixture" &&
-   grep -Fq -- '/sys/class/net' "$security_fixture" &&
-   grep -Fq -- '" = lo' "$security_fixture" &&
+   grep -Fq -- 'check test "$(cd /sys/class/net && echo *)" = lo' \
+     "$security_fixture" &&
    grep -Fq -- 'DOCKER SECURITY FIXTURE SUMMARY failures=%s' "$security_fixture" &&
    grep -Fq -- 'test "$failures" -eq 0' "$security_fixture"; then
   pass "simple Docker fixture proves its uid, no-new-privileges, and network containment"
@@ -142,15 +273,19 @@ fi
 # A non-root process reports CapEff=0 and cannot write to root-owned `/` whether or
 # not --cap-drop ALL and --read-only were requested, so neither observable can carry
 # that evidence. Only the capability bounding set and the root mount options change
-# when those flags are dropped.
-if grep -Fq -- 'CapBnd:/ { print \$2 }" /proc/self/status)" = 0000000000000000' \
+# when those flags are dropped. The tmpfs needs both halves of its contract proved:
+# writable, and constrained in both mount options and size.
+if grep -Fq -- 'check grep -Eq "^CapBnd:[[:space:]]+0000000000000000$" /proc/self/status' \
      "$security_fixture" &&
    grep -Fq -- 'check grep -Eq "^[0-9]+ [0-9]+ [0-9]+:[0-9]+ [^ ]+ / ro[, ]" /proc/self/mountinfo' \
      "$security_fixture" &&
-   grep -Fq -- 'check touch /tmp/agent-lab-tmp-write-probe' "$security_fixture"; then
-  pass "simple Docker fixture proves read-only root and dropped capabilities independently of its uid"
+   grep -Fq -- '/tmp rw,nosuid,nodev,noexec[, ].* - tmpfs ' "$security_fixture" &&
+   grep -Fq -- 'check touch /tmp/agent-lab-tmp-write-probe' "$security_fixture" &&
+   grep -Fq -- 'refute dd if=/dev/zero of=/tmp/agent-lab-tmpfs-limit-probe' \
+     "$security_fixture"; then
+  pass "simple Docker fixture proves read-only root, dropped capabilities, and a constrained tmpfs"
 else
-  fail "simple Docker fixture proves read-only root and dropped capabilities independently of its uid"
+  fail "simple Docker fixture proves read-only root, dropped capabilities, and a constrained tmpfs"
 fi
 
 docker_gate_fixture="$work/docker-gate-fixture"
