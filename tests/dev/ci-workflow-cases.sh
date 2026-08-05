@@ -212,6 +212,17 @@ else
 fi
 require_job_text fast 'sudo apt-get install -y -qq bubblewrap shellcheck' \
   "Fast runner provisions bubblewrap before the security gate"
+if job_block "$ci" fast | awk '
+  /- name: Verify Fast gate bubblewrap isolation/ { step=NR }
+  /if ! bwrap_probe/ { initial=NR }
+  /sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0/ { enable=NR }
+  /^[[:space:]]*bwrap_probe[[:space:]]*$/ { verify=NR }
+  END { exit !(step > 0 && initial > step && enable > initial && verify > enable) }
+'; then
+  pass "Fast runner proves bubblewrap isolation after a bounded Ubuntu user-namespace correction"
+else
+  fail "Fast runner proves bubblewrap isolation after a bounded Ubuntu user-namespace correction"
+fi
 
 require_job_text static '    name: Static' "static job has a stable display name"
 require_job_text static '    timeout-minutes: 15' "static job has a bounded runtime"
@@ -355,6 +366,8 @@ if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
     '/id: fast-gate/a\        continue-on-error: true'
   run_ci_mutant omit-bubblewrap-provision \
     's/bubblewrap shellcheck/shellcheck/'
+  run_ci_mutant omit-bubblewrap-userns-correction \
+    '/kernel.apparmor_restrict_unprivileged_userns=0/d'
   run_ci_mutant drop-required-worker \
     's/needs: \[fast, static, docker\]/needs: [fast, static]/'
   run_ci_mutant erase-result-classification \
