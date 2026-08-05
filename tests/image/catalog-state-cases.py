@@ -597,7 +597,7 @@ def traced_catalog_add(home: Path, name: str, subject: str):
     return rc, value, error, targets
 
 
-def main() -> int:
+def run_state_slice() -> None:
     with tempfile.TemporaryDirectory(prefix="agent-lab-catalog-state-") as directory:
         root = Path(directory)
 
@@ -969,6 +969,14 @@ def main() -> int:
             f"rc={completed.returncode} stderr={completed.stderr[-120:]!r}",
         )
 
+
+def run_name_bound_slice() -> None:
+    # Publishing 256 logical names before the refusal costs more wall clock than
+    # every other case in this leaf combined and cannot be subdivided further, so
+    # it is the whole slice and shares no route with movable work.
+    with tempfile.TemporaryDirectory(prefix="agent-lab-catalog-name-bound-") as directory:
+        root = Path(directory)
+
         names_home = new_home(root, "names-bound-home")
         names_ok = True
         for index in range(256):
@@ -985,6 +993,11 @@ def main() -> int:
             "the 257th logical name is a stable refusal with no publication",
             f"setup_ok={names_ok} rc={rc} error={error!r} changed={before != after}",
         )
+
+
+def run_durability_slice() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-lab-catalog-durability-") as directory:
+        root = Path(directory)
 
         bytes_home = new_home(root, "bytes-bound-home")
         add(bytes_home)
@@ -1757,48 +1770,79 @@ def main() -> int:
             f"rc={platform_rc} error={platform_error!r} changed={before != after}",
         )
 
-    expected = [
-        "CAT-STATE-001",
-        "CAT-STATE-002",
-        "CAT-STATE-003",
-        "CAT-STATE-004",
-        "CAT-STATE-005",
-        "CAT-STATE-006",
-        "CAT-STATE-007",
-        "CAT-STATE-008",
-        "CAT-STATE-009",
-        "CAT-STATE-010",
-        "CAT-STATE-011",
-        "CAT-STATE-012",
-        "CAT-STATE-013",
-        "CAT-STATE-014",
-        "CAT-STATE-015",
-        "CAT-STATE-016",
-        "CAT-STATE-018",
-        "CAT-STATE-017",
-        "CAT-BOUND-001",
-        "CAT-BOUND-002",
-        "CAT-BOUND-003",
-        "CAT-BOUND-004",
-        "CAT-CRASH-001",
-        "CAT-CRASH-002",
-        "CAT-CRASH-003",
-        "CAT-CRASH-004",
-        "CAT-CRASH-005",
-        "CAT-CRASH-006",
-        "CAT-CRASH-007",
-        "CAT-CRASH-008",
-        "CAT-CRASH-009",
-        "CAT-CRASH-010",
-        "CAT-CRASH-011",
-        "CAT-PLAT-001",
-    ]
+STATE_IDS = (
+    "CAT-STATE-001",
+    "CAT-STATE-002",
+    "CAT-STATE-003",
+    "CAT-STATE-004",
+    "CAT-STATE-005",
+    "CAT-STATE-006",
+    "CAT-STATE-007",
+    "CAT-STATE-008",
+    "CAT-STATE-009",
+    "CAT-STATE-010",
+    "CAT-STATE-011",
+    "CAT-STATE-012",
+    "CAT-STATE-013",
+    "CAT-STATE-014",
+    "CAT-STATE-015",
+    "CAT-STATE-016",
+    "CAT-STATE-018",
+    "CAT-STATE-017",
+)
+NAME_BOUND_IDS = ("CAT-BOUND-001",)
+DURABILITY_IDS = (
+    "CAT-BOUND-002",
+    "CAT-BOUND-003",
+    "CAT-BOUND-004",
+    "CAT-CRASH-001",
+    "CAT-CRASH-002",
+    "CAT-CRASH-003",
+    "CAT-CRASH-004",
+    "CAT-CRASH-005",
+    "CAT-CRASH-006",
+    "CAT-CRASH-007",
+    "CAT-CRASH-008",
+    "CAT-CRASH-009",
+    "CAT-CRASH-010",
+    "CAT-CRASH-011",
+    "CAT-PLAT-001",
+)
+# Each selector enters exactly one slice function, so a selected slice never
+# executes another slice's cases and then filters them out of the output. The
+# slices are disjoint and, concatenated in this order, reproduce the frozen
+# thirty-four identities of the whole leaf.
+SLICES = {
+    "state": (run_state_slice, STATE_IDS),
+    "name-bound": (run_name_bound_slice, NAME_BOUND_IDS),
+    "durability": (run_durability_slice, DURABILITY_IDS),
+}
+SLICE_ORDER = ("state", "name-bound", "durability")
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        selected = SLICE_ORDER
+    elif len(argv) == 1 and argv[0] in SLICES:
+        selected = (argv[0],)
+    else:
+        usage = "|".join(SLICE_ORDER)
+        print(f"Usage: {Path(__file__).name} [{usage}]", file=sys.stderr)
+        return 2
+
+    expected: list[str] = []
+    for slice_name in selected:
+        run_slice, identities = SLICES[slice_name]
+        expected.extend(identities)
+        run_slice()
+
     if OBSERVED != expected:
         print(f"INFRA catalog state assertion identity drift: {OBSERVED!r}", file=sys.stderr)
         return 125
-    print(f"SUMMARY assertions=34 expected=34 failures={FAILURES} infra=0")
+    count = len(expected)
+    print(f"SUMMARY assertions={count} expected={count} failures={FAILURES} infra=0")
     return 0 if FAILURES == 0 else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
