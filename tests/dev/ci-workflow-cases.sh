@@ -210,6 +210,8 @@ if [ -x "$ci_fast" ] &&
 else
   fail "canonical Fast replay provisions pinned CUE and Cedar before the gate"
 fi
+require_job_text fast 'sudo apt-get install -y -qq bubblewrap shellcheck' \
+  "Fast runner provisions bubblewrap before the security gate"
 
 require_job_text static '    name: Static' "static job has a stable display name"
 require_job_text static '    timeout-minutes: 15' "static job has a bounded runtime"
@@ -351,6 +353,8 @@ if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
     "s/, 'group\/\*\*'//"
   run_ci_mutant allow-continue-on-error \
     '/id: fast-gate/a\        continue-on-error: true'
+  run_ci_mutant omit-bubblewrap-provision \
+    's/bubblewrap shellcheck/shellcheck/'
   run_ci_mutant drop-required-worker \
     's/needs: \[fast, static, docker\]/needs: [fast, static]/'
   run_ci_mutant erase-result-classification \
