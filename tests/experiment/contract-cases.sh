@@ -7,7 +7,7 @@ subcases=(
   "$repo_root/tests/experiment/aggregate-harness-cases.sh"
   "$repo_root/tests/experiment/catalog-aggregate-harness-cases.sh"
 )
-expected_count=43
+expected_count=45
 work=""
 
 cleanup_work() {
@@ -33,7 +33,8 @@ printf '%s\n' \
   FMT-001 FMT-002 FMT-004 FMT-005 FMT-006 FMT-007 FMT-003 FMT-008 \
   SEL-001 CUE-001 FMT-009 M-FMT-001 SEL-002 \
   AGG-001 AGG-002 AGG-003 AGG-004 AGG-005 AGG-006 AGG-007 AGG-008 AGG-009 \
-  AGG-010 AGG-011 AGG-012 AGG-013 AGG-021 AGG-022 AGG-023 AGG-024 \
+  AGG-010 AGG-011 AGG-012 AGG-013 AGG-031 AGG-032 \
+  AGG-021 AGG-022 AGG-023 AGG-024 \
   AGG-025 AGG-026 AGG-027 AGG-028 AGG-029 AGG-030 \
   AGG-014 AGG-015 AGG-016 AGG-017 \
   AGG-018 AGG-019 AGG-020 > "$expected"
