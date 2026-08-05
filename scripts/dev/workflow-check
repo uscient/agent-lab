@@ -674,9 +674,18 @@ check_evidence_append() {
   fi
   old_lines="$(wc -l < "$old_evidence" | tr -d '[:space:]')"
   new_lines="$(wc -l < "$new_evidence" | tr -d '[:space:]')"
-  if ((old_lines == 0 || new_lines < old_lines)); then
+  if ((new_lines == 0 || new_lines < old_lines)); then
     find "$state" -depth -delete >/dev/null 2>&1 || true
     fail "PR evidence update changed or erased a prior cycle"
+    return
+  fi
+  # An old body whose exact Evidence section holds no nonblank line has no prior cycle to
+  # preserve, so one bootstrap may seed Cycle 1. The caller validates the replacement against
+  # the current base, head, and route before this check, and the byte-prefix rule below binds
+  # every later update, so a bootstrap can neither rerun nor erase recorded evidence.
+  if ((old_lines == 0)); then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    printf 'PASS workflow append-only evidence bootstrap\n'
     return
   fi
   if ! awk '
