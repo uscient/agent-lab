@@ -6,7 +6,7 @@ lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
 local_onboarding="$repo_root/tests/experiment/local-onboarding-cases.sh"
 install_lifecycle="$repo_root/tests/experiment/install-lifecycle-cases.sh"
 source_adapters="$repo_root/tests/experiment/source-adapter-cases.sh"
-expected_count=23
+expected_count=24
 work=""
 
 cleanup_work() {
@@ -137,6 +137,21 @@ write_fixture() {
         printf 'fi\n'
         ;;
     esac
+    case "$execution_id" in
+      install-store-cases.sh)
+        printf 'if [ -n "${AGENT_LAB_AGG_INSTALL_BARRIER_DIR:-}" ]; then\n'
+        printf "  : > \"\$AGENT_LAB_AGG_INSTALL_BARRIER_DIR/%s.ready\" || exit 125\n" \
+          "$execution_id"
+        printf '  attempts=0\n'
+        printf '  while [ ! -f "$AGENT_LAB_AGG_INSTALL_BARRIER_DIR/install-store-cases.sh.ready" ] ||\n'
+        printf '        [ ! -f "$AGENT_LAB_AGG_INSTALL_BARRIER_DIR/install-state-cases.py.ready" ]; do\n'
+        printf '    attempts=$((attempts + 1))\n'
+        printf '    [ "$attempts" -lt 200 ] || exit 125\n'
+        printf '    sleep 0.01\n'
+        printf '  done\n'
+        printf 'fi\n'
+        ;;
+    esac
     printf 'if [ -n "${AGENT_LAB_AGG_HOLD_DIR:-}" ] &&\n'
     printf "   [ \"\${AGENT_LAB_AGG_HOLD_ID:-}\" = '%s' ]; then\n" "$execution_id"
     printf '  : > "$AGENT_LAB_AGG_HOLD_DIR/ready" || exit 125\n'
@@ -201,7 +216,7 @@ write_python_fixture() {
     printf "hold_id = os.environ.get('AGENT_LAB_AGG_HOLD_ID')\n"
     printf "if hold_dir and hold_id == '%s':\n" "$execution_id"
     printf "    Path(hold_dir, 'ready').touch()\n"
-    printf '    deadline = time.monotonic() + 5.0\n'
+    printf '    deadline = time.monotonic() + 15.0\n'
     printf "    while not Path(hold_dir, 'release').is_file():\n"
     printf '        if time.monotonic() >= deadline:\n'
     printf '            raise SystemExit(125)\n'
@@ -217,6 +232,20 @@ write_python_fixture() {
       printf '    )\n'
       printf '    deadline = time.monotonic() + 2.0\n'
       printf '    while not all(Path(barrier, peer).is_file() for peer in peers):\n'
+      printf '        if time.monotonic() >= deadline:\n'
+      printf '            raise SystemExit(125)\n'
+      printf '        time.sleep(0.01)\n'
+      printf 'install_barrier = os.environ.get("AGENT_LAB_AGG_INSTALL_BARRIER_DIR")\n'
+      printf 'if install_barrier:\n'
+      printf "    Path(install_barrier, '%s.ready').touch()\n" "$execution_id"
+      printf '    install_peers = (\n'
+      printf "        'install-store-cases.sh.ready',\n"
+      printf "        'install-state-cases.py.ready',\n"
+      printf '    )\n'
+      printf '    deadline = time.monotonic() + 2.0\n'
+      printf '    while not all(\n'
+      printf '        Path(install_barrier, peer).is_file() for peer in install_peers\n'
+      printf '    ):\n'
       printf '        if time.monotonic() >= deadline:\n'
       printf '            raise SystemExit(125)\n'
       printf '        time.sleep(0.01)\n'
@@ -426,6 +455,9 @@ split_output_contract=0
 split_mutation_contract=0
 tail_mutation_contract=0
 wrapper_infrastructure_contract=0
+install_overlap_contract=0
+install_isolation_contract=0
+install_lane_mutation_contract=0
 if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
   cp "$local_onboarding" "$replica_local_onboarding"
   cp "$install_lifecycle" "$replica_install_lifecycle"
@@ -581,6 +613,140 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
      grep -Fxq 'INFRA shared lifecycle core unavailable' \
        "$work/missing-install-core.out"; then
     wrapper_infrastructure_contract=1
+  fi
+
+  # The install route must run its long-pole subcase concurrently with the
+  # batched short subcases. A rendezvous between the two lanes is the oracle:
+  # a serialized route can never satisfy it, whatever the elapsed time is.
+  reset_fixtures
+  install_barrier="$work/install-barrier"
+  install_overlap_executions="$work/install-overlap-executions"
+  mkdir "$install_barrier"
+  : > "$install_overlap_executions"
+  install_overlap_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$install_overlap_executions" \
+    AGENT_LAB_AGG_INSTALL_BARRIER_DIR="$install_barrier" \
+    bash "$replica_install_lifecycle" > "$work/install-overlap.out" 2>&1 || \
+    install_overlap_rc=$?
+  if route_output_valid \
+       "$work/install-overlap.out" "$expected_install_ids" 47 \
+       'EXPERIMENT INSTALL LIFECYCLE PASS' "$install_overlap_rc" &&
+     [ -f "$install_barrier/install-store-cases.sh.ready" ] &&
+     [ -f "$install_barrier/install-state-cases.py.ready" ] &&
+     cmp -s <(LC_ALL=C sort "$expected_install_executions") \
+       <(LC_ALL=C sort "$install_overlap_executions"); then
+    install_overlap_contract=1
+  fi
+
+  # Holding the long-pole subcase must not hold any other install subcase:
+  # every batched subcase completes while the held lane is still parked.
+  reset_fixtures
+  isolation_hold="$work/install-isolation-hold"
+  isolation_done="$work/install-isolation-done"
+  isolation_executions="$work/install-isolation-executions"
+  mkdir "$isolation_hold" "$isolation_done"
+  : > "$isolation_executions"
+  isolation_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$isolation_executions" \
+    AGENT_LAB_AGG_HOLD_DIR="$isolation_hold" \
+    AGENT_LAB_AGG_HOLD_ID=install-state-cases.py \
+    AGENT_LAB_AGG_DONE_DIR="$isolation_done" \
+    bash "$replica_install_lifecycle" > "$work/install-isolation.out" 2>&1 &
+  isolation_pid=$!
+  isolation_case=0
+  if wait_for_path "$isolation_hold/ready" &&
+     wait_for_path "$isolation_done/install-store-cases.sh.done" &&
+     wait_for_path "$isolation_done/install-integrity-cases.py.done" &&
+     wait_for_path "$isolation_done/install-mutation-cases.py.done" &&
+     wait_for_child_wait "$isolation_pid" 1; then
+    isolation_case=1
+  fi
+  : > "$isolation_hold/release"
+  wait "$isolation_pid" || isolation_rc=$?
+  if [ "$isolation_case" -eq 1 ] && [ "$isolation_rc" -eq 0 ] &&
+     wait_for_path "$isolation_done/install-state-cases.py.done" &&
+     route_output_valid \
+       "$work/install-isolation.out" "$expected_install_ids" 47 \
+       'EXPERIMENT INSTALL LIFECYCLE PASS' "$isolation_rc" &&
+     cmp -s <(LC_ALL=C sort "$expected_install_executions") \
+       <(LC_ALL=C sort "$isolation_executions"); then
+    install_isolation_contract=1
+  fi
+
+  # The superseded single-lane routing, a routing that re-serializes the long
+  # pole behind a batched subcase, and a routing that drops a subcase are all
+  # intended REDs.
+  serial_core="$replica/tests/experiment/local-lifecycle-serial-install.sh"
+  serial_write_rc=0
+  awk '
+    $0 == "  install)" { in_install = 1 }
+    in_install && $0 == "    lane_count=2" { print "    lane_count=1"; changes++; next }
+    in_install && $0 == "    lane_map=(0 1 0 0)" {
+      print "    lane_map=(0 0 0 0)"
+      changes++
+      in_install = 0
+      next
+    }
+    { print }
+    END { if (changes != 2) exit 1 }
+  ' "$replica_lifecycle" > "$serial_core" || serial_write_rc=$?
+  chmod +x "$serial_core"
+
+  shared_core="$replica/tests/experiment/local-lifecycle-shared-install.sh"
+  shared_write_rc=0
+  awk '
+    $0 == "  install)" { in_install = 1 }
+    in_install && $0 == "    lane_map=(0 1 0 0)" {
+      print "    lane_map=(0 0 0 1)"
+      changes++
+      in_install = 0
+      next
+    }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$shared_core" || shared_write_rc=$?
+  chmod +x "$shared_core"
+
+  dropped_core="$replica/tests/experiment/local-lifecycle-dropped-install.sh"
+  dropped_write_rc=0
+  awk '
+    $0 == "  install)" { in_install = 1 }
+    in_install && $0 == "    selected_count=4" {
+      print "    selected_count=3"
+      changes++
+      in_install = 0
+      next
+    }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$dropped_core" || dropped_write_rc=$?
+  chmod +x "$dropped_core"
+
+  serial_barrier="$work/install-serial-barrier"
+  shared_barrier="$work/install-shared-barrier"
+  mkdir "$serial_barrier" "$shared_barrier"
+  reset_fixtures
+  serial_rc=0
+  env AGENT_LAB_AGG_INSTALL_BARRIER_DIR="$serial_barrier" \
+    bash "$serial_core" install > "$work/install-serial.out" 2>&1 || serial_rc=$?
+  shared_rc=0
+  env AGENT_LAB_AGG_INSTALL_BARRIER_DIR="$shared_barrier" \
+    bash "$shared_core" install > "$work/install-shared.out" 2>&1 || shared_rc=$?
+  dropped_executions="$work/install-dropped-executions"
+  : > "$dropped_executions"
+  dropped_rc=0
+  env AGENT_LAB_AGG_EXEC_LOG="$dropped_executions" \
+    bash "$dropped_core" install > "$work/install-dropped.out" 2>&1 || dropped_rc=$?
+  if [ "$serial_write_rc" -eq 0 ] && [ "$shared_write_rc" -eq 0 ] &&
+     [ "$dropped_write_rc" -eq 0 ] &&
+     [ "$serial_rc" -ne 0 ] && [ "$shared_rc" -ne 0 ] &&
+     ! grep -Fq 'EXPERIMENT INSTALL LIFECYCLE PASS' "$work/install-serial.out" &&
+     ! grep -Fq 'EXPERIMENT INSTALL LIFECYCLE PASS' "$work/install-shared.out" &&
+     infrastructure_output_valid "$work/install-dropped.out" 47 "$dropped_rc" &&
+     [ ! -s "$dropped_executions" ]; then
+    install_lane_mutation_contract=1
   fi
 fi
 
@@ -743,11 +909,12 @@ lane_assignment_count="$(grep -Ec '^[[:space:]]+lane_count=[0-9]+$' \
   "$replica_lifecycle" || true)"
 if [ "$lane_assignment_count" -eq 3 ] &&
    [ "$(grep -Fxc '    lane_count=3' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_count=2' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_count=1' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_count=2' "$replica_lifecycle")" -eq 2 ] &&
+   [ "$(grep -Fxc '    lane_count=1' "$replica_lifecycle")" -eq 0 ] &&
    [ "$(grep -Fxc '    lane_map=(0 1 2 0 1 2 0)' "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc '    lane_map=(0 0 1)' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_map=(0 0 0 0)' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 1 0 0)' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 0 0 0)' "$replica_lifecycle")" -eq 0 ] &&
    [ "$(grep -Fxc 'readonly lane_count' "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc 'readonly lane_map' "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc 'for ((lane = 0; lane < lane_count; lane++)); do' \
@@ -761,9 +928,9 @@ if [ "$lane_assignment_count" -eq 3 ] &&
      "$replica_local_onboarding" || true)" -eq 1 ] &&
    [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" install' \
      "$replica_install_lifecycle" || true)" -eq 1 ]; then
-  pass AGG-010 "split routes preserve three measured aggregate lanes through one scheduler"
+  pass AGG-010 "split routes declare measured lane bounds through one scheduler"
 else
-  fail AGG-010 "split routes preserve three measured aggregate lanes through one scheduler"
+  fail AGG-010 "split routes declare measured lane bounds through one scheduler"
 fi
 
 hold_ids=(
@@ -910,6 +1077,14 @@ if [ "$stubborn_rc" -eq 0 ] && [ "$observed_stubborn_rc" -eq 143 ] &&
   pass AGG-013 "signal exit preserves work owned by an uncooperative descendant"
 else
   fail AGG-013 "signal exit preserves work owned by an uncooperative descendant"
+fi
+
+if [ "$install_overlap_contract" -eq 1 ] &&
+   [ "$install_isolation_contract" -eq 1 ] &&
+   [ "$install_lane_mutation_contract" -eq 1 ]; then
+  pass AGG-031 "the install route overlaps an isolated long-pole lane and rejects serializing or dropping mutants"
+else
+  fail AGG-031 "the install route overlaps an isolated long-pole lane and rejects serializing or dropping mutants"
 fi
 
 reset_source_fixtures

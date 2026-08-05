@@ -46,8 +46,10 @@ case "$route" in
     selected_count=4
     expected_start=87
     expected_count=47
-    lane_count=1
-    lane_map=(0 0 0 0)
+    # The long-pole subcase owns a lane, as the local route already does for the
+    # catalog aggregate; the three short subcases share the other lane.
+    lane_count=2
+    lane_map=(0 1 0 0)
     final_marker='EXPERIMENT INSTALL LIFECYCLE PASS'
     ;;
   *)
