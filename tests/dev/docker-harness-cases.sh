@@ -40,6 +40,7 @@ network-boundary tests/docker/network-boundary.sh SUMMARY failures=0
 dns-contract tests/docker/dns-contract.sh SUMMARY failures=0
 runtime-inspect-differential tests/docker/runtime-inspect-differential.sh SUMMARY failures=0
 runtime-hardening tests/docker/runtime-hardening.sh RUNTIME HARDENING SUMMARY failures=0
+security-fixture tests/docker/security-fixture.sh DOCKER SECURITY FIXTURE SUMMARY failures=0
 secret-nondisclosure tests/docker/secret-nondisclosure.sh SUMMARY failures=0
 serena-runtime tests/docker/serena-runtime.sh SERENA RUNTIME SUMMARY failures=0
 EOF
@@ -100,6 +101,56 @@ if grep -Eq \
   pass "canonical devbox base is content-pinned"
 else
   fail "canonical devbox base is content-pinned"
+fi
+
+security_fixture="$repo_root/tests/docker/security-fixture.sh"
+if [ -x "$security_fixture" ] &&
+   grep -Fq 'docker image inspect --format' "$security_fixture" &&
+   grep -Fq -- '--network none' "$security_fixture" &&
+   grep -Fq -- '--read-only' "$security_fixture" &&
+   grep -Fq -- '--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m' "$security_fixture" &&
+   grep -Fq -- '--cap-drop ALL' "$security_fixture" &&
+   grep -Fq -- '--security-opt no-new-privileges' "$security_fixture" &&
+   grep -Fq -- '--user 1000:1000' "$security_fixture" &&
+   grep -Fq -- '"$image_id" -c' "$security_fixture" &&
+   ! grep -Eq -- '--privileged|--network (host|container:)|docker\.sock' \
+     "$security_fixture"; then
+  pass "simple Docker fixture is content-pinned and least-privilege"
+else
+  fail "simple Docker fixture is content-pinned and least-privilege"
+fi
+if grep -Fxq 'tests/docker/security-fixture.sh' \
+     "$repo_root/policy/protected.paths"; then
+  pass "simple Docker fixture is maintenance-protected"
+else
+  fail "simple Docker fixture is maintenance-protected"
+fi
+# Requested runtime flags only describe intent; the fixture must also observe the
+# kernel-enforced result of each one from inside the container.
+if grep -Fq -- 'check test "$(id -u)" = 1000' "$security_fixture" &&
+   grep -Fq -- 'check test "$(id -g)" = 1000' "$security_fixture" &&
+   grep -Fq -- 'NoNewPrivs:/ { print \$2 }" /proc/self/status)" = 1' \
+     "$security_fixture" &&
+   grep -Fq -- '/sys/class/net' "$security_fixture" &&
+   grep -Fq -- '" = lo' "$security_fixture" &&
+   grep -Fq -- 'DOCKER SECURITY FIXTURE SUMMARY failures=%s' "$security_fixture" &&
+   grep -Fq -- 'test "$failures" -eq 0' "$security_fixture"; then
+  pass "simple Docker fixture proves its uid, no-new-privileges, and network containment"
+else
+  fail "simple Docker fixture proves its uid, no-new-privileges, and network containment"
+fi
+# A non-root process reports CapEff=0 and cannot write to root-owned `/` whether or
+# not --cap-drop ALL and --read-only were requested, so neither observable can carry
+# that evidence. Only the capability bounding set and the root mount options change
+# when those flags are dropped.
+if grep -Fq -- 'CapBnd:/ { print \$2 }" /proc/self/status)" = 0000000000000000' \
+     "$security_fixture" &&
+   grep -Fq -- 'check grep -Eq "^[0-9]+ [0-9]+ [0-9]+:[0-9]+ [^ ]+ / ro[, ]" /proc/self/mountinfo' \
+     "$security_fixture" &&
+   grep -Fq -- 'check touch /tmp/agent-lab-tmp-write-probe' "$security_fixture"; then
+  pass "simple Docker fixture proves read-only root and dropped capabilities independently of its uid"
+else
+  fail "simple Docker fixture proves read-only root and dropped capabilities independently of its uid"
 fi
 
 docker_gate_fixture="$work/docker-gate-fixture"

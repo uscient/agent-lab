@@ -44,7 +44,7 @@ jobs:
             if [ "$restriction" = 1 ]; then
               sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
             fi
-          fi
+           fi
           bwrap_probe
 
       - name: Validate pull request topology

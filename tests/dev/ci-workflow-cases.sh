@@ -44,7 +44,9 @@ job_block() {
 require_job_text() {
   local job="$1" text="$2" name="$3" block
   block="$(job_block "$ci" "$job")"
-  if [ -n "$block" ] && printf '%s\n' "$block" | grep -Fq -- "$text"; then
+  # Avoid `producer | grep -q` under pipefail: an early match may SIGPIPE the
+  # producer and turn a true assertion into a scheduler-dependent failure.
+  if [ -n "$block" ] && grep -Fq -- "$text" <<<"$block"; then
     pass "$name"
   else
     fail "$name"
@@ -199,6 +201,24 @@ require_job_text fast '[ "$PR_HEAD_REF" = "group/$group_name" ] && valid_group "
   "fast job enforces group to flow topology"
 require_job_text fast '[[ "$PR_HEAD_REF" =~ ^slice/group/$group_name/$component$ ]]' \
   "fast job enforces matching group-slice topology"
+require_text "$agents" 'receives changes only through matching group-slice PRs' \
+  "agent policy makes Group branches PR-only integration parents"
+require_text "$workstreams_doc" 'at least two independently GREEN vertical slices' \
+  "program guide requires multiple vertical slices after G0"
+require_text "$workstreams_doc" \
+  'A process-only synchronization or gate-registration slice does not' \
+  "program guide excludes process-only slices from the vertical-slice minimum"
+require_text "$workstreams_doc" \
+  'ignored packet state is never shared between checkouts' \
+  "program guide isolates each active slice's workflow packet"
+require_text "$workstreams_doc" './scripts/dev/workstream group-sync' \
+  "program guide routes moving Flow through a Group synchronization slice"
+require_text "$development_doc" 'PR-only `group-sync` slice from `origin/flow`' \
+  "development guide matches the PR-only Group synchronization route"
+require_text "$workstreams_doc" 'Claude Opus 5 at `max`' \
+  "program guide pins the corrected Claude effort"
+require_text "$workstreams_doc" 'Never launch a status worker' \
+  "program guide requires direct unattended worker observation"
 if [ -x "$ci_fast" ] &&
    awk '
      /scripts\/dev\/cue-tool provision/ { cue=NR }

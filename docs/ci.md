@@ -37,17 +37,40 @@ code-scanning result; that result must succeed but cannot substitute for the wor
 The Docker worker always runs the full runtime gate. Its cache-aware devbox
 build is a separate timed step, and the gate records runtime-suite timings so
 slow phases remain visible without turning containment evidence into an
-optional check. The optional OpenClaw image is not built by CI.
+optional check. A small content-pinned fixture first proves one container has
+no network, a read-only root, an empty capability bounding set, no-new-privileges,
+and a non-root identity. It supplements rather than replaces the product
+containment suites. The optional OpenClaw image is not built by CI.
 
 ## Agent navigation loop
 
-1. Open `CI / Required gates` for the compact result table and replay commands.
-2. Open the failed worker for its focused step summary and annotation.
-3. Download its seven-day failure artifact, when produced, if the normal log is
-   too noisy.
-4. Reproduce with the exact command from the table.
-5. Fix the source defect; do not weaken assertions, convert failures to skips,
+After publishing a PR head, run the read-only observer with that exact head:
+
+```bash
+./scripts/dev/hosted-ci-watch --repo uscient/agent-lab --pr PR_NUMBER \
+  --expected-head FULL_PR_HEAD_SHA
+```
+
+The observer polls the PR-bound `CI` and `CodeQL` workflow jobs. As soon as any
+required job reaches a terminal non-success conclusion, it fetches direct check
+annotations or that job's direct log with bounded retries and reports the exact
+PR head, workflow, job ID/name, conclusion, failing step, and a bounded redacted
+excerpt. It does not wait for unrelated jobs or the overall workflow run to
+finish, cancel or rerun the obsolete run, or reuse its results for a later head.
+
+Diagnosis is not acceptance. The observer reports `HOSTED CI ACCEPTED` only
+after the full exact-head set—Fast, Static, Docker security, Required gates, and
+Actions CodeQL—is terminal and successful. A missing, partial, pending,
+cancelled, stale-head, or mismatched-merge result remains non-green. The fixed
+custody collector and protected rules remain authoritative acceptance evidence.
+
+1. Use the emitted failed-job excerpt and exact local replay command.
+2. Download the seven-day failure artifact, when produced, only if the bounded
+   direct diagnosis is insufficient.
+3. Fix the source defect; do not weaken assertions, convert failures to skips,
    or add blanket retries.
+4. Push a new head and run the complete CI/CodeQL campaign again. Let the
+   obsolete run finish naturally; none of its results apply to the new head.
 
 The fast job records and validates the immutable event diff base and checked-out
 head. It rejects missing, malformed, unfetched, non-ancestor, or mismatched SHAs
@@ -67,23 +90,26 @@ current-head statuses and review; it does not replace either one.
 
 The required status is navigation and merge evidence, not a standalone security
 boundary. Pull-request code can change workflows, reducers, manifests, and the
-tests they execute while preserving the same check name. The human-owned review
-gate remains authoritative.
+tests they execute while preserving the same check name. The final human-owned
+`flow` to `dev` review gate remains authoritative.
 
-Before granting autonomous agents any merge authority, require an approval of
-the most recent push and dismiss stale approvals. Also require code-owner review
-by a real maintainer team for `.github/workflows/`, `scripts/dev/`,
-`scripts/lib/dev-common.sh`, and `tests/security/`; alternatively, enforce a
-required workflow or path restriction whose definition agents cannot modify.
-Do not add a placeholder CODEOWNER: GitHub silently ignores owners that lack
-write access.
+Agent-owned Group and Group-slice integration is restricted by the verified
+helper to the exact branch-derived route, current base/head, complete successful
+checks, append-only evidence, retained ancestry, and no changes-requested state.
+Final PRs into `dev` require human approval of the most recent push and stale
+approval dismissal. Require code-owner review by a real maintainer team for
+`.github/workflows/`, `scripts/dev/`, `scripts/lib/dev-common.sh`, and
+`tests/security/` on that final route; alternatively, enforce a required workflow
+or path restriction whose definition agents cannot modify. Do not add a
+placeholder CODEOWNER: GitHub silently ignores owners that lack write access.
 
 ## Repository ruleset
 
 After each base has emitted its first check, require `CI / Required gates` and
 CodeQL on `dev`, `flow`, every `group/**` base, and any retained publication
-branch. Require current-base testing, approval of the latest push, and stale-approval dismissal;
-the verified program route does not use a merge queue. Deny force updates and deletion for
+branch. Require current-base testing everywhere and human approval of the latest push plus
+stale-approval dismissal on the final `dev` route; the verified program route does not use a merge
+queue. Deny force updates and deletion for
 `flow`, `work/**`, `group/**`, and `slice/group/**`; keep merge commits and disable
 automatic program-branch deletion through final review.
 
