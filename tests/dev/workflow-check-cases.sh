@@ -42,6 +42,18 @@ expect_ok() {
   fi
 }
 
+expect_ok_line() {
+  local name="$1" expected="$2"
+  shift 2
+  run_checker "$@"
+  if [ "$checker_rc" -eq 0 ] && printf '%s\n' "$checker_out" | grep -Fxq "$expected"; then
+    pass "$name"
+  else
+    fail "$name (rc=$checker_rc; expected exact line: $expected)"
+    printf '%s\n' "$checker_out"
+  fi
+}
+
 expect_reject() {
   local name="$1" expected="$2"
   shift 2
@@ -547,6 +559,55 @@ sed -n '1,/^## Evidence$/p' "$good_body" > "$erased_evidence_body"
 expect_reject "evidence update cannot erase every prior cycle" "changed or erased" \
   evidence-append "$good_body" "$erased_evidence_body"
 
+blank_evidence_body="$work/blank-evidence-body.md"
+{
+  cat "$erased_evidence_body"
+  printf '%s\n' '' '   ' ''
+} > "$blank_evidence_body"
+
+stray_evidence_body="$work/stray-evidence-body.md"
+{
+  cat "$erased_evidence_body"
+  printf '%s\n' '' 'Evidence pending.'
+} > "$stray_evidence_body"
+
+reordered_cycles_body="$work/reordered-cycles-body.md"
+{
+  sed -n '1,/^## Evidence$/p' "$appended_evidence_body"
+  sed -n '/^### Cycle 2$/,$p' "$appended_evidence_body"
+  awk '/^### Cycle 1$/ { keep = 1 } /^### Cycle 2$/ { keep = 0 } keep' "$appended_evidence_body"
+} > "$reordered_cycles_body"
+
+truncated_evidence_body="$work/truncated-evidence-body.md"
+grep -Fv -- '- Unverified: none' "$good_body" > "$truncated_evidence_body"
+
+expect_ok_line "an absent prior Evidence section bootstraps one validated cycle" \
+  'PASS workflow append-only evidence bootstrap' \
+  evidence-append "$missing_evidence_body" "$good_body"
+expect_ok_line "an empty prior Evidence section bootstraps one validated cycle" \
+  'PASS workflow append-only evidence bootstrap' \
+  evidence-append "$erased_evidence_body" "$good_body"
+expect_ok_line "a blank-only prior Evidence section bootstraps one validated cycle" \
+  'PASS workflow append-only evidence bootstrap' \
+  evidence-append "$blank_evidence_body" "$good_body"
+expect_ok_line "an appended cycle keeps the strict append-only path" \
+  'PASS workflow append-only evidence' \
+  evidence-append "$good_body" "$appended_evidence_body"
+expect_reject "bootstrap cannot seed an empty Evidence section" "changed or erased" \
+  evidence-append "$erased_evidence_body" "$erased_evidence_body"
+expect_reject "bootstrap cannot seed an absent Evidence section" "changed or erased" \
+  evidence-append "$missing_evidence_body" "$missing_evidence_body"
+expect_reject "one stray prior evidence line disables bootstrap" "changed or erased" \
+  evidence-append "$stray_evidence_body" "$good_body"
+expect_reject "bootstrap cannot rerun once a cycle is recorded" "changed or erased" \
+  evidence-append "$good_body" "$blank_evidence_body"
+expect_reject "evidence update cannot reorder prior cycles" "changed or erased" \
+  evidence-append "$appended_evidence_body" "$reordered_cycles_body"
+expect_reject "evidence update cannot truncate a prior cycle" "changed or erased" \
+  evidence-append "$good_body" "$truncated_evidence_body"
+expect_infra "an unreadable prior body stays an infrastructure failure" \
+  "cannot read PR bodies" evidence-append "$work/absent-body.md" "$good_body"
+
 vague_testing_body="$work/vague-testing-body.md"
 cat > "$vague_testing_body" <<'EOF'
 ## Summary
@@ -1030,7 +1091,7 @@ else
   printf '%s\n' "$checker_out"
 fi
 
-expected_passes=160
+expected_passes=171
 if [ "$passes" -ne "$expected_passes" ]; then
   fail "contract executed the exact expected assertions ($passes/$expected_passes)"
 fi

@@ -515,6 +515,41 @@ else
   fail "append-only evidence sensitivity mutation turns RED"
 fi
 
+# An agent-created PR body can reach GitHub without any Evidence section, so the helper must
+# be able to seed Cycle 1 exactly once without ever relaxing the strict current-evidence gate.
+bootstrap_old_body="$work/bootstrap-old-body.md"
+awk '$0 == "## Evidence" { exit } { print }' "$valid_body" > "$bootstrap_old_body"
+bootstrap_json="$(jq -c --rawfile body "$bootstrap_old_body" '.body = $body' <<<"$valid_json")"
+if run_evidence "$bootstrap_json" "$valid_body" \
+  && cmp -s "$valid_body" "$updated_body_marker" \
+  && grep -Fxq "pr edit 17 --repo github.com/uscient/agent-lab --body-file $valid_body" "$gh_log"; then
+  pass "bounded evidence update bootstraps a first cycle over an empty ledger"
+else
+  fail "bounded evidence update bootstraps a first cycle over an empty ledger"
+fi
+
+stale_bootstrap_body="$work/stale-bootstrap-body.md"
+sed 's/0123456789abcdef0123456789abcdef01234567/3333333333333333333333333333333333333333/' \
+  "$valid_body" > "$stale_bootstrap_body"
+if run_evidence "$bootstrap_json" "$stale_bootstrap_body"; then
+  fail "evidence bootstrap still requires strict current evidence"
+elif ! grep -q '^pr edit ' "$gh_log"; then
+  pass "evidence bootstrap still requires strict current evidence"
+else
+  fail "evidence bootstrap still requires strict current evidence"
+fi
+
+strict_mutant="$route_fixture/scripts/dev/workstream-strict-mutant"
+sed 's#PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$body_file" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null#true#' \
+  "$route_fixture/scripts/dev/workstream" > "$strict_mutant"
+chmod +x "$strict_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$strict_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$bootstrap_json" "$stale_bootstrap_body" "$strict_mutant"; then
+  pass "strict current-evidence sensitivity mutation turns RED"
+else
+  fail "strict current-evidence sensitivity mutation turns RED"
+fi
+
 if run_merge "$valid_json" \
   && grep -Fxq "api repos/uscient/agent-lab/compare/$base_oid...$head_oid --hostname github.com --jq .status" "$gh_log" \
   && grep -Fxq "api repos/uscient/agent-lab/pulls/17/merge --hostname github.com --method PUT -f merge_method=merge -f sha=$head_oid" "$gh_log" \
