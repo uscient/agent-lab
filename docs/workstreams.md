@@ -103,19 +103,19 @@ it, and open its fixed draft PR:
 ./scripts/dev/workstream group-pr --title "..." --body-file /tmp/pr-body.md
 ```
 
-The group PR always targets `flow` and starts as a draft. For the bounded Flow program, the
-coordinator owns intermediate Group readiness and integration; it makes the exact current Group PR
-ready through the verified helper:
+Group-slice and Group PRs start as drafts. For the bounded Flow program, the coordinator owns their
+intermediate readiness and integration; from the exact current Group or matching Group-slice branch,
+it makes the corresponding PR ready through the verified helper:
 
 ```bash
 ./scripts/dev/workstream ready <pr-number>
 ```
 
-Group integration does not require an intermediate human approval, but changes-requested state,
-draft state, stale base/head/evidence, missing checks, failed checks, or non-merge ancestry still
-block it. Slice and legacy-workstream integration retain their approval requirement. Once the Group
-head contains the observed current `flow` base and every required check succeeds, the coordinator
-checks out read-only `flow` and runs:
+Group-slice and Group integration do not require an intermediate human approval, but
+changes-requested state, draft state, stale base/head/evidence, missing checks, failed checks, or
+non-merge ancestry still block them. Legacy workstream integration retains its approval requirement.
+Once the Group head contains the observed current `flow` base and every required check succeeds, the
+coordinator checks out read-only `flow` and runs:
 
 ```bash
 ./scripts/dev/workstream merge <pr-number>

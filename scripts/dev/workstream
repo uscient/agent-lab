@@ -327,27 +327,43 @@ case "$command_name" in
     pr_number="$1"
     [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || refuse "PR number must be a positive integer"
     branch="$(current_branch)"
+    expected_base=""
     case "$branch" in
-      group/*) valid_group "${branch#group/}" || refuse "invalid current group branch" ;;
-      *) refuse "ready requires a group/<id>-<slug> branch" ;;
+      group/*)
+        valid_group "${branch#group/}" || refuse "invalid current group branch"
+        expected_base="flow"
+        ;;
+      slice/group/*/*)
+        if [[ "$branch" =~ ^slice/group/([^/]+)/([^/]+)$ ]]; then
+          group_id="${BASH_REMATCH[1]}"
+          slice_id="${BASH_REMATCH[2]}"
+        else
+          refuse "invalid current group-slice branch"
+        fi
+        valid_group "$group_id" || refuse "invalid current group-slice parent"
+        valid_component "$slice_id" || refuse "invalid current group-slice name"
+        expected_base="group/$group_id"
+        ;;
+      *) refuse "ready requires a Group or matching Group-slice branch" ;;
     esac
     require_clean
     metadata="$("$real_gh" pr view "$pr_number" --repo "$repository_target" \
       --json number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository)" \
       || die "cannot read PR $pr_number"
     if ! printf '%s' "$metadata" | "$real_jq" -e \
-      --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" '
+      --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" \
+      --arg expected_base "$expected_base" '
       (.number == $number) and
       (.state == "OPEN") and
       (.isDraft == true) and
-      (.baseRefName == "flow") and
+      (.baseRefName == $expected_base) and
       (.headRefName == $branch) and
       (.isCrossRepository == false) and
       (.headRepository.nameWithOwner == $repository) and
       (.baseRefOid | test("^[0-9a-f]{40}$")) and
       (.headRefOid | test("^[0-9a-f]{40}$"))
     ' >/dev/null; then
-      refuse "PR $pr_number is not the exact draft Group PR for the current branch"
+      refuse "PR $pr_number is not the exact draft program PR for the current branch"
     fi
     base_sha="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefOid)"
     head_sha="$(printf '%s' "$metadata" | "$real_jq" -r .headRefOid)"
@@ -358,11 +374,11 @@ case "$command_name" in
       || die "cannot confirm PR $pr_number readiness"
     if ! printf '%s' "$confirmed" | "$real_jq" -e \
       --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" \
-      --arg base "$base_sha" --arg head "$head_sha" '
+      --arg base "$base_sha" --arg head "$head_sha" --arg expected_base "$expected_base" '
       (.number == $number) and
       (.state == "OPEN") and
       (.isDraft == false) and
-      (.baseRefName == "flow") and
+      (.baseRefName == $expected_base) and
       (.baseRefOid == $base) and
       (.headRefName == $branch) and
       (.headRefOid == $head) and
@@ -371,7 +387,7 @@ case "$command_name" in
     ' >/dev/null; then
       refuse "PR $pr_number identity changed while becoming ready"
     fi
-    printf 'PASS workstream made Group PR %s ready at head %s\n' "$pr_number" "$head_sha"
+    printf 'PASS workstream made program PR %s ready at head %s\n' "$pr_number" "$head_sha"
     ;;
   merge)
     [ "$#" -eq 1 ] || usage
@@ -415,10 +431,13 @@ case "$command_name" in
       (.baseRefOid | test("^[0-9a-f]{40}$")) and
       (.headRefOid | test("^[0-9a-f]{40}$")) and
       (.mergeStateStatus == "CLEAN") and
-      (((.baseRefName == "flow") and
+      ((((.baseRefName == "flow") or
+         (.baseRefName | test("^group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$"))) and
         ((.reviewDecision == null) or (.reviewDecision == "") or
          (.reviewDecision == "REVIEW_REQUIRED") or (.reviewDecision == "APPROVED"))) or
-      ((.baseRefName != "flow") and (.reviewDecision == "APPROVED"))) and
+       (((.baseRefName != "flow") and
+         (.baseRefName | test("^group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$") | not)) and
+        (.reviewDecision == "APPROVED"))) and
       ((.statusCheckRollup | length) > 0) and
       ((.statusCheckRollup |
         map([(.workflowName // ""), .name, (.startedAt // ""),

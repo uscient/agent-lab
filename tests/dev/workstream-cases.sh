@@ -196,6 +196,23 @@ if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
 else
   fail "verified helper makes only the exact current Group PR ready"
 fi
+group_slice_ready_json="$(printf '%s' "$valid_json" | jq -c '
+  .baseRefName="group/g0-operator-surface" |
+  .headRefName="slice/group/g0-operator-surface/format" | .isDraft=true')"
+git -C "$route_fixture" update-ref \
+  refs/heads/slice/group/g0-operator-surface/format "$fixture_oid"
+git -C "$route_fixture" symbolic-ref HEAD refs/heads/slice/group/g0-operator-surface/format
+find "$ready_marker" -maxdepth 0 -delete >/dev/null 2>&1 || true
+: > "$gh_log"
+if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
+  WORKSTREAM_PR_JSON="$group_slice_ready_json" WORKSTREAM_READY_MARKER="$ready_marker" \
+  WORKSTREAM_MERGED_MARKER="$merged_marker" \
+  "$route_fixture/scripts/dev/workstream" ready 17 >/dev/null \
+  && grep -Fxq 'pr ready 17 --repo github.com/uscient/agent-lab' "$gh_log"; then
+  pass "verified helper makes only the exact matching Group-slice PR ready"
+else
+  fail "verified helper makes only the exact matching Group-slice PR ready"
+fi
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/work/demo
 : > "$gh_log"
 if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
@@ -452,6 +469,20 @@ if run_merge "$group_json"; then
 else
   fail "approved current-base group slice integrates through the helper"
 fi
+unreviewed_group_json="$(printf '%s' "$group_json" | jq -c '.reviewDecision="REVIEW_REQUIRED"')"
+if run_merge "$unreviewed_group_json"; then
+  pass "current-base Group-slice PR integrates without intermediate human approval"
+else
+  fail "current-base Group-slice PR integrates without intermediate human approval"
+fi
+changes_requested_group_json="$(printf '%s' "$group_json" | jq -c '.reviewDecision="CHANGES_REQUESTED"')"
+if run_merge "$changes_requested_group_json"; then
+  fail "changes-requested Group-slice PR remains blocked"
+elif ! grep -q '^api repos/uscient/agent-lab/pulls/17/merge ' "$gh_log"; then
+  pass "changes-requested Group-slice PR remains blocked"
+else
+  fail "changes-requested Group-slice PR remains blocked"
+fi
 
 wrong_route_json="$(printf '%s' "$valid_json" | jq -c \
   '.baseRefName="group/g0-operator-surface" |
@@ -613,6 +644,17 @@ if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$review_mutant"; printf 
   pass "changes-requested Group sensitivity mutation turns RED"
 else
   fail "changes-requested Group sensitivity mutation turns RED"
+fi
+
+group_slice_review_mutant="$route_fixture/scripts/dev/workstream-group-slice-review-mutant"
+sed 's/((\.baseRefName == "flow") or/((.baseRefName == "flow") and/' \
+  "$route_fixture/scripts/dev/workstream" > "$group_slice_review_mutant"
+chmod +x "$group_slice_review_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$group_slice_review_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && ! run_merge "$unreviewed_group_json" "$group_slice_review_mutant"; then
+  pass "Group-slice approval sensitivity mutation turns RED"
+else
+  fail "Group-slice approval sensitivity mutation turns RED"
 fi
 
 squash_mutant="$route_fixture/scripts/dev/workstream-squash-mutant"
