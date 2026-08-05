@@ -94,6 +94,8 @@ def fixture(kind: str) -> dict[str, object]:
         codeql_jobs = [job(201, "CodeQL", "completed", "success")]
         ci_run = run(11, "ci.yml", "completed", "success")
         codeql_run = run(21, "codeql.yml", "completed", "success")
+    if kind == "duplicate":
+        ci_jobs.append(job(105, "Fast", "completed", "success"))
     if kind == "old-head":
         ci_run = run(11, "ci.yml", "completed", "success", head=OLD_HEAD)
         codeql_run = run(21, "codeql.yml", "completed", "success", head=OLD_HEAD)
@@ -207,6 +209,9 @@ def check_case(helper: Path, kind: str, *, quiet: bool = False) -> bool:
     elif kind == "success":
         ok = result.returncode == 0 and f"HOSTED CI ACCEPTED head={HEAD}" in output
         ok = ok and "required=ci.yml/Required gates,codeql.yml/CodeQL" in output
+    elif kind == "duplicate":
+        ok = result.returncode == 2 and "REFUSE hosted-ci-watch duplicate ci.yml/Fast jobs" in output
+        ok = ok and "HOSTED CI ACCEPTED" not in output
     if not quiet:
         if ok:
             pass_case({
@@ -215,6 +220,7 @@ def check_case(helper: Path, kind: str, *, quiet: bool = False) -> bool:
                 "pending": "partial or pending required results cannot become accepted hosted CI",
                 "old-head": "a new head cannot reuse completed results from the failed old merge head",
                 "success": "acceptance requires the complete exact-head required Actions set",
+                "duplicate": "duplicate required job names are refused instead of selected arbitrarily",
             }[kind])
         else:
             fail_case(f"{kind} contract (rc={result.returncode})\n{output}")
@@ -238,7 +244,9 @@ def mutation(helper: Path, label: str, old: str, new: str, case: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--helper", type=Path, default=DEFAULT_HELPER)
-    parser.add_argument("--case", choices=("failure", "delayed", "pending", "old-head", "success"))
+    parser.add_argument(
+        "--case", choices=("failure", "delayed", "pending", "old-head", "success", "duplicate")
+    )
     args = parser.parse_args()
     helper = args.helper.resolve()
     if not helper.is_file():
@@ -249,7 +257,7 @@ def main() -> int:
         ok = check_case(helper, args.case)
         print(f"SUMMARY failures={failures}")
         return 0 if ok else 1
-    for case in ("failure", "delayed", "pending", "old-head", "success"):
+    for case in ("failure", "delayed", "pending", "old-head", "success", "duplicate"):
         check_case(helper, case)
     mutation(
         helper,
@@ -278,6 +286,13 @@ def main() -> int:
         "if run_head != head_sha:\n",
         "if False and run_head != head_sha:\n",
         "old-head",
+    )
+    mutation(
+        helper,
+        "duplicate-required-job-selected",
+        '            else:\n                return Decision("refused", f"duplicate {workflow}/{name} jobs")\n',
+        "            else:\n                required[(workflow, name)] = entries[-1]\n",
+        "duplicate",
     )
     print(f"SUMMARY failures={failures}")
     return 0 if failures == 0 else 1
