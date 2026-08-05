@@ -473,6 +473,35 @@ if run_merge "$flow_json"; then
 else
   fail "approved current-base group PR integrates into flow through the helper"
 fi
+replayed_flow_json="$(printf '%s' "$flow_json" | jq -c '
+  .statusCheckRollup |= (. as $checks |
+    [($checks[0] + {
+      status:"COMPLETED", conclusion:"FAILURE",
+      startedAt:"2026-08-05T04:00:00Z", completedAt:"2026-08-05T04:01:00Z",
+      detailsUrl:"https://github.test/actions/runs/100/jobs/1001"
+    })] +
+    ($checks | to_entries | map(.value + {
+      startedAt:"2026-08-05T05:00:00Z", completedAt:"2026-08-05T05:01:00Z",
+      detailsUrl:("https://github.test/actions/runs/200/jobs/" + ((.key + 2001) | tostring))
+    })))')"
+if run_merge "$replayed_flow_json"; then
+  pass "latest successful replay supersedes an older failed check on the same head"
+else
+  fail "latest successful replay supersedes an older failed check on the same head"
+fi
+latest_pending_flow_json="$(printf '%s' "$replayed_flow_json" | jq -c '
+  .statusCheckRollup += [(last(.statusCheckRollup[] | select(.name == "Fast"))) + {
+    status:"IN_PROGRESS", conclusion:"", startedAt:"2026-08-05T06:00:00Z",
+    completedAt:"0001-01-01T00:00:00Z",
+    detailsUrl:"https://github.test/actions/runs/300/jobs/3001"
+  }]')"
+if run_merge "$latest_pending_flow_json"; then
+  fail "latest pending replay blocks integration despite older success"
+elif ! grep -q '^api repos/uscient/agent-lab/pulls/17/merge ' "$gh_log"; then
+  pass "latest pending replay blocks integration despite older success"
+else
+  fail "latest pending replay blocks integration despite older success"
+fi
 unreviewed_flow_json="$(printf '%s' "$flow_json" | jq -c '.reviewDecision="REVIEW_REQUIRED"')"
 if run_merge "$unreviewed_flow_json"; then
   pass "current-base Group PR integrates without intermediate human approval"
@@ -543,7 +572,7 @@ else
 fi
 
 mutant="$route_fixture/scripts/dev/workstream-mutant"
-sed 's/(all(\.statusCheckRollup\[\]; \.status == "COMPLETED" and \.conclusion == "SUCCESS"))/(true)/' \
+sed 's/(all(\$latest_checks\[\]; \.status == "COMPLETED" and \.conclusion == "SUCCESS"))/(true)/' \
   "$route_fixture/scripts/dev/workstream" > "$mutant"
 chmod +x "$mutant"
 if [ "$(cmp -s "$command_path" "$mutant"; printf '%s' "$?")" -ne 0 ] \
@@ -551,6 +580,17 @@ if [ "$(cmp -s "$command_path" "$mutant"; printf '%s' "$?")" -ne 0 ] \
   pass "all-checks sensitivity mutation turns RED"
 else
   fail "all-checks sensitivity mutation turns RED"
+fi
+
+oldest_replay_mutant="$route_fixture/scripts/dev/workstream-oldest-replay-mutant"
+sed 's/]) | last)/]) | first)/' \
+  "$route_fixture/scripts/dev/workstream" > "$oldest_replay_mutant"
+chmod +x "$oldest_replay_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$oldest_replay_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && ! run_merge "$replayed_flow_json" "$oldest_replay_mutant"; then
+  pass "oldest-replay sensitivity mutation turns RED"
+else
+  fail "oldest-replay sensitivity mutation turns RED"
 fi
 
 evidence_mutant="$route_fixture/scripts/dev/workstream-evidence-mutant"

@@ -391,6 +391,10 @@ case "$command_name" in
       || die "cannot read PR $pr_number"
     if ! printf '%s' "$metadata" | "$real_jq" -e \
       --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" '
+      (.statusCheckRollup |
+        group_by([(.workflowName // ""), .name]) |
+        map(sort_by([(.startedAt // ""), (.completedAt // ""), (.detailsUrl // "")]) | last)
+      ) as $latest_checks |
       (.number == $number) and
       (.state == "OPEN") and
       (.isDraft == false) and
@@ -414,17 +418,20 @@ case "$command_name" in
       (((.baseRefName == "flow") and
         ((.reviewDecision == null) or (.reviewDecision == "") or
          (.reviewDecision == "REVIEW_REQUIRED") or (.reviewDecision == "APPROVED"))) or
-       ((.baseRefName != "flow") and (.reviewDecision == "APPROVED"))) and
+      ((.baseRefName != "flow") and (.reviewDecision == "APPROVED"))) and
       ((.statusCheckRollup | length) > 0) and
-      ((.statusCheckRollup | map([(.workflowName // ""), .name]) | unique | length) ==
+      ((.statusCheckRollup |
+        map([(.workflowName // ""), .name, (.startedAt // ""),
+             (.completedAt // ""), (.detailsUrl // "")]) | unique | length) ==
        (.statusCheckRollup | length)) and
-      (([.statusCheckRollup[] | select(.name == "Required gates" and
+      (($latest_checks | length) > 0) and
+      (([$latest_checks[] | select(.name == "Required gates" and
         .workflowName == "CI" and
         .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
-      (([.statusCheckRollup[] | select(.name == "CodeQL" and
+      (([$latest_checks[] | select(.name == "CodeQL" and
         .workflowName == "CodeQL" and
         .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
-      (all(.statusCheckRollup[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
+      (all($latest_checks[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
     ' >/dev/null; then
       refuse "PR $pr_number is not a current-base intermediate PR with every check successful"
     fi
