@@ -31,8 +31,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Install Fast gate host tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap shellcheck
+
+      - name: Verify Fast gate bubblewrap isolation
+        run: |
+          bwrap_probe() {
+            bwrap --die-with-parent --dev-bind / / --unshare-net true
+          }
+          if ! bwrap_probe >/dev/null 2>&1; then
+            restriction="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+            if [ "$restriction" = 1 ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+          fi
+          bwrap_probe
 
       - name: Validate pull request topology
         env:
