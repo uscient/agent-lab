@@ -135,10 +135,6 @@ jobs:
             exit 125
           fi
 
-          if [ -f "$old_body" ]; then
-            ./scripts/dev/workflow-check evidence-append "$old_body" "$body"
-          fi
-
           evidence_mode=pr-body
           case "$PR_BASE_REF" in
             flow | group/* | work/*) evidence_mode=pr-body-strict ;;
@@ -174,6 +170,66 @@ jobs:
                 break
               fi
             done < "$changed_file"
+          fi
+
+          # A pull request body reaches GitHub before anything can validate it, so a published
+          # latest cycle can end a canonical result token with comma-adjacent prose that strict
+          # validation rejects and the byte-exact append-only rule refuses to correct. The edited
+          # event carrying the correction is the only run that sees both ledgers, so it accepts the
+          # same bounded repair as scripts/dev/workstream and nothing wider: strict applicability, a
+          # replacement that passes this event's own strict validation, a published body that still
+          # fails that identical validation with an assertion result, and a difference the bounded
+          # repair rule accepts. The ordinary validation below stays authoritative either way.
+          evidence_repair_applies() {
+            local replacement_rc=0 published_rc=0 repair_rc=0
+            [ "$evidence_mode" = pr-body-strict ] || return 1
+            ./scripts/dev/workflow-check pr-body-strict "$body" \
+              "$PR_BASE_SHA" "$PR_HEAD_SHA" "$PR_HEAD_REF" "$PR_BASE_REF" >/dev/null 2>&1 \
+              || replacement_rc=$?
+            case "$replacement_rc" in
+              0) ;;
+              1) return 1 ;;
+              *) return "$replacement_rc" ;;
+            esac
+            ./scripts/dev/workflow-check pr-body-strict "$old_body" \
+              "$PR_BASE_SHA" "$PR_HEAD_SHA" "$PR_HEAD_REF" "$PR_BASE_REF" >/dev/null 2>&1 \
+              || published_rc=$?
+            case "$published_rc" in
+              1) ;;
+              0) return 1 ;;
+              *) return "$published_rc" ;;
+            esac
+            ./scripts/dev/workflow-check evidence-repair "$old_body" "$body" >/dev/null 2>&1 \
+              || repair_rc=$?
+            return "$repair_rc"
+          }
+
+          if [ -f "$old_body" ]; then
+            append_log="$evidence_state/append.log"
+            append_rc=0
+            ./scripts/dev/workflow-check evidence-append "$old_body" "$body" \
+              > "$append_log" 2>&1 || append_rc=$?
+            case "$append_rc" in
+              0) cat "$append_log" ;;
+              1)
+                repair_rc=0
+                evidence_repair_applies || repair_rc=$?
+                case "$repair_rc" in
+                  0)
+                    printf 'PASS workflow bounded evidence repair of the published cycle\n'
+                    ;;
+                  1)
+                    cat "$append_log" >&2
+                    exit "$append_rc"
+                    ;;
+                  *) exit "$repair_rc" ;;
+                esac
+                ;;
+              *)
+                cat "$append_log" >&2
+                exit "$append_rc"
+                ;;
+            esac
           fi
 
           ./scripts/dev/workflow-check "$evidence_mode" "$body" \

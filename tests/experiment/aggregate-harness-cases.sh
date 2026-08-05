@@ -4,9 +4,14 @@ set -u -o pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
 lifecycle="$repo_root/tests/experiment/local-lifecycle-cases.sh"
 local_onboarding="$repo_root/tests/experiment/local-onboarding-cases.sh"
+catalog_state_lifecycle="$repo_root/tests/experiment/catalog-state-lifecycle-cases.sh"
+catalog_name_bound_lifecycle="$repo_root/tests/experiment/catalog-name-bound-lifecycle-cases.sh"
+catalog_durability_lifecycle="$repo_root/tests/experiment/catalog-durability-lifecycle-cases.sh"
+catalog_resolution_lifecycle="$repo_root/tests/experiment/catalog-resolution-lifecycle-cases.sh"
 install_lifecycle="$repo_root/tests/experiment/install-lifecycle-cases.sh"
 source_adapters="$repo_root/tests/experiment/source-adapter-cases.sh"
-expected_count=23
+fast_manifest="$repo_root/tests/security/fast.manifest"
+expected_count=26
 work=""
 
 cleanup_work() {
@@ -28,9 +33,13 @@ trap 'cleanup_work >/dev/null 2>&1 || true' EXIT
 replica="$work/repo"
 replica_lifecycle="$replica/tests/experiment/local-lifecycle-cases.sh"
 replica_local_onboarding="$replica/tests/experiment/local-onboarding-cases.sh"
+replica_catalog_state="$replica/tests/experiment/catalog-state-lifecycle-cases.sh"
+replica_catalog_name_bound="$replica/tests/experiment/catalog-name-bound-lifecycle-cases.sh"
+replica_catalog_durability="$replica/tests/experiment/catalog-durability-lifecycle-cases.sh"
+replica_catalog_resolution="$replica/tests/experiment/catalog-resolution-lifecycle-cases.sh"
 replica_install_lifecycle="$replica/tests/experiment/install-lifecycle-cases.sh"
 replica_source_adapters="$replica/tests/experiment/source-adapter-cases.sh"
-mkdir -p "$replica/tests/experiment" "$replica/tests/install"
+mkdir -p "$replica/tests/experiment" "$replica/tests/install" "$replica/tests/image"
 cp "$lifecycle" "$replica_lifecycle"
 cp "$source_adapters" "$replica_source_adapters"
 chmod +x "$replica_lifecycle" "$replica_source_adapters"
@@ -72,11 +81,69 @@ expected_ids=(
 )
 installer_ids=("${expected_ids[@]:0:5}")
 config_ids=("${expected_ids[@]:5:5}")
-catalog_ids=("${expected_ids[@]:10:76}")
+catalog_base_ids=("${expected_ids[@]:10:18}")
+catalog_state_ids=("${expected_ids[@]:28:18}")
+catalog_name_bound_ids=("${expected_ids[@]:46:1}")
+catalog_durability_ids=("${expected_ids[@]:47:15}")
+catalog_resolution_ids=("${expected_ids[@]:62:14}")
+catalog_mutation_ids=("${expected_ids[@]:76:10}")
 install_ids=("${expected_ids[@]:86:13}")
 state_ids=("${expected_ids[@]:99:16}")
 integrity_ids=("${expected_ids[@]:115:7}")
 mutation_ids=("${expected_ids[@]:122:11}")
+
+# The catalog-state leaf is one file entered once per disjoint slice, so its
+# recorded execution identity carries the selector. A ledger that names only the
+# file cannot tell a slice from the whole leaf.
+catalog_state_execution='catalog-state-cases.py:state'
+catalog_name_bound_execution='catalog-state-cases.py:name-bound'
+catalog_durability_execution='catalog-state-cases.py:durability'
+catalog_slice_executions=(
+  "$catalog_state_execution"
+  "$catalog_name_bound_execution"
+  "$catalog_durability_execution"
+)
+
+# One rendezvous participant per lane of the compatibility route, one per public
+# route, and one per lane of the install route. A participant blocks until every
+# peer in its own set has started, so a serialized scheduler can never satisfy
+# it whatever the elapsed time is.
+lane_barrier_ids=(
+  local-install-cases.sh
+  "$catalog_state_execution"
+  catalog-resolution-cases.sh
+)
+split_barrier_ids=(
+  local-install-cases.sh
+  "$catalog_state_execution"
+  "$catalog_name_bound_execution"
+  "$catalog_durability_execution"
+  catalog-resolution-cases.sh
+  install-state-cases.py
+)
+local_barrier_ids=(
+  local-install-cases.sh
+  catalog-cases.sh
+)
+resolution_barrier_ids=(
+  catalog-resolution-cases.sh
+  catalog-mutation-cases.py
+)
+install_barrier_ids=(
+  install-store-cases.sh
+  install-state-cases.py
+)
+
+member_of() {
+  local needle="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [ "$candidate" = "$needle" ] || continue
+    return 0
+  done
+  return 1
+}
 source_zip_ids=(
   ZIP-001 ZIP-COMPAT-001 ZIP-USAGE-001 ZIP-PATH-001 ZIP-COUNT-001 ZIP-TYPE-001
   ZIP-META-001 ZIP-FLAG-001 ZIP-METHOD-001 ZIP-ZIP64-001 ZIP-HEADER-001 ZIP-CRC-001
@@ -111,6 +178,53 @@ source_expected_ids=(
   "${source_git_mutation_ids[@]}"
 )
 
+emit_bash_barrier() {
+  local variable="$1"
+  local execution_id="$2"
+  shift 2
+  local peer
+  local separator='  while '
+
+  member_of "$execution_id" "$@" || return 0
+  printf 'if [ -n "${%s:-}" ]; then\n' "$variable"
+  printf "  : > \"\$%s/%s.ready\" || exit 125\n" "$variable" "$execution_id"
+  printf '  attempts=0\n'
+  for peer in "$@"; do
+    printf '%s[ ! -f "$%s/%s.ready" ]' "$separator" "$variable" "$peer"
+    separator=' ||
+        '
+  done
+  printf '; do\n'
+  printf '    attempts=$((attempts + 1))\n'
+  printf '    [ "$attempts" -lt 500 ] || exit 125\n'
+  printf '    sleep 0.01\n'
+  printf '  done\n'
+  printf 'fi\n'
+}
+
+emit_python_barrier() {
+  local variable="$1"
+  local execution_id="$2"
+  shift 2
+  local peer
+  local slot="barrier_${variable,,}"
+
+  member_of "$execution_id" "$@" || return 0
+  printf "%s = os.environ.get('%s')\n" "$slot" "$variable"
+  printf 'if %s:\n' "$slot"
+  printf "    Path(%s, '%s.ready').touch()\n" "$slot" "$execution_id"
+  printf '    peers = (\n'
+  for peer in "$@"; do
+    printf "        '%s.ready',\n" "$peer"
+  done
+  printf '    )\n'
+  printf '    deadline = time.monotonic() + 5.0\n'
+  printf '    while not all(Path(%s, peer).is_file() for peer in peers):\n' "$slot"
+  printf '        if time.monotonic() >= deadline:\n'
+  printf '            raise SystemExit(125)\n'
+  printf '        time.sleep(0.01)\n'
+}
+
 write_fixture() {
   local path="$1"
   local rc="$2"
@@ -122,21 +236,16 @@ write_fixture() {
     printf 'if [ -n "${AGENT_LAB_AGG_EXEC_LOG:-}" ]; then\n'
     printf "  printf '%%s\\n' '%s' >> \"\$AGENT_LAB_AGG_EXEC_LOG\" || exit 125\n" "$execution_id"
     printf 'fi\n'
-    case "$execution_id" in
-      local-install-cases.sh | local-image-catalog-cases.sh)
-        printf 'if [ -n "${AGENT_LAB_AGG_BARRIER_DIR:-}" ]; then\n'
-        printf "  : > \"\$AGENT_LAB_AGG_BARRIER_DIR/%s.ready\" || exit 125\n" "$execution_id"
-        printf '  attempts=0\n'
-        printf '  while [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/local-install-cases.sh.ready" ] ||\n'
-        printf '        [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/local-image-catalog-cases.sh.ready" ] ||\n'
-        printf '        [ ! -f "$AGENT_LAB_AGG_BARRIER_DIR/install-state-cases.py.ready" ]; do\n'
-        printf '    attempts=$((attempts + 1))\n'
-        printf '    [ "$attempts" -lt 200 ] || exit 125\n'
-        printf '    sleep 0.01\n'
-        printf '  done\n'
-        printf 'fi\n'
-        ;;
-    esac
+    emit_bash_barrier AGENT_LAB_AGG_BARRIER_DIR "$execution_id" \
+      "${lane_barrier_ids[@]}"
+    emit_bash_barrier AGENT_LAB_AGG_SPLIT_BARRIER_DIR "$execution_id" \
+      "${split_barrier_ids[@]}"
+    emit_bash_barrier AGENT_LAB_AGG_LOCAL_BARRIER_DIR "$execution_id" \
+      "${local_barrier_ids[@]}"
+    emit_bash_barrier AGENT_LAB_AGG_RESOLUTION_BARRIER_DIR "$execution_id" \
+      "${resolution_barrier_ids[@]}"
+    emit_bash_barrier AGENT_LAB_AGG_INSTALL_BARRIER_DIR "$execution_id" \
+      "${install_barrier_ids[@]}"
     printf 'if [ -n "${AGENT_LAB_AGG_HOLD_DIR:-}" ] &&\n'
     printf "   [ \"\${AGENT_LAB_AGG_HOLD_ID:-}\" = '%s' ]; then\n" "$execution_id"
     printf '  : > "$AGENT_LAB_AGG_HOLD_DIR/ready" || exit 125\n'
@@ -147,7 +256,7 @@ write_fixture() {
     printf '    sleep 0.01\n'
     printf '  done\n'
     printf 'fi\n'
-    if [ "$execution_id" = "local-image-catalog-cases.sh" ]; then
+    if [ "$execution_id" = "catalog-cases.sh" ]; then
       printf 'if [ -n "${AGENT_LAB_AGG_SIGNAL_DIR:-}" ]; then\n'
       printf '  sleep 30 &\n'
       printf '  descendant_pid=$!\n'
@@ -201,26 +310,21 @@ write_python_fixture() {
     printf "hold_id = os.environ.get('AGENT_LAB_AGG_HOLD_ID')\n"
     printf "if hold_dir and hold_id == '%s':\n" "$execution_id"
     printf "    Path(hold_dir, 'ready').touch()\n"
-    printf '    deadline = time.monotonic() + 5.0\n'
+    printf '    deadline = time.monotonic() + 15.0\n'
     printf "    while not Path(hold_dir, 'release').is_file():\n"
     printf '        if time.monotonic() >= deadline:\n'
     printf '            raise SystemExit(125)\n'
     printf '        time.sleep(0.01)\n'
-    if [ "$execution_id" = "install-state-cases.py" ]; then
-      printf 'barrier = os.environ.get("AGENT_LAB_AGG_BARRIER_DIR")\n'
-      printf 'if barrier:\n'
-      printf "    Path(barrier, '%s.ready').touch()\n" "$execution_id"
-      printf '    peers = (\n'
-      printf "        'local-install-cases.sh.ready',\n"
-      printf "        'local-image-catalog-cases.sh.ready',\n"
-      printf "        'install-state-cases.py.ready',\n"
-      printf '    )\n'
-      printf '    deadline = time.monotonic() + 2.0\n'
-      printf '    while not all(Path(barrier, peer).is_file() for peer in peers):\n'
-      printf '        if time.monotonic() >= deadline:\n'
-      printf '            raise SystemExit(125)\n'
-      printf '        time.sleep(0.01)\n'
-    fi
+    emit_python_barrier AGENT_LAB_AGG_BARRIER_DIR "$execution_id" \
+      "${lane_barrier_ids[@]}"
+    emit_python_barrier AGENT_LAB_AGG_SPLIT_BARRIER_DIR "$execution_id" \
+      "${split_barrier_ids[@]}"
+    emit_python_barrier AGENT_LAB_AGG_LOCAL_BARRIER_DIR "$execution_id" \
+      "${local_barrier_ids[@]}"
+    emit_python_barrier AGENT_LAB_AGG_RESOLUTION_BARRIER_DIR "$execution_id" \
+      "${resolution_barrier_ids[@]}"
+    emit_python_barrier AGENT_LAB_AGG_INSTALL_BARRIER_DIR "$execution_id" \
+      "${install_barrier_ids[@]}"
     for record in "$@"; do
       kind="${record%%:*}"
       id="${record#*:}"
@@ -237,6 +341,104 @@ write_python_fixture() {
   chmod +x "$path"
 }
 
+# The catalog-state fixture is entered through a selector and answers each one
+# with that slice's identities only. A route that runs the wrong slice, or that
+# runs the whole leaf and filters the output afterwards, therefore fails the
+# identity comparison instead of passing silently.
+write_catalog_state_fixture() {
+  local path="$1"
+  local rc="$2"
+  local slice_name id peer variable
+  {
+    printf '#!/usr/bin/env python3\n'
+    printf 'import os\n'
+    printf 'import sys\n'
+    printf 'import time\n'
+    printf 'from pathlib import Path\n'
+    printf 'slices = {}\n'
+    for slice_name in state name-bound durability; do
+      printf "slices['%s'] = [\n" "$slice_name"
+      case "$slice_name" in
+        state) for id in "${catalog_state_ids[@]}"; do
+          printf "    'PASS %s fixture assertion',\n" "$id"
+        done ;;
+        name-bound) for id in "${catalog_name_bound_ids[@]}"; do
+          printf "    'PASS %s fixture assertion',\n" "$id"
+        done ;;
+        durability) for id in "${catalog_durability_ids[@]}"; do
+          printf "    'PASS %s fixture assertion',\n" "$id"
+        done ;;
+      esac
+      printf ']\n'
+    done
+    printf "order = ('state', 'name-bound', 'durability')\n"
+    printf "selector = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+    printf 'if selector and selector not in slices:\n'
+    printf '    raise SystemExit(2)\n'
+    printf 'chosen = (selector,) if selector else order\n'
+    printf "execution = 'catalog-state-cases.py'\n"
+    printf 'if selector:\n'
+    printf "    execution = execution + ':' + selector\n"
+    printf "log = os.environ.get('AGENT_LAB_AGG_EXEC_LOG')\n"
+    printf 'if log:\n'
+    printf "    with open(log, 'a', encoding='ascii') as stream:\n"
+    printf "        stream.write(execution + '\\\\n')\n"
+    printf "hold_dir = os.environ.get('AGENT_LAB_AGG_HOLD_DIR')\n"
+    printf "if hold_dir and os.environ.get('AGENT_LAB_AGG_HOLD_ID') == execution:\n"
+    printf "    Path(hold_dir, 'ready').touch()\n"
+    printf '    deadline = time.monotonic() + 15.0\n'
+    printf "    while not Path(hold_dir, 'release').is_file():\n"
+    printf '        if time.monotonic() >= deadline:\n'
+    printf '            raise SystemExit(125)\n'
+    printf '        time.sleep(0.01)\n'
+    printf 'rendezvous = (\n'
+    for variable in AGENT_LAB_AGG_BARRIER_DIR AGENT_LAB_AGG_SPLIT_BARRIER_DIR; do
+      for id in "${catalog_slice_executions[@]}"; do
+        case "$variable" in
+          AGENT_LAB_AGG_BARRIER_DIR)
+            member_of "$id" "${lane_barrier_ids[@]}" || continue ;;
+          *)
+            member_of "$id" "${split_barrier_ids[@]}" || continue ;;
+        esac
+        printf "    ('%s', '%s', (\n" "$variable" "$id"
+        case "$variable" in
+          AGENT_LAB_AGG_BARRIER_DIR)
+            for peer in "${lane_barrier_ids[@]}"; do
+              printf "        '%s.ready',\n" "$peer"
+            done ;;
+          *)
+            for peer in "${split_barrier_ids[@]}"; do
+              printf "        '%s.ready',\n" "$peer"
+            done ;;
+        esac
+        printf '    )),\n'
+      done
+    done
+    printf ')\n'
+    printf 'for variable, member, peers in rendezvous:\n'
+    printf '    if member != execution:\n'
+    printf '        continue\n'
+    printf '    directory = os.environ.get(variable)\n'
+    printf '    if not directory:\n'
+    printf '        continue\n'
+    printf "    Path(directory, member + '.ready').touch()\n"
+    printf '    deadline = time.monotonic() + 5.0\n'
+    printf '    while not all(Path(directory, peer).is_file() for peer in peers):\n'
+    printf '        if time.monotonic() >= deadline:\n'
+    printf '            raise SystemExit(125)\n'
+    printf '        time.sleep(0.01)\n'
+    printf 'lines = [line for name in chosen for line in slices[name]]\n'
+    printf 'for line in lines:\n'
+    printf '    print(line)\n'
+    printf "print('SUMMARY assertions={0} expected={0} failures=0 infra=0'.format(len(lines)))\n"
+    printf "done_dir = os.environ.get('AGENT_LAB_AGG_DONE_DIR')\n"
+    printf 'if done_dir:\n'
+    printf "    Path(done_dir, execution + '.done').touch()\n"
+    printf 'raise SystemExit(%s)\n' "$rc"
+  } > "$path"
+  chmod +x "$path"
+}
+
 pass_records() {
   local id
   for id in "$@"; do
@@ -245,18 +447,27 @@ pass_records() {
 }
 
 reset_fixtures() {
-  local installer_records=() config_records=() catalog_records=()
+  local installer_records=() config_records=()
+  local catalog_base_records=()
+  local catalog_resolution_records=() catalog_mutation_records=()
   local install_records=() state_records=() integrity_records=() mutation_records=()
   mapfile -t installer_records < <(pass_records "${installer_ids[@]}")
   mapfile -t config_records < <(pass_records "${config_ids[@]}")
-  mapfile -t catalog_records < <(pass_records "${catalog_ids[@]}")
+  mapfile -t catalog_base_records < <(pass_records "${catalog_base_ids[@]}")
+  mapfile -t catalog_resolution_records < <(pass_records "${catalog_resolution_ids[@]}")
+  mapfile -t catalog_mutation_records < <(pass_records "${catalog_mutation_ids[@]}")
   mapfile -t install_records < <(pass_records "${install_ids[@]}")
   mapfile -t state_records < <(pass_records "${state_ids[@]}")
   mapfile -t integrity_records < <(pass_records "${integrity_ids[@]}")
   mapfile -t mutation_records < <(pass_records "${mutation_ids[@]}")
   write_fixture "$replica/tests/install/local-install-cases.sh" 0 "${installer_records[@]}"
   write_fixture "$replica/tests/experiment/local-config-cases.sh" 0 "${config_records[@]}"
-  write_fixture "$replica/tests/experiment/local-image-catalog-cases.sh" 0 "${catalog_records[@]}"
+  write_fixture "$replica/tests/image/catalog-cases.sh" 0 "${catalog_base_records[@]}"
+  write_catalog_state_fixture "$replica/tests/image/catalog-state-cases.py" 0
+  write_fixture "$replica/tests/experiment/catalog-resolution-cases.sh" 0 \
+    "${catalog_resolution_records[@]}"
+  write_python_fixture \
+    "$replica/tests/image/catalog-mutation-cases.py" 0 "${catalog_mutation_records[@]}"
   write_fixture "$replica/tests/experiment/install-store-cases.sh" 0 "${install_records[@]}"
   write_python_fixture "$replica/tests/experiment/install-state-cases.py" 0 "${state_records[@]}"
   write_python_fixture "$replica/tests/experiment/install-integrity-cases.py" 0 "${integrity_records[@]}"
@@ -326,7 +537,16 @@ infrastructure_output_valid() {
       "SUMMARY assertions=0 expected=$expected_assertions failures=0 infra=1" \
       "$output" || true)" -eq 1 ] &&
     ! grep -Fq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$output" &&
+    ! grep -Fq 'EXPERIMENT CATALOG STATE LIFECYCLE PASS' "$output" &&
+    ! grep -Fq 'EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS' "$output" &&
+    ! grep -Fq 'EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS' "$output" &&
+    ! grep -Fq 'EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS' "$output" &&
     ! grep -Fq 'EXPERIMENT INSTALL LIFECYCLE PASS' "$output"
+}
+
+# Observed identities of one route, in the order the route emitted them.
+observed_ids() {
+  awk '/^(PASS|FAIL) [A-Z0-9-]+ / {print $2}' "$1"
 }
 
 wait_for_path() {
@@ -378,7 +598,10 @@ mutant_executions="$work/mutant-executions"
 printf '%s\n' \
   local-install-cases.sh \
   local-config-cases.sh \
-  local-image-catalog-cases.sh \
+  catalog-cases.sh \
+  "${catalog_slice_executions[@]}" \
+  catalog-resolution-cases.sh \
+  catalog-mutation-cases.py \
   install-store-cases.sh \
   install-state-cases.py \
   install-integrity-cases.py \
@@ -406,7 +629,10 @@ printf '%s\n' \
   local-install-cases.sh \
   local-install-cases.sh \
   local-config-cases.sh \
-  local-image-catalog-cases.sh \
+  catalog-cases.sh \
+  "${catalog_slice_executions[@]}" \
+  catalog-resolution-cases.sh \
+  catalog-mutation-cases.py \
   install-store-cases.sh \
   install-state-cases.py \
   install-integrity-cases.py \
@@ -426,66 +652,188 @@ split_output_contract=0
 split_mutation_contract=0
 tail_mutation_contract=0
 wrapper_infrastructure_contract=0
-if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
+install_overlap_contract=0
+install_isolation_contract=0
+install_lane_mutation_contract=0
+split_identity_union_contract=0
+local_pole_isolation_contract=0
+local_lane_mutation_contract=0
+catalog_partition_contract=0
+catalog_selector_mutation_contract=0
+catalog_registration_contract=0
+if [ -f "$local_onboarding" ] && [ -f "$catalog_state_lifecycle" ] &&
+   [ -f "$catalog_name_bound_lifecycle" ] && [ -f "$catalog_durability_lifecycle" ] &&
+   [ -f "$catalog_resolution_lifecycle" ] && [ -f "$install_lifecycle" ]; then
   cp "$local_onboarding" "$replica_local_onboarding"
+  cp "$catalog_state_lifecycle" "$replica_catalog_state"
+  cp "$catalog_name_bound_lifecycle" "$replica_catalog_name_bound"
+  cp "$catalog_durability_lifecycle" "$replica_catalog_durability"
+  cp "$catalog_resolution_lifecycle" "$replica_catalog_resolution"
   cp "$install_lifecycle" "$replica_install_lifecycle"
-  chmod +x "$replica_local_onboarding" "$replica_install_lifecycle"
+  chmod +x "$replica_local_onboarding" "$replica_catalog_state" \
+    "$replica_catalog_name_bound" "$replica_catalog_durability" \
+    "$replica_catalog_resolution" "$replica_install_lifecycle"
 
   expected_local_ids="$work/expected-local-ids"
+  expected_catalog_state_ids="$work/expected-catalog-state-ids"
+  expected_catalog_name_bound_ids="$work/expected-catalog-name-bound-ids"
+  expected_catalog_durability_ids="$work/expected-catalog-durability-ids"
+  expected_catalog_resolution_ids="$work/expected-catalog-resolution-ids"
   expected_install_ids="$work/expected-install-ids"
   expected_local_executions="$work/expected-local-executions"
+  expected_catalog_state_executions="$work/expected-catalog-state-executions"
+  expected_catalog_name_bound_executions="$work/expected-catalog-name-bound-executions"
+  expected_catalog_durability_executions="$work/expected-catalog-durability-executions"
+  expected_catalog_resolution_executions="$work/expected-catalog-resolution-executions"
   expected_install_executions="$work/expected-install-executions"
-  printf '%s\n' "${expected_ids[@]:0:86}" > "$expected_local_ids"
+  printf '%s\n' "${expected_ids[@]:0:28}" > "$expected_local_ids"
+  printf '%s\n' "${expected_ids[@]:28:18}" > "$expected_catalog_state_ids"
+  printf '%s\n' "${expected_ids[@]:46:1}" > "$expected_catalog_name_bound_ids"
+  printf '%s\n' "${expected_ids[@]:47:15}" > "$expected_catalog_durability_ids"
+  printf '%s\n' "${expected_ids[@]:62:24}" > "$expected_catalog_resolution_ids"
   printf '%s\n' "${expected_ids[@]:86:47}" > "$expected_install_ids"
   printf '%s\n' \
     local-install-cases.sh \
     local-config-cases.sh \
-    local-image-catalog-cases.sh > "$expected_local_executions"
+    catalog-cases.sh > "$expected_local_executions"
+  printf '%s\n' "$catalog_state_execution" > "$expected_catalog_state_executions"
+  printf '%s\n' "$catalog_name_bound_execution" \
+    > "$expected_catalog_name_bound_executions"
+  printf '%s\n' "$catalog_durability_execution" \
+    > "$expected_catalog_durability_executions"
+  printf '%s\n' \
+    catalog-resolution-cases.sh \
+    catalog-mutation-cases.py > "$expected_catalog_resolution_executions"
   printf '%s\n' \
     install-store-cases.sh \
     install-state-cases.py \
     install-integrity-cases.py \
     install-mutation-cases.py > "$expected_install_executions"
 
+  # Every public route runs concurrently against one rendezvous: each route
+  # parks a participant until all six have started. A route set that cannot
+  # run in parallel never satisfies it, whatever the elapsed time is.
   reset_fixtures
   split_barrier="$work/split-barrier"
   local_executions="$work/local-executions"
+  catalog_state_executions="$work/catalog-state-executions"
+  catalog_name_bound_executions="$work/catalog-name-bound-executions"
+  catalog_durability_executions="$work/catalog-durability-executions"
+  catalog_resolution_executions="$work/catalog-resolution-executions"
   install_executions="$work/install-executions"
   mkdir "$split_barrier"
   : > "$local_executions"
+  : > "$catalog_state_executions"
+  : > "$catalog_name_bound_executions"
+  : > "$catalog_durability_executions"
+  : > "$catalog_resolution_executions"
   : > "$install_executions"
   local_route_rc=0
+  catalog_state_route_rc=0
+  catalog_name_bound_route_rc=0
+  catalog_durability_route_rc=0
+  catalog_resolution_route_rc=0
   install_route_rc=0
   env \
     AGENT_LAB_AGG_EXEC_LOG="$local_executions" \
-    AGENT_LAB_AGG_BARRIER_DIR="$split_barrier" \
+    AGENT_LAB_AGG_SPLIT_BARRIER_DIR="$split_barrier" \
     bash "$replica_local_onboarding" > "$work/local-route.out" 2>&1 &
   local_route_pid=$!
   env \
+    AGENT_LAB_AGG_EXEC_LOG="$catalog_state_executions" \
+    AGENT_LAB_AGG_SPLIT_BARRIER_DIR="$split_barrier" \
+    bash "$replica_catalog_state" > "$work/catalog-state-route.out" 2>&1 &
+  catalog_state_route_pid=$!
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$catalog_name_bound_executions" \
+    AGENT_LAB_AGG_SPLIT_BARRIER_DIR="$split_barrier" \
+    bash "$replica_catalog_name_bound" > "$work/catalog-name-bound-route.out" 2>&1 &
+  catalog_name_bound_route_pid=$!
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$catalog_durability_executions" \
+    AGENT_LAB_AGG_SPLIT_BARRIER_DIR="$split_barrier" \
+    bash "$replica_catalog_durability" > "$work/catalog-durability-route.out" 2>&1 &
+  catalog_durability_route_pid=$!
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$catalog_resolution_executions" \
+    AGENT_LAB_AGG_SPLIT_BARRIER_DIR="$split_barrier" \
+    bash "$replica_catalog_resolution" > "$work/catalog-resolution-route.out" 2>&1 &
+  catalog_resolution_route_pid=$!
+  env \
     AGENT_LAB_AGG_EXEC_LOG="$install_executions" \
-    AGENT_LAB_AGG_BARRIER_DIR="$split_barrier" \
+    AGENT_LAB_AGG_SPLIT_BARRIER_DIR="$split_barrier" \
     bash "$replica_install_lifecycle" > "$work/install-route.out" 2>&1 &
   install_route_pid=$!
   wait "$local_route_pid" || local_route_rc=$?
+  wait "$catalog_state_route_pid" || catalog_state_route_rc=$?
+  wait "$catalog_name_bound_route_pid" || catalog_name_bound_route_rc=$?
+  wait "$catalog_durability_route_pid" || catalog_durability_route_rc=$?
+  wait "$catalog_resolution_route_pid" || catalog_resolution_route_rc=$?
   wait "$install_route_pid" || install_route_rc=$?
 
   combined_executions="$work/combined-executions"
-  LC_ALL=C sort "$local_executions" "$install_executions" > "$combined_executions"
-  if [ "$local_route_rc" -eq 0 ] && [ "$install_route_rc" -eq 0 ] &&
+  LC_ALL=C sort "$local_executions" "$catalog_state_executions" \
+    "$catalog_name_bound_executions" "$catalog_durability_executions" \
+    "$catalog_resolution_executions" "$install_executions" > "$combined_executions"
+  if [ "$local_route_rc" -eq 0 ] && [ "$catalog_state_route_rc" -eq 0 ] &&
+     [ "$catalog_name_bound_route_rc" -eq 0 ] &&
+     [ "$catalog_durability_route_rc" -eq 0 ] &&
+     [ "$catalog_resolution_route_rc" -eq 0 ] && [ "$install_route_rc" -eq 0 ] &&
      cmp -s <(LC_ALL=C sort "$expected_local_executions") \
        <(LC_ALL=C sort "$local_executions") &&
+     cmp -s <(LC_ALL=C sort "$expected_catalog_state_executions") \
+       <(LC_ALL=C sort "$catalog_state_executions") &&
+     cmp -s <(LC_ALL=C sort "$expected_catalog_name_bound_executions") \
+       <(LC_ALL=C sort "$catalog_name_bound_executions") &&
+     cmp -s <(LC_ALL=C sort "$expected_catalog_durability_executions") \
+       <(LC_ALL=C sort "$catalog_durability_executions") &&
+     cmp -s <(LC_ALL=C sort "$expected_catalog_resolution_executions") \
+       <(LC_ALL=C sort "$catalog_resolution_executions") &&
      cmp -s <(LC_ALL=C sort "$expected_install_executions") \
        <(LC_ALL=C sort "$install_executions") &&
      cmp -s <(LC_ALL=C sort "$expected_executions") "$combined_executions"; then
     split_routing_contract=1
   fi
   if route_output_valid \
-       "$work/local-route.out" "$expected_local_ids" 86 \
+       "$work/local-route.out" "$expected_local_ids" 28 \
        'EXPERIMENT LOCAL LIFECYCLE PASS' "$local_route_rc" &&
+     route_output_valid \
+       "$work/catalog-state-route.out" "$expected_catalog_state_ids" 18 \
+       'EXPERIMENT CATALOG STATE LIFECYCLE PASS' "$catalog_state_route_rc" &&
+     route_output_valid \
+       "$work/catalog-name-bound-route.out" "$expected_catalog_name_bound_ids" 1 \
+       'EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS' "$catalog_name_bound_route_rc" &&
+     route_output_valid \
+       "$work/catalog-durability-route.out" "$expected_catalog_durability_ids" 15 \
+       'EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS' "$catalog_durability_route_rc" &&
+     route_output_valid \
+       "$work/catalog-resolution-route.out" "$expected_catalog_resolution_ids" 24 \
+       'EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS' "$catalog_resolution_route_rc" &&
      route_output_valid \
        "$work/install-route.out" "$expected_install_ids" 47 \
        'EXPERIMENT INSTALL LIFECYCLE PASS' "$install_route_rc"; then
     split_output_contract=1
+  fi
+
+  # The six public routes must partition the frozen 133 identities exactly. The
+  # union is taken from what the routes actually emitted, not from this file's
+  # expectations, so a route that swallows a neighbour's slice shows up as a
+  # duplicate rather than as a silent pass.
+  union_ids="$work/split-union-ids"
+  compatibility_ids="$work/compatibility-ids"
+  {
+    observed_ids "$work/local-route.out"
+    observed_ids "$work/catalog-state-route.out"
+    observed_ids "$work/catalog-name-bound-route.out"
+    observed_ids "$work/catalog-durability-route.out"
+    observed_ids "$work/catalog-resolution-route.out"
+    observed_ids "$work/install-route.out"
+  } > "$union_ids"
+  printf '%s\n' "${expected_ids[@]}" > "$compatibility_ids"
+  if cmp -s "$compatibility_ids" "$union_ids" &&
+     [ "$(wc -l < "$union_ids")" -eq 133 ] &&
+     [ "$(LC_ALL=C sort -u "$union_ids" | wc -l)" -eq 133 ]; then
+    split_identity_union_contract=1
   fi
 
   mutant_install_route="$replica/tests/experiment/install-lifecycle-wrong-route.sh"
@@ -566,21 +914,581 @@ if [ -f "$local_onboarding" ] && [ -f "$install_lifecycle" ]; then
   saved_lifecycle="$work/local-lifecycle-core.saved"
   mv "$replica_lifecycle" "$saved_lifecycle"
   missing_local_core_rc=0
+  missing_catalog_state_core_rc=0
+  missing_catalog_name_bound_core_rc=0
+  missing_catalog_durability_core_rc=0
+  missing_catalog_resolution_core_rc=0
   missing_install_core_rc=0
   bash "$replica_local_onboarding" > "$work/missing-local-core.out" 2>&1 || \
     missing_local_core_rc=$?
+  bash "$replica_catalog_state" > "$work/missing-catalog-state-core.out" 2>&1 || \
+    missing_catalog_state_core_rc=$?
+  bash "$replica_catalog_name_bound" \
+    > "$work/missing-catalog-name-bound-core.out" 2>&1 || \
+    missing_catalog_name_bound_core_rc=$?
+  bash "$replica_catalog_durability" \
+    > "$work/missing-catalog-durability-core.out" 2>&1 || \
+    missing_catalog_durability_core_rc=$?
+  bash "$replica_catalog_resolution" \
+    > "$work/missing-catalog-resolution-core.out" 2>&1 || \
+    missing_catalog_resolution_core_rc=$?
   bash "$replica_install_lifecycle" > "$work/missing-install-core.out" 2>&1 || \
     missing_install_core_rc=$?
   mv "$saved_lifecycle" "$replica_lifecycle"
   if infrastructure_output_valid \
-       "$work/missing-local-core.out" 86 "$missing_local_core_rc" &&
+       "$work/missing-local-core.out" 28 "$missing_local_core_rc" &&
      grep -Fxq 'INFRA shared lifecycle core unavailable' \
        "$work/missing-local-core.out" &&
+     infrastructure_output_valid \
+       "$work/missing-catalog-state-core.out" 18 "$missing_catalog_state_core_rc" &&
+     grep -Fxq 'INFRA shared lifecycle core unavailable' \
+       "$work/missing-catalog-state-core.out" &&
+     infrastructure_output_valid \
+       "$work/missing-catalog-name-bound-core.out" 1 \
+       "$missing_catalog_name_bound_core_rc" &&
+     grep -Fxq 'INFRA shared lifecycle core unavailable' \
+       "$work/missing-catalog-name-bound-core.out" &&
+     infrastructure_output_valid \
+       "$work/missing-catalog-durability-core.out" 15 \
+       "$missing_catalog_durability_core_rc" &&
+     grep -Fxq 'INFRA shared lifecycle core unavailable' \
+       "$work/missing-catalog-durability-core.out" &&
+     infrastructure_output_valid \
+       "$work/missing-catalog-resolution-core.out" 24 \
+       "$missing_catalog_resolution_core_rc" &&
+     grep -Fxq 'INFRA shared lifecycle core unavailable' \
+       "$work/missing-catalog-resolution-core.out" &&
      infrastructure_output_valid \
        "$work/missing-install-core.out" 47 "$missing_install_core_rc" &&
      grep -Fxq 'INFRA shared lifecycle core unavailable' \
        "$work/missing-install-core.out"; then
     wrapper_infrastructure_contract=1
+  fi
+
+  # The install route must run its long-pole subcase concurrently with the
+  # batched short subcases. A rendezvous between the two lanes is the oracle:
+  # a serialized route can never satisfy it, whatever the elapsed time is.
+  reset_fixtures
+  install_barrier="$work/install-barrier"
+  install_overlap_executions="$work/install-overlap-executions"
+  mkdir "$install_barrier"
+  : > "$install_overlap_executions"
+  install_overlap_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$install_overlap_executions" \
+    AGENT_LAB_AGG_INSTALL_BARRIER_DIR="$install_barrier" \
+    bash "$replica_install_lifecycle" > "$work/install-overlap.out" 2>&1 || \
+    install_overlap_rc=$?
+  if route_output_valid \
+       "$work/install-overlap.out" "$expected_install_ids" 47 \
+       'EXPERIMENT INSTALL LIFECYCLE PASS' "$install_overlap_rc" &&
+     [ -f "$install_barrier/install-store-cases.sh.ready" ] &&
+     [ -f "$install_barrier/install-state-cases.py.ready" ] &&
+     cmp -s <(LC_ALL=C sort "$expected_install_executions") \
+       <(LC_ALL=C sort "$install_overlap_executions"); then
+    install_overlap_contract=1
+  fi
+
+  # Holding the long-pole subcase must not hold any other install subcase:
+  # every batched subcase completes while the held lane is still parked.
+  reset_fixtures
+  isolation_hold="$work/install-isolation-hold"
+  isolation_done="$work/install-isolation-done"
+  isolation_executions="$work/install-isolation-executions"
+  mkdir "$isolation_hold" "$isolation_done"
+  : > "$isolation_executions"
+  isolation_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$isolation_executions" \
+    AGENT_LAB_AGG_HOLD_DIR="$isolation_hold" \
+    AGENT_LAB_AGG_HOLD_ID=install-state-cases.py \
+    AGENT_LAB_AGG_DONE_DIR="$isolation_done" \
+    bash "$replica_install_lifecycle" > "$work/install-isolation.out" 2>&1 &
+  isolation_pid=$!
+  isolation_case=0
+  if wait_for_path "$isolation_hold/ready" &&
+     wait_for_path "$isolation_done/install-store-cases.sh.done" &&
+     wait_for_path "$isolation_done/install-integrity-cases.py.done" &&
+     wait_for_path "$isolation_done/install-mutation-cases.py.done" &&
+     wait_for_child_wait "$isolation_pid" 1; then
+    isolation_case=1
+  fi
+  : > "$isolation_hold/release"
+  wait "$isolation_pid" || isolation_rc=$?
+  if [ "$isolation_case" -eq 1 ] && [ "$isolation_rc" -eq 0 ] &&
+     wait_for_path "$isolation_done/install-state-cases.py.done" &&
+     route_output_valid \
+       "$work/install-isolation.out" "$expected_install_ids" 47 \
+       'EXPERIMENT INSTALL LIFECYCLE PASS' "$isolation_rc" &&
+     cmp -s <(LC_ALL=C sort "$expected_install_executions") \
+       <(LC_ALL=C sort "$isolation_executions"); then
+    install_isolation_contract=1
+  fi
+
+  # The superseded single-lane routing, a routing that re-serializes the long
+  # pole behind a batched subcase, and a routing that drops a subcase are all
+  # intended REDs.
+  serial_core="$replica/tests/experiment/local-lifecycle-serial-install.sh"
+  serial_write_rc=0
+  awk '
+    $0 == "  install)" { in_install = 1 }
+    in_install && $0 == "    lane_count=2" { print "    lane_count=1"; changes++; next }
+    in_install && $0 == "    lane_map=(0 1 0 0)" {
+      print "    lane_map=(0 0 0 0)"
+      changes++
+      in_install = 0
+      next
+    }
+    { print }
+    END { if (changes != 2) exit 1 }
+  ' "$replica_lifecycle" > "$serial_core" || serial_write_rc=$?
+  chmod +x "$serial_core"
+
+  shared_core="$replica/tests/experiment/local-lifecycle-shared-install.sh"
+  shared_write_rc=0
+  awk '
+    $0 == "  install)" { in_install = 1 }
+    in_install && $0 == "    lane_map=(0 1 0 0)" {
+      print "    lane_map=(0 0 0 1)"
+      changes++
+      in_install = 0
+      next
+    }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$shared_core" || shared_write_rc=$?
+  chmod +x "$shared_core"
+
+  dropped_core="$replica/tests/experiment/local-lifecycle-dropped-install.sh"
+  dropped_write_rc=0
+  awk '
+    $0 == "  install)" { in_install = 1 }
+    in_install && $0 == "    selected_count=4" {
+      print "    selected_count=3"
+      changes++
+      in_install = 0
+      next
+    }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$dropped_core" || dropped_write_rc=$?
+  chmod +x "$dropped_core"
+
+  serial_barrier="$work/install-serial-barrier"
+  shared_barrier="$work/install-shared-barrier"
+  mkdir "$serial_barrier" "$shared_barrier"
+  reset_fixtures
+  serial_rc=0
+  env AGENT_LAB_AGG_INSTALL_BARRIER_DIR="$serial_barrier" \
+    bash "$serial_core" install > "$work/install-serial.out" 2>&1 || serial_rc=$?
+  shared_rc=0
+  env AGENT_LAB_AGG_INSTALL_BARRIER_DIR="$shared_barrier" \
+    bash "$shared_core" install > "$work/install-shared.out" 2>&1 || shared_rc=$?
+  dropped_executions="$work/install-dropped-executions"
+  : > "$dropped_executions"
+  dropped_rc=0
+  env AGENT_LAB_AGG_EXEC_LOG="$dropped_executions" \
+    bash "$dropped_core" install > "$work/install-dropped.out" 2>&1 || dropped_rc=$?
+  if [ "$serial_write_rc" -eq 0 ] && [ "$shared_write_rc" -eq 0 ] &&
+     [ "$dropped_write_rc" -eq 0 ] &&
+     [ "$serial_rc" -ne 0 ] && [ "$shared_rc" -ne 0 ] &&
+     ! grep -Fq 'EXPERIMENT INSTALL LIFECYCLE PASS' "$work/install-serial.out" &&
+     ! grep -Fq 'EXPERIMENT INSTALL LIFECYCLE PASS' "$work/install-shared.out" &&
+     infrastructure_output_valid "$work/install-dropped.out" 47 "$dropped_rc" &&
+     [ ! -s "$dropped_executions" ]; then
+    install_lane_mutation_contract=1
+  fi
+
+  # The corrected local partition: the local route overlaps its two lanes and
+  # the catalog-resolution route overlaps its two lanes.
+  reset_fixtures
+  local_lane_barrier="$work/local-lane-barrier"
+  resolution_lane_barrier="$work/resolution-lane-barrier"
+  local_lane_executions="$work/local-lane-executions"
+  resolution_lane_executions="$work/resolution-lane-executions"
+  mkdir "$local_lane_barrier" "$resolution_lane_barrier"
+  : > "$local_lane_executions"
+  : > "$resolution_lane_executions"
+  local_lane_rc=0
+  resolution_lane_rc=0
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$local_lane_executions" \
+    AGENT_LAB_AGG_LOCAL_BARRIER_DIR="$local_lane_barrier" \
+    bash "$replica_local_onboarding" > "$work/local-lane.out" 2>&1 || local_lane_rc=$?
+  env \
+    AGENT_LAB_AGG_EXEC_LOG="$resolution_lane_executions" \
+    AGENT_LAB_AGG_RESOLUTION_BARRIER_DIR="$resolution_lane_barrier" \
+    bash "$replica_catalog_resolution" > "$work/resolution-lane.out" 2>&1 || \
+    resolution_lane_rc=$?
+  if route_output_valid \
+       "$work/local-lane.out" "$expected_local_ids" 28 \
+       'EXPERIMENT LOCAL LIFECYCLE PASS' "$local_lane_rc" &&
+     [ -f "$local_lane_barrier/local-install-cases.sh.ready" ] &&
+     [ -f "$local_lane_barrier/catalog-cases.sh.ready" ] &&
+     cmp -s <(LC_ALL=C sort "$expected_local_executions") \
+       <(LC_ALL=C sort "$local_lane_executions") &&
+     route_output_valid \
+       "$work/resolution-lane.out" "$expected_catalog_resolution_ids" 24 \
+       'EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS' "$resolution_lane_rc" &&
+     [ -f "$resolution_lane_barrier/catalog-resolution-cases.sh.ready" ] &&
+     [ -f "$resolution_lane_barrier/catalog-mutation-cases.py.ready" ] &&
+     cmp -s <(LC_ALL=C sort "$expected_catalog_resolution_executions") \
+       <(LC_ALL=C sort "$resolution_lane_executions"); then
+    local_pole_isolation_contract=1
+  fi
+
+  # The corrected catalog partition. Each catalog route is entered on its own and
+  # must execute exactly one slice of the shared leaf: the selector it was given
+  # and no other. The name-bound route carries the indivisible pole alone.
+  reset_fixtures
+  catalog_slice_contract=1
+  catalog_slice_wrappers=(
+    "$replica_catalog_state"
+    "$replica_catalog_name_bound"
+    "$replica_catalog_durability"
+  )
+  catalog_slice_expected_ids=(
+    "$expected_catalog_state_ids"
+    "$expected_catalog_name_bound_ids"
+    "$expected_catalog_durability_ids"
+  )
+  catalog_slice_expected_executions=(
+    "$expected_catalog_state_executions"
+    "$expected_catalog_name_bound_executions"
+    "$expected_catalog_durability_executions"
+  )
+  catalog_slice_counts=(18 1 15)
+  catalog_slice_markers=(
+    'EXPERIMENT CATALOG STATE LIFECYCLE PASS'
+    'EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS'
+    'EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS'
+  )
+  for slice_index in "${!catalog_slice_wrappers[@]}"; do
+    slice_executions="$work/catalog-slice-executions-$slice_index"
+    slice_output="$work/catalog-slice-$slice_index.out"
+    : > "$slice_executions"
+    slice_rc=0
+    env AGENT_LAB_AGG_EXEC_LOG="$slice_executions" \
+      bash "${catalog_slice_wrappers[$slice_index]}" > "$slice_output" 2>&1 || \
+      slice_rc=$?
+    if ! route_output_valid \
+         "$slice_output" "${catalog_slice_expected_ids[$slice_index]}" \
+         "${catalog_slice_counts[$slice_index]}" \
+         "${catalog_slice_markers[$slice_index]}" "$slice_rc" ||
+       ! cmp -s "${catalog_slice_expected_executions[$slice_index]}" \
+         "$slice_executions"; then
+      catalog_slice_contract=0
+    fi
+  done
+  catalog_slice_union="$work/catalog-slice-union"
+  cat "$work/catalog-slice-0.out" "$work/catalog-slice-1.out" \
+    "$work/catalog-slice-2.out" > "$work/catalog-slice-combined.out"
+  observed_ids "$work/catalog-slice-combined.out" > "$catalog_slice_union"
+  catalog_leaf_ids="$work/catalog-leaf-ids"
+  printf '%s\n' "${expected_ids[@]:28:34}" > "$catalog_leaf_ids"
+  if [ "$catalog_slice_contract" -eq 1 ] &&
+     cmp -s "$catalog_leaf_ids" "$catalog_slice_union" &&
+     [ "$(LC_ALL=C sort -u "$catalog_slice_union" | wc -l)" -eq 34 ]; then
+    catalog_partition_contract=1
+  fi
+
+  # The superseded local routing that swallowed the pole, a dropped public
+  # route, routings that re-serialize either corrected local route, and a route
+  # slice that overlaps its neighbour are all intended REDs.
+  predecessor_core="$replica/tests/experiment/local-lifecycle-predecessor-local.sh"
+  predecessor_write_rc=0
+  awk '
+    $0 == "  local)" { in_local = 1 }
+    in_local && $0 == "    selected_count=3" { print "    selected_count=6"; changes++; next }
+    in_local && $0 == "    expected_count=28" { print "    expected_count=86"; changes++; next }
+    in_local && $0 == "    lane_map=(0 0 1)" {
+      print "    lane_map=(0 0 1 1 1 1)"
+      changes++
+      in_local = 0
+      next
+    }
+    { print }
+    END { if (changes != 3) exit 1 }
+  ' "$replica_lifecycle" > "$predecessor_core" || predecessor_write_rc=$?
+  chmod +x "$predecessor_core"
+
+  dropped_route_core="$replica/tests/experiment/local-lifecycle-dropped-route.sh"
+  dropped_route_write_rc=0
+  awk '
+    $0 == "  catalog-state)" { dropping = 1; changes++ }
+    dropping && $0 == "    ;;" { dropping = 0; next }
+    dropping { next }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$dropped_route_core" || dropped_route_write_rc=$?
+  chmod +x "$dropped_route_core"
+
+  serial_local_core="$replica/tests/experiment/local-lifecycle-serial-local.sh"
+  serial_local_write_rc=0
+  awk '
+    $0 == "  local)" { in_local = 1 }
+    in_local && $0 == "    lane_count=2" { print "    lane_count=1"; changes++; next }
+    in_local && $0 == "    lane_map=(0 0 1)" {
+      print "    lane_map=(0 0 0)"
+      changes++
+      in_local = 0
+      next
+    }
+    { print }
+    END { if (changes != 2) exit 1 }
+  ' "$replica_lifecycle" > "$serial_local_core" || serial_local_write_rc=$?
+  chmod +x "$serial_local_core"
+
+  serial_resolution_core="$replica/tests/experiment/local-lifecycle-serial-resolution.sh"
+  serial_resolution_write_rc=0
+  awk '
+    $0 == "  catalog-resolution)" { in_resolution = 1 }
+    in_resolution && $0 == "    lane_count=2" { print "    lane_count=1"; changes++; next }
+    in_resolution && $0 == "    lane_map=(0 1)" {
+      print "    lane_map=(0 0)"
+      changes++
+      in_resolution = 0
+      next
+    }
+    { print }
+    END { if (changes != 2) exit 1 }
+  ' "$replica_lifecycle" > "$serial_resolution_core" || serial_resolution_write_rc=$?
+  chmod +x "$serial_resolution_core"
+
+  overlap_slice_core="$replica/tests/experiment/local-lifecycle-overlap-slice.sh"
+  overlap_slice_write_rc=0
+  awk '
+    $0 == "  catalog-resolution)" { in_resolution = 1 }
+    in_resolution && $0 == "    expected_start=63" {
+      print "    expected_start=62"
+      changes++
+      in_resolution = 0
+      next
+    }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$overlap_slice_core" || overlap_slice_write_rc=$?
+  chmod +x "$overlap_slice_core"
+
+  # The superseded catalog routing: one catalog-state route owning the whole
+  # thirty-four-identity leaf while the two corrected routes still claim their
+  # slices. Every route still emits a well-formed summary, so only the union of
+  # what the routes actually ran can reject it.
+  catalog_predecessor_core="$replica/tests/experiment/local-lifecycle-predecessor-catalog.sh"
+  catalog_predecessor_write_rc=0
+  awk '
+    $0 == "  catalog-state)" { in_state = 1 }
+    in_state && $0 == "    selected_count=1" {
+      print "    selected_count=3"
+      changes++
+      next
+    }
+    in_state && $0 == "    expected_count=18" {
+      print "    expected_count=34"
+      changes++
+      next
+    }
+    in_state && $0 == "    lane_map=(0)" {
+      print "    lane_map=(0 0 0)"
+      changes++
+      in_state = 0
+      next
+    }
+    { print }
+    END { if (changes != 3) exit 1 }
+  ' "$replica_lifecycle" > "$catalog_predecessor_core" || \
+    catalog_predecessor_write_rc=$?
+  chmod +x "$catalog_predecessor_core"
+
+  dropped_catalog_route_core="$replica/tests/experiment/local-lifecycle-dropped-catalog.sh"
+  dropped_catalog_route_write_rc=0
+  awk '
+    $0 == "  catalog-name-bound)" { dropping = 1; changes++ }
+    dropping && $0 == "    ;;" { dropping = 0; next }
+    dropping { next }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$dropped_catalog_route_core" || \
+    dropped_catalog_route_write_rc=$?
+  chmod +x "$dropped_catalog_route_core"
+
+  # An ineffective selector: the durability route keeps its identity window but
+  # hands the leaf the neighbouring slice's selector.
+  wrong_selector_core="$replica/tests/experiment/local-lifecycle-wrong-selector.sh"
+  wrong_selector_write_rc=0
+  awk '
+    $0 == "  durability" { print "  state"; changes++; next }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$wrong_selector_core" || wrong_selector_write_rc=$?
+  chmod +x "$wrong_selector_core"
+
+  # A dropped slice registration inside the shared core: one selector entry is
+  # deleted, so the selector table no longer covers the leaf list.
+  dropped_selector_core="$replica/tests/experiment/local-lifecycle-dropped-selector.sh"
+  dropped_selector_write_rc=0
+  awk '
+    $0 == "  name-bound" { changes++; next }
+    { print }
+    END { if (changes != 1) exit 1 }
+  ' "$replica_lifecycle" > "$dropped_selector_core" || dropped_selector_write_rc=$?
+  chmod +x "$dropped_selector_core"
+
+  reset_fixtures
+  predecessor_executions="$work/predecessor-executions"
+  : > "$predecessor_executions"
+  predecessor_rc=0
+  env AGENT_LAB_AGG_EXEC_LOG="$predecessor_executions" \
+    bash "$predecessor_core" local > "$work/predecessor-local.out" 2>&1 || \
+    predecessor_rc=$?
+  dropped_route_rc=0
+  bash "$dropped_route_core" catalog-state > "$work/dropped-route.out" 2>&1 || \
+    dropped_route_rc=$?
+  serial_local_barrier="$work/serial-local-barrier"
+  serial_resolution_barrier="$work/serial-resolution-barrier"
+  mkdir "$serial_local_barrier" "$serial_resolution_barrier"
+  serial_local_rc=0
+  env AGENT_LAB_AGG_LOCAL_BARRIER_DIR="$serial_local_barrier" \
+    bash "$serial_local_core" local > "$work/serial-local.out" 2>&1 || serial_local_rc=$?
+  serial_resolution_rc=0
+  env AGENT_LAB_AGG_RESOLUTION_BARRIER_DIR="$serial_resolution_barrier" \
+    bash "$serial_resolution_core" catalog-resolution \
+    > "$work/serial-resolution.out" 2>&1 || serial_resolution_rc=$?
+  overlap_slice_rc=0
+  bash "$overlap_slice_core" catalog-resolution > "$work/overlap-slice.out" 2>&1 || \
+    overlap_slice_rc=$?
+  if [ "$predecessor_write_rc" -eq 0 ] && [ "$dropped_route_write_rc" -eq 0 ] &&
+     [ "$serial_local_write_rc" -eq 0 ] && [ "$serial_resolution_write_rc" -eq 0 ] &&
+     [ "$overlap_slice_write_rc" -eq 0 ] &&
+     ! route_output_valid \
+       "$work/predecessor-local.out" "$expected_local_ids" 28 \
+       'EXPERIMENT LOCAL LIFECYCLE PASS' "$predecessor_rc" &&
+     ! cmp -s <(LC_ALL=C sort "$expected_local_executions") \
+       <(LC_ALL=C sort "$predecessor_executions") &&
+     [ "$dropped_route_rc" -eq 2 ] &&
+     ! grep -Fq 'EXPERIMENT CATALOG STATE LIFECYCLE PASS' "$work/dropped-route.out" &&
+     [ "$serial_local_rc" -ne 0 ] && [ "$serial_resolution_rc" -ne 0 ] &&
+     ! grep -Fq 'EXPERIMENT LOCAL LIFECYCLE PASS' "$work/serial-local.out" &&
+     ! grep -Fq 'EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS' \
+       "$work/serial-resolution.out" &&
+     [ "$overlap_slice_rc" -ne 0 ] &&
+     ! grep -Fq 'EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS' \
+       "$work/overlap-slice.out"; then
+    local_lane_mutation_contract=1
+  fi
+
+  reset_fixtures
+  catalog_predecessor_union="$work/catalog-predecessor-union"
+  : > "$catalog_predecessor_union"
+  for mutant_route in local catalog-state catalog-name-bound catalog-durability \
+    catalog-resolution install; do
+    bash "$catalog_predecessor_core" "$mutant_route" \
+      > "$work/catalog-predecessor-$mutant_route.out" 2>&1 || true
+    observed_ids "$work/catalog-predecessor-$mutant_route.out" \
+      >> "$catalog_predecessor_union"
+  done
+
+  dropped_catalog_route_rc=0
+  bash "$dropped_catalog_route_core" catalog-name-bound \
+    > "$work/dropped-catalog-route.out" 2>&1 || dropped_catalog_route_rc=$?
+
+  wrong_selector_executions="$work/wrong-selector-executions"
+  : > "$wrong_selector_executions"
+  wrong_selector_rc=0
+  env AGENT_LAB_AGG_EXEC_LOG="$wrong_selector_executions" \
+    bash "$wrong_selector_core" catalog-durability \
+    > "$work/wrong-selector.out" 2>&1 || wrong_selector_rc=$?
+
+  dropped_selector_executions="$work/dropped-selector-executions"
+  : > "$dropped_selector_executions"
+  dropped_selector_rc=0
+  env AGENT_LAB_AGG_EXEC_LOG="$dropped_selector_executions" \
+    bash "$dropped_selector_core" catalog-durability \
+    > "$work/dropped-selector.out" 2>&1 || dropped_selector_rc=$?
+
+  if [ "$catalog_predecessor_write_rc" -eq 0 ] &&
+     [ "$dropped_catalog_route_write_rc" -eq 0 ] &&
+     [ "$wrong_selector_write_rc" -eq 0 ] &&
+     [ "$dropped_selector_write_rc" -eq 0 ] &&
+     ! cmp -s "$compatibility_ids" "$catalog_predecessor_union" &&
+     [ "$(LC_ALL=C sort -u "$catalog_predecessor_union" | wc -l)" -ne \
+       "$(wc -l < "$catalog_predecessor_union")" ] &&
+     [ "$dropped_catalog_route_rc" -eq 2 ] &&
+     ! grep -Fq 'EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS' \
+       "$work/dropped-catalog-route.out" &&
+     [ "$wrong_selector_rc" -ne 0 ] &&
+     ! grep -Fq 'EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS' \
+       "$work/wrong-selector.out" &&
+     cmp -s "$expected_catalog_state_executions" "$wrong_selector_executions" &&
+     infrastructure_output_valid \
+       "$work/dropped-selector.out" 15 "$dropped_selector_rc" &&
+     [ ! -s "$dropped_selector_executions" ]; then
+    catalog_selector_mutation_contract=1
+  fi
+
+  # Truthful registration: every catalog route is its own required Fast suite,
+  # registered against its own wrapper and against the marker that route really
+  # prints. A dropped registration, a borrowed marker, or a wrapper that chains a
+  # second route behind its own are all RED.
+  registered_catalog_suites=(
+    "experiment-catalog-state-lifecycle tests/experiment/catalog-state-lifecycle-cases.sh EXPERIMENT CATALOG STATE LIFECYCLE PASS"
+    "experiment-catalog-name-bound-lifecycle tests/experiment/catalog-name-bound-lifecycle-cases.sh EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS"
+    "experiment-catalog-durability-lifecycle tests/experiment/catalog-durability-lifecycle-cases.sh EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS"
+  )
+  registered_catalog_wrappers=(
+    "$replica_catalog_state"
+    "$replica_catalog_name_bound"
+    "$replica_catalog_durability"
+  )
+  registered_catalog_routes=(catalog-state catalog-name-bound catalog-durability)
+
+  registration_is_split() {
+    local manifest="$1"
+    local index entry wrapper route marker
+    for index in "${!registered_catalog_suites[@]}"; do
+      entry="${registered_catalog_suites[$index]}"
+      wrapper="${registered_catalog_wrappers[$index]}"
+      route="${registered_catalog_routes[$index]}"
+      marker="${catalog_slice_markers[$index]}"
+      [ "$(grep -Fxc "suite $entry" "$manifest")" -eq 1 ] || return 1
+      [ "$(grep -Fc "$marker" "$manifest")" -eq 1 ] || return 1
+      [ "$(grep -Fxc \
+        "exec bash \"\$script_dir/local-lifecycle-cases.sh\" $route" \
+        "$wrapper")" -eq 1 ] || return 1
+      [ "$(grep -Ec '^exec bash ' "$wrapper")" -eq 1 ] || return 1
+      [ "$(grep -Fxc "    final_marker='$marker'" "$replica_lifecycle")" -eq 1 ] ||
+        return 1
+    done
+    return 0
+  }
+
+  if [ -f "$fast_manifest" ] && registration_is_split "$fast_manifest"; then
+    dropped_registration="$work/dropped-registration.manifest"
+    grep -Fxv \
+      "suite ${registered_catalog_suites[1]}" "$fast_manifest" \
+      > "$dropped_registration" || true
+    borrowed_marker="$work/borrowed-marker.manifest"
+    awk -v old="suite ${registered_catalog_suites[2]}" \
+      -v new="suite experiment-catalog-durability-lifecycle tests/experiment/catalog-durability-lifecycle-cases.sh EXPERIMENT CATALOG STATE LIFECYCLE PASS" \
+      '$0 == old { print new; next } { print }' "$fast_manifest" \
+      > "$borrowed_marker"
+    serialized_wrapper="$work/serialized-durability-wrapper.sh"
+    cp "$replica_catalog_durability" "$serialized_wrapper"
+    printf '%s\n' \
+      'exec bash "$script_dir/local-lifecycle-cases.sh" catalog-state' \
+      >> "$serialized_wrapper"
+    saved_durability_wrapper="$work/durability-wrapper.saved"
+    cp "$replica_catalog_durability" "$saved_durability_wrapper"
+    cp "$serialized_wrapper" "$replica_catalog_durability"
+    serialized_registration_rejected=0
+    registration_is_split "$fast_manifest" || serialized_registration_rejected=1
+    cp "$saved_durability_wrapper" "$replica_catalog_durability"
+    if ! registration_is_split "$dropped_registration" &&
+       ! registration_is_split "$borrowed_marker" &&
+       [ "$serialized_registration_rejected" -eq 1 ] &&
+       registration_is_split "$fast_manifest"; then
+      catalog_registration_contract=1
+    fi
   fi
 fi
 
@@ -594,8 +1502,8 @@ if [ "$baseline_rc" -eq 0 ] &&
    [ "$overlap_rc" -eq 0 ] &&
    cmp -s <(LC_ALL=C sort "$expected_executions") <(LC_ALL=C sort "$overlap_executions") &&
    [ -f "$overlap_barrier/local-install-cases.sh.ready" ] &&
-   [ -f "$overlap_barrier/local-image-catalog-cases.sh.ready" ] &&
-   [ -f "$overlap_barrier/install-state-cases.py.ready" ] &&
+   [ -f "$overlap_barrier/$catalog_state_execution.ready" ] &&
+   [ -f "$overlap_barrier/catalog-resolution-cases.sh.ready" ] &&
    [ "$split_routing_contract" -eq 1 ] &&
    [ "$split_mutation_contract" -eq 1 ] &&
    [ "$tail_mutation_contract" -eq 1 ]; then
@@ -613,7 +1521,8 @@ if [ "$success_rc" -eq 0 ] &&
    [ "$(grep -Fxc 'SUMMARY assertions=133 expected=133 failures=0 infra=0' "$success_output")" -eq 1 ] &&
    [ "$(tail -n 1 "$success_output")" = 'EXPERIMENT LOCAL LIFECYCLE PASS' ] &&
    awk '/^(PASS|FAIL) [A-Z0-9-]+ / {next} /^SUMMARY assertions=133 expected=133 failures=0 infra=0$/ {next} /^EXPERIMENT LOCAL LIFECYCLE PASS$/ {next} {bad=1} END {exit bad}' "$success_output" &&
-   [ "$split_output_contract" -eq 1 ]; then
+   [ "$split_output_contract" -eq 1 ] &&
+   [ "$split_identity_union_contract" -eq 1 ]; then
   pass AGG-002 "compatibility and split routes emit exact summaries and markers"
 else
   fail AGG-002 "compatibility and split routes emit exact summaries and markers"
@@ -741,50 +1650,76 @@ fi
 
 lane_assignment_count="$(grep -Ec '^[[:space:]]+lane_count=[0-9]+$' \
   "$replica_lifecycle" || true)"
-if [ "$lane_assignment_count" -eq 3 ] &&
+if [ "$lane_assignment_count" -eq 7 ] &&
    [ "$(grep -Fxc '    lane_count=3' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_count=2' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_count=1' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_map=(0 1 2 0 1 2 0)' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_count=2' "$replica_lifecycle")" -eq 3 ] &&
+   [ "$(grep -Fxc '    lane_count=1' "$replica_lifecycle")" -eq 3 ] &&
+   [ "$(grep -Fxc '    lane_map=(1 1 1 0 0 0 2 2 2 1 2 2)' \
+     "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc '    lane_map=(0 0 1)' "$replica_lifecycle")" -eq 1 ] &&
-   [ "$(grep -Fxc '    lane_map=(0 0 0 0)' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_map=(0)' "$replica_lifecycle")" -eq 3 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 1)' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 1 0 0)' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 0 0)' "$replica_lifecycle")" -eq 0 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 0)' "$replica_lifecycle")" -eq 0 ] &&
+   [ "$(grep -Fxc '    lane_map=(0 0 0 0)' "$replica_lifecycle")" -eq 0 ] &&
    [ "$(grep -Fxc 'readonly lane_count' "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc 'readonly lane_map' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc 'readonly all_subcase_selectors' "$replica_lifecycle")" -eq 1 ] &&
+   [ "$(grep -Fxc 'readonly subcase_selectors' "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc 'for ((lane = 0; lane < lane_count; lane++)); do' \
      "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc '    [ "${lane_map[$index]}" -eq "$lane" ] || continue' \
      "$replica_lifecycle")" -eq 1 ] &&
    [ "$(grep -Fxc '  run_lane "$lane" &' "$replica_lifecycle")" -eq 1 ] &&
    [ -f "$replica_local_onboarding" ] &&
+   [ -f "$replica_catalog_state" ] &&
+   [ -f "$replica_catalog_name_bound" ] &&
+   [ -f "$replica_catalog_durability" ] &&
+   [ -f "$replica_catalog_resolution" ] &&
    [ -f "$replica_install_lifecycle" ] &&
    [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" local' \
      "$replica_local_onboarding" || true)" -eq 1 ] &&
+   [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" catalog-state' \
+     "$replica_catalog_state" || true)" -eq 1 ] &&
+   [ "$(grep -Fxc \
+     'exec bash "$script_dir/local-lifecycle-cases.sh" catalog-name-bound' \
+     "$replica_catalog_name_bound" || true)" -eq 1 ] &&
+   [ "$(grep -Fxc \
+     'exec bash "$script_dir/local-lifecycle-cases.sh" catalog-durability' \
+     "$replica_catalog_durability" || true)" -eq 1 ] &&
+   [ "$(grep -Fxc \
+     'exec bash "$script_dir/local-lifecycle-cases.sh" catalog-resolution' \
+     "$replica_catalog_resolution" || true)" -eq 1 ] &&
    [ "$(grep -Fxc 'exec bash "$script_dir/local-lifecycle-cases.sh" install' \
      "$replica_install_lifecycle" || true)" -eq 1 ]; then
-  pass AGG-010 "split routes preserve three measured aggregate lanes through one scheduler"
+  pass AGG-010 "split routes declare measured lane bounds through one scheduler"
 else
-  fail AGG-010 "split routes preserve three measured aggregate lanes through one scheduler"
+  fail AGG-010 "split routes declare measured lane bounds through one scheduler"
 fi
 
+# One hold per compatibility lane. Holding any lane must leave the parent
+# waiting on exactly that lane while the last subcase of every other lane
+# completes, and the held lane must still finish once released.
 hold_ids=(
+  "$catalog_state_execution"
   local-install-cases.sh
-  local-config-cases.sh
-  local-image-catalog-cases.sh
+  catalog-resolution-cases.sh
 )
 peer_done_one=(
   install-state-cases.py.done
-  install-mutation-cases.py.done
-  install-mutation-cases.py.done
+  "$catalog_durability_execution.done"
+  "$catalog_durability_execution.done"
 )
 peer_done_two=(
-  install-integrity-cases.py.done
-  install-integrity-cases.py.done
+  install-mutation-cases.py.done
+  install-mutation-cases.py.done
   install-state-cases.py.done
 )
 target_done=(
-  install-mutation-cases.py.done
+  "$catalog_state_execution.done"
   install-state-cases.py.done
-  install-integrity-cases.py.done
+  install-mutation-cases.py.done
 )
 expected_wait_children=(1 1 1)
 wait_contract=1
@@ -910,6 +1845,29 @@ if [ "$stubborn_rc" -eq 0 ] && [ "$observed_stubborn_rc" -eq 143 ] &&
   pass AGG-013 "signal exit preserves work owned by an uncooperative descendant"
 else
   fail AGG-013 "signal exit preserves work owned by an uncooperative descendant"
+fi
+
+if [ "$install_overlap_contract" -eq 1 ] &&
+   [ "$install_isolation_contract" -eq 1 ] &&
+   [ "$install_lane_mutation_contract" -eq 1 ]; then
+  pass AGG-031 "the install route overlaps an isolated long-pole lane and rejects serializing or dropping mutants"
+else
+  fail AGG-031 "the install route overlaps an isolated long-pole lane and rejects serializing or dropping mutants"
+fi
+
+if [ "$local_pole_isolation_contract" -eq 1 ] &&
+   [ "$local_lane_mutation_contract" -eq 1 ]; then
+  pass AGG-032 "the local partition isolates the catalog-state pole and rejects predecessor, dropped, serializing, or overlapping mutants"
+else
+  fail AGG-032 "the local partition isolates the catalog-state pole and rejects predecessor, dropped, serializing, or overlapping mutants"
+fi
+
+if [ "$catalog_partition_contract" -eq 1 ] &&
+   [ "$catalog_selector_mutation_contract" -eq 1 ] &&
+   [ "$catalog_registration_contract" -eq 1 ]; then
+  pass AGG-033 "the catalog-state leaf splits into selector-disjoint truthfully registered routes and rejects predecessor, dropped, or ineffective-selector mutants"
+else
+  fail AGG-033 "the catalog-state leaf splits into selector-disjoint truthfully registered routes and rejects predecessor, dropped, or ineffective-selector mutants"
 fi
 
 reset_source_fixtures

@@ -13,6 +13,7 @@ usage: scripts/dev/workflow-check branch [name]
        scripts/dev/workflow-check pr-body <file> [base-sha head-sha [head-ref base-ref]]
        scripts/dev/workflow-check pr-body-strict <file> [base-sha head-sha [head-ref base-ref]]
        scripts/dev/workflow-check evidence-append <old-body> <new-body>
+       scripts/dev/workflow-check evidence-repair <old-body> <new-body>
        scripts/dev/workflow-check pr-base <base>
        scripts/dev/workflow-check pr-route <head> <base>
        scripts/dev/workflow-check all [base]
@@ -674,9 +675,18 @@ check_evidence_append() {
   fi
   old_lines="$(wc -l < "$old_evidence" | tr -d '[:space:]')"
   new_lines="$(wc -l < "$new_evidence" | tr -d '[:space:]')"
-  if ((old_lines == 0 || new_lines < old_lines)); then
+  if ((new_lines == 0 || new_lines < old_lines)); then
     find "$state" -depth -delete >/dev/null 2>&1 || true
     fail "PR evidence update changed or erased a prior cycle"
+    return
+  fi
+  # An old body whose exact Evidence section holds no nonblank line has no prior cycle to
+  # preserve, so one bootstrap may seed Cycle 1. The caller validates the replacement against
+  # the current base, head, and route before this check, and the byte-prefix rule below binds
+  # every later update, so a bootstrap can neither rerun nor erase recorded evidence.
+  if ((old_lines == 0)); then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    printf 'PASS workflow append-only evidence bootstrap\n'
     return
   fi
   if ! awk '
@@ -690,6 +700,117 @@ check_evidence_append() {
   fi
   find "$state" -depth -delete >/dev/null 2>&1 || true
   printf 'PASS workflow append-only evidence\n'
+}
+
+# A first PR body reaches GitHub before any validation can see it, so its latest cycle can end an
+# otherwise canonical result token with comma-adjacent prose. Strict validation then rejects that
+# published cycle permanently, while the append-only prefix rule rejects every correction, so the
+# ledger cannot move in either direction. This check recognizes exactly that repair: the two bodies
+# must hold the same evidence cycle and field topology, every line up to and including the latest
+# cycle heading must be byte-identical, and one to four latest-cycle RED, GREEN, Product mutation, or
+# CI mutation lines may drop a comma and its nonempty trailing prose from behind an exact canonical
+# terminal result token. It proves nothing about the replacement itself: callers must still validate
+# the replacement strictly and require the published body to fail that same validation.
+check_evidence_repair() {
+  local old_body="$1" new_body="$2" state old_parsed new_parsed old_evidence new_evidence
+  local old_lines new_lines repair_error repair_rc=0
+
+  if [[ ! -f "$old_body" || ! -r "$old_body" || ! -f "$new_body" || ! -r "$new_body" ]]; then
+    infra "cannot read PR bodies for bounded evidence repair"
+    return
+  fi
+  state="$(mktemp -d)" || {
+    infra "cannot create bounded evidence repair state"
+    return
+  }
+  old_parsed="$state/old.parsed"
+  new_parsed="$state/new.parsed"
+  old_evidence="$state/old.evidence"
+  new_evidence="$state/new.evidence"
+  if ! strip_nonprose_markdown "$old_body" > "$old_parsed" ||
+     ! strip_nonprose_markdown "$new_body" > "$new_parsed" ||
+     ! extract_section "$old_parsed" "Evidence" | awk '/[^[:space:]]/' > "$old_evidence" ||
+     ! extract_section "$new_parsed" "Evidence" | awk '/[^[:space:]]/' > "$new_evidence"; then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    infra "cannot compare PR evidence for bounded repair"
+    return
+  fi
+  old_lines="$(wc -l < "$old_evidence" | tr -d '[:space:]')"
+  new_lines="$(wc -l < "$new_evidence" | tr -d '[:space:]')"
+  if ((old_lines == 0 || new_lines == 0 || old_lines != new_lines)); then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    fail "PR evidence repair requires the identical published cycle and field topology"
+    return
+  fi
+  if repair_error="$(awk '
+    function reject(message) {
+      if (error == "") error = message
+    }
+    function canonical_result(name) {
+      if (name == "RED" || name == "Product mutation" || name == "CI mutation") {
+        return "rc=1 classification=assertion-failure"
+      }
+      if (name == "GREEN") return "rc=0 classification=success"
+      return ""
+    }
+    function repaired(old_line, new_line,   field, separator, name, value, token, offset, deleted) {
+      if (substr(new_line, 1, 2) != "- ") return 0
+      field = substr(new_line, 3)
+      separator = index(field, ": ")
+      if (separator == 0) return 0
+      name = substr(field, 1, separator - 1)
+      value = substr(field, separator + 2)
+      token = canonical_result(name)
+      if (token == "") return 0
+      offset = length(value) - length(token)
+      if (offset < 0 || substr(value, offset + 1) != token) return 0
+      if (offset > 0 && substr(value, offset, 1) != " ") return 0
+      if (substr(old_line, 1, length(new_line)) != new_line) return 0
+      deleted = substr(old_line, length(new_line) + 1)
+      if (substr(deleted, 1, 1) != ",") return 0
+      return substr(deleted, 2) ~ /[^[:space:]]/
+    }
+    # The caller already proved both ledgers hold the same nonzero number of nonblank lines, so the
+    # first file is never empty and the two arrays are always the same length here.
+    NR == FNR { published[++published_count] = $0; next }
+    { replacement[++replacement_count] = $0 }
+    END {
+      for (position = 1; position <= published_count; position++) {
+        if (published[position] ~ /^### Cycle [1-9][0-9]*$/) latest = position
+      }
+      if (latest == 0) reject("requires one published cycle to correct")
+      for (position = 1; position <= published_count && error == ""; position++) {
+        if (published[position] == replacement[position]) continue
+        if (position <= latest) {
+          reject("cannot change any line before the latest cycle")
+        } else if (!repaired(published[position], replacement[position])) {
+          reject("must delete only a comma and its trailing prose after an exact canonical latest-cycle result")
+        } else {
+          repairs++
+        }
+      }
+      if (error == "" && repairs == 0) {
+        reject("requires at least one corrected latest-cycle result")
+      }
+      if (error == "" && repairs > 4) {
+        reject("cannot correct more than four latest-cycle results")
+      }
+      if (error != "") {
+        print error
+        exit 1
+      }
+    }
+  ' "$old_evidence" "$new_evidence" 2>&1)"; then
+    repair_rc=0
+  else
+    repair_rc=$?
+  fi
+  find "$state" -depth -delete >/dev/null 2>&1 || true
+  if ((repair_rc != 0)); then
+    fail "PR evidence repair ${repair_error:-failed}"
+    return
+  fi
+  printf 'PASS workflow bounded evidence repair\n'
 }
 
 check_commits() {
@@ -825,6 +946,10 @@ main() {
     evidence-append)
       (($# == 2)) || { usage; return; }
       check_evidence_append "$@"
+      ;;
+    evidence-repair)
+      (($# == 2)) || { usage; return; }
+      check_evidence_repair "$@"
       ;;
     pr-base)
       (($# == 1)) || { usage; return; }

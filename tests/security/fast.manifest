@@ -44,7 +44,7 @@ suite gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY fail
 suite ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
 suite required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
 suite guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
-suite workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=160 fail=0
+suite workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=198 fail=0
 suite hosted-ci-watch-contract tests/dev/hosted-ci-watch-cases.sh SUMMARY failures=0
 suite coordination tests/dev/coord-cases.sh SUMMARY assertions=58 expected=58 failures=0
 suite docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0
@@ -55,6 +55,10 @@ suite experiment-contract tests/experiment/contract-cases.sh EXPERIMENT CONTRACT
 suite experiment-authorization tests/experiment/authorization-cases.sh EXPERIMENT AUTHORIZATION PASS
 suite flow-g0-operator-surface tests/flow/g0-operator-surface/cases.sh FLOW G0 OPERATOR SURFACE PASS
 suite experiment-local-lifecycle tests/experiment/local-onboarding-cases.sh EXPERIMENT LOCAL LIFECYCLE PASS
+suite experiment-catalog-state-lifecycle tests/experiment/catalog-state-lifecycle-cases.sh EXPERIMENT CATALOG STATE LIFECYCLE PASS
+suite experiment-catalog-name-bound-lifecycle tests/experiment/catalog-name-bound-lifecycle-cases.sh EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS
+suite experiment-catalog-durability-lifecycle tests/experiment/catalog-durability-lifecycle-cases.sh EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS
+suite experiment-catalog-resolution-lifecycle tests/experiment/catalog-resolution-lifecycle-cases.sh EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS
 suite experiment-install-lifecycle tests/experiment/install-lifecycle-cases.sh EXPERIMENT INSTALL LIFECYCLE PASS
 suite experiment-source-adapters tests/experiment/source-adapter-cases.sh EXPERIMENT SOURCE ADAPTERS PASS
 suite config-matrix tests/agent/config-matrix.sh SUMMARY failures=0
