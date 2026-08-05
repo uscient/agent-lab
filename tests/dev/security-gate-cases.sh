@@ -231,6 +231,7 @@ guard-mount tests/guard/cases.sh SUMMARY failures=0
 config-authority tests/agent/config-guard.sh SUMMARY failures=0
 experiment-contract tests/experiment/contract-cases.sh EXPERIMENT CONTRACT PASS
 experiment-authorization tests/experiment/authorization-cases.sh EXPERIMENT AUTHORIZATION PASS
+flow-g0-operator-surface tests/flow/g0-operator-surface/cases.sh FLOW G0 OPERATOR SURFACE PASS
 experiment-local-lifecycle tests/experiment/local-onboarding-cases.sh EXPERIMENT LOCAL LIFECYCLE PASS
 experiment-install-lifecycle tests/experiment/install-lifecycle-cases.sh EXPERIMENT INSTALL LIFECYCLE PASS
 experiment-source-adapters tests/experiment/source-adapter-cases.sh EXPERIMENT SOURCE ADAPTERS PASS
@@ -255,6 +256,41 @@ if cmp -s "$expected_suites" "$actual_suites"; then
 else
   fail "default manifest has the exact required suite contract"
   diff -u "$expected_suites" "$actual_suites" || true
+fi
+
+g0_registration_is_split() {
+  local manifest="$1" lifecycle_wrapper="$2"
+  [ "$(grep -Fxc \
+    'suite flow-g0-operator-surface tests/flow/g0-operator-surface/cases.sh FLOW G0 OPERATOR SURFACE PASS' \
+    "$manifest")" -eq 1 ] &&
+    ! grep -Fq 'flow/g0-operator-surface/cases.sh' "$lifecycle_wrapper"
+}
+
+local_lifecycle_wrapper="$repo_root/tests/experiment/local-onboarding-cases.sh"
+if g0_registration_is_split "$default_manifest" "$local_lifecycle_wrapper"; then
+  pass "G0 and the existing local lifecycle are separate required Fast suites"
+
+  missing_g0_manifest="$work/missing-g0-fast.manifest"
+  grep -Fv \
+    'suite flow-g0-operator-surface tests/flow/g0-operator-surface/cases.sh FLOW G0 OPERATOR SURFACE PASS' \
+    "$default_manifest" > "$missing_g0_manifest"
+  if ! g0_registration_is_split "$missing_g0_manifest" "$local_lifecycle_wrapper"; then
+    pass "missing-G0-registration mutation turns the split-suite contract RED"
+  else
+    fail "missing-G0-registration mutation turns the split-suite contract RED"
+  fi
+
+  serial_wrapper="$work/serial-g0-wrapper.sh"
+  cp "$local_lifecycle_wrapper" "$serial_wrapper"
+  printf '%s\n' 'focused_g0="$script_dir/../flow/g0-operator-surface/cases.sh"' \
+    >> "$serial_wrapper"
+  if ! g0_registration_is_split "$default_manifest" "$serial_wrapper"; then
+    pass "serial-G0-wrapper mutation turns the split-suite contract RED"
+  else
+    fail "serial-G0-wrapper mutation turns the split-suite contract RED"
+  fi
+else
+  fail "G0 and the existing local lifecycle are separate required Fast suites"
 fi
 
 required_tools=(
