@@ -222,7 +222,7 @@ gate-concurrency tests/dev/security-gate-concurrency-cases.sh SUMMARY failures=0
 ci-workflow-contract tests/dev/ci-workflow-cases.sh SUMMARY failures=0
 required-gates-contract tests/dev/required-gates-cases.sh SUMMARY failures=0
 guard-diff tests/dev/guard-diff-cases.sh SUMMARY failures=0
-workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=171 fail=0
+workflow-metadata tests/dev/workflow-check-cases.sh SUMMARY pass=198 fail=0
 hosted-ci-watch-contract tests/dev/hosted-ci-watch-cases.sh SUMMARY failures=0
 coordination tests/dev/coord-cases.sh SUMMARY assertions=58 expected=58 failures=0
 docker-harness-contract tests/dev/docker-harness-cases.sh SUMMARY failures=0

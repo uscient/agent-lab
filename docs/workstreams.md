@@ -150,6 +150,22 @@ cycle to a local body file and update only that branch-derived PR through the bo
 The helper proves the repository, open PR number, current head/base names and SHAs, strict evidence
 schema, and unchanged prior cycles before and after the edit. Direct `gh pr edit` remains blocked.
 
+An opened PR body reaches GitHub before anything validates it, so a published first cycle can end a
+canonical result token with comma-adjacent prose that strict validation rejects and append-only
+refuses to correct. Only that case takes one bounded repair route through the same helper: the
+replacement must pass the same strict current base, head, and route validation, the published body
+must still fail that same validation, and the two ledgers must differ only by deleting a comma and
+its nonempty trailing prose from one to four latest-cycle `RED`, `GREEN`, `Product mutation`, or
+`CI mutation` lines whose prefix through the canonical result token is byte-identical. Earlier
+cycles, other fields, result tokens, scenarios, assertions, SHAs, route, cycle count, and every
+already-strict body stay on the byte-exact append-only path. The required workflow applies the same
+bounded repair inside that edited run: it captures the append attempt, accepts the correction only
+after it determines strict applicability, strictly validates the replacement against the event base,
+head, and route, proves the published body still fails that identical validation with an assertion
+result, and proves the difference through `evidence-repair`, then rules on the replacement with the
+ordinary strict validation. The repair edit therefore completes its own exact-head hosted campaign;
+it needs no later pushed head, no rerun, and no cancellation.
+
 The resulting `flow` head must complete CI and CodeQL before another group integrates. After all
 groups are integrated, a human or an agent may open the final draft while checked out on `flow`:
 
