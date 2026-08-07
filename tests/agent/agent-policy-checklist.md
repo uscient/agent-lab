@@ -21,7 +21,7 @@ Two layers:
 | 7 | `git pull` | **blocked** | | | |
 | 8 | `git rebase origin/dev` / other remote integration | allowed / **blocked** | | | |
 | 9 | same-branch push / protected or plain-force push | allowed / **blocked** | | | |
-| 10 | read-only `gh pr` + `gh pr create --base dev` / PR merge | allowed / **blocked** | | | |
+| 10 | scoped `gh pr`/`gh run`/API GET + derived PR create / mutation | allowed / **blocked** | | | |
 | 11 | `git remote set-url origin …` | **blocked** | | | |
 | 12 | destructive: `git reset --hard` · `rm -rf` · `chmod -R` | **blocked** | | | |
 | 13 | edit `AGENTS.md` / `policy/**` (maint unset) | **blocked** | | | |

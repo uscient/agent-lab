@@ -2,7 +2,9 @@
 # Read by tools/pretooluse-guard.sh: Edit/Write to these, or shell mutation of them, is DENIED
 # unless AGENT_LAB_MAINTENANCE=1 (an explicit, separately-approved maintenance task).
 # AGENTS.md defines maintenance authority. Entries ending in / are directory prefixes; others are file paths.
-# Paths are matched anywhere in the string (absolute or repo-relative), at a / boundary.
+# File-tool matches resolve the target into this repository worktree, then match the repo-relative
+# form at a / boundary. Host paths outside the worktree (for example ~/.grok/sessions/...) are not
+# rails. Shell command text still uses a literal substring check against these entries.
 
 AGENTS.md
 policy/
@@ -24,5 +26,39 @@ scripts/dev/serena-smoke
 scripts/lib/serena.sh
 scripts/serena-mcp
 tools/serena-entrypoint.sh
+.github/workflows/
+.github/PULL_REQUEST_TEMPLATE.md
+scripts/dev/workstream
+scripts/dev/workflow-check
+scripts/dev/ci-fast
+scripts/dev/hosted-ci-watch
+scripts/dev/hosted-ci-watch.py
+scripts/dev/required-gates
+scripts/dev/security-gate
+scripts/dev/security-gate.py
+scripts/dev/check
+scripts/dev/test
+scripts/dev/docker-gate
+scripts/dev/lint-scripts
+scripts/dev/cue-tool
+scripts/dev/cedar-tool
+tools/validate.sh
+tools/containment-lint.sh
+tests/security/
+tests/dev/workstream-cases.sh
+tests/dev/workflow-check-cases.sh
+tests/dev/ci-workflow-cases.sh
+tests/dev/required-gates-cases.sh
+tests/dev/hosted-ci-watch-cases.sh
+tests/dev/hosted-ci-watch-cases.py
+tests/dev/security-gate-cases.sh
+tests/dev/docker-harness-cases.sh
+tests/docker/security-fixture.sh
+tests/docker/fixtures/
+tests/dev/guard-diff-cases.sh
+tests/guard/
+tests/agent/policy-verify.sh
+tests/agent/render-adapters-idempotence.sh
+tests/serena/
 .cursor/
 .devguard/

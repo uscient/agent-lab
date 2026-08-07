@@ -31,16 +31,120 @@ require_absent() {
   fi
 }
 
-require_text .serena/project.yml 'project_name: "agent-lab-dev"' \
+top_level_line_is_exact() {
+  local file="$1" key="$2" expected="$3" key_count line_count
+  key_count="$(awk -v prefix="$key:" \
+    'index($0, prefix) == 1 { count++ } END { print count + 0 }' \
+    "$file")"
+  line_count="$(grep -Fxc -- "$expected" "$file" || true)"
+  [ "$key_count" -eq 1 ] && [ "$line_count" -eq 1 ]
+}
+
+require_top_level_line() {
+  local file="$1" key="$2" expected="$3" label="$4"
+  if top_level_line_is_exact "$repo_root/$file" "$key" "$expected"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
+project_indented_block() {
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    index($0, key ":") == 1 {
+      count++
+      capture = 1
+      next
+    }
+    capture && /^[^[:space:]]/ { capture = 0 }
+    capture { print }
+    END { if (count != 1) exit 1 }
+  ' "$file"
+}
+
+project_block_contains() {
+  local file="$1" key="$2" expected="$3" block
+  block="$(project_indented_block "$file" "$key")" &&
+    [[ "$block" == *"$expected"* ]]
+}
+
+require_project_block_text() {
+  local key="$1" expected="$2" label="$3"
+  if project_block_contains \
+       "$repo_root/.serena/project.yml" "$key" "$expected"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
+require_top_level_line .serena/project.yml project_name \
+  'project_name: "agent-lab-dev"' \
   "Serena project has an unambiguous logical name"
 require_text .serena/project.yml 'language_servers:' \
   "Serena project uses the current language_servers schema"
 require_text .serena/project.yml '- bash' \
   "Serena project selects the actual Bash language"
-require_text .serena/project.yml 'language_backend: LSP' \
+require_top_level_line .serena/project.yml language_backend \
+  'language_backend: LSP' \
   "Serena project explicitly selects the LSP backend"
-require_text .serena/project.yml 'ls_workspace_folders: ["."]' \
+require_top_level_line .serena/project.yml ignore_all_files_in_gitignore \
+  'ignore_all_files_in_gitignore: true' \
+  "Serena keeps ignored local material outside semantic search"
+require_top_level_line .serena/project.yml activation_command \
+  'activation_command:' \
+  "Serena activation runs no repository command"
+require_top_level_line .serena/project.yml ls_workspace_folders \
+  'ls_workspace_folders: ["."]' \
   "Serena indexes exactly the Agent Lab project root"
+require_project_block_text ls_specific_settings \
+  'bash_language_server_version: "5.6.0"' \
+  "Serena project selects the preseeded Bash language server version"
+for workflow_guidance in \
+  './scripts/dev/brief' \
+  './scripts/dev/changed' \
+  'docs/workstreams.md' \
+  './scripts/dev/workstream'; do
+  require_project_block_text initial_prompt "$workflow_guidance" \
+    "Serena activation prompt includes $workflow_guidance"
+done
+require_project_block_text initial_prompt \
+  'Serena does not' \
+  "Serena activation prompt disclaims Git and GitHub authority"
+require_project_block_text initial_prompt \
+  'proj/ is shared' \
+  "Serena activation prompt identifies proj as shared planning state"
+
+mutant_config="$work/project-mutant.yml"
+sed \
+  -e 's#bash_language_server_version: "5.6.0"#bash_language_server_version: "9.9.9"#' \
+  -e 's#\./scripts/dev/workstream#./scripts/dev/forged#' \
+  "$repo_root/.serena/project.yml" > "$mutant_config"
+printf '%s\n' \
+  '# project_name: "agent-lab-dev"' \
+  '# bash_language_server_version: "5.6.0"' \
+  '# ./scripts/dev/workstream' \
+  'project_name: "attacker-controlled"' >> "$mutant_config"
+if top_level_line_is_exact \
+     "$mutant_config" project_name 'project_name: "agent-lab-dev"'; then
+  fail "Serena config checks reject duplicate-key comment decoys"
+else
+  pass "Serena config checks reject duplicate-key comment decoys"
+fi
+if project_block_contains \
+     "$mutant_config" ls_specific_settings \
+     'bash_language_server_version: "5.6.0"'; then
+  fail "Serena config checks reject out-of-block version decoys"
+else
+  pass "Serena config checks reject out-of-block version decoys"
+fi
+if project_block_contains \
+     "$mutant_config" initial_prompt './scripts/dev/workstream'; then
+  fail "Serena config checks reject out-of-block workflow decoys"
+else
+  pass "Serena config checks reject out-of-block workflow decoys"
+fi
 
 require_text compose.serena.yaml 'network_mode: none' \
   "Serena runtime has no network namespace"
@@ -82,6 +186,12 @@ require_text scripts/serena-mcp '--enable-web-dashboard false' \
 require_absent scripts/serena-mcp \
   '--project([=[:space:]]|$)|--project-from-cwd' \
   "Serena starts recoverably without a fixed project"
+require_text docs/serena.md \
+  'Activation alone does not recreate container mounts.' \
+  "Serena docs explain the restart required for a stale proj mask"
+require_text THREAT_MODEL.md \
+  'Concurrent host-side writers are trusted to preserve that object contract.' \
+  "Serena threat model states the shared-proj concurrency boundary"
 
 require_text .codex/config.toml '[mcp_servers.serena]' \
   "Codex registers Serena at project scope"
@@ -288,6 +398,7 @@ printf '%s\n' '{}' > "$fixture/.mcp.json"
 printf '%s\n' 'project_name: fixture' > "$fixture/.serena/project.yml"
 printf '%s\n' 'masked fixture value' > "$fixture/.env.local"
 printf '%s\n' 'public example value' > "$fixture/.env.example"
+printf '%s\n' 'shared planning value' > "$fixture/proj/shared.md"
 printf '%s\n' '#!/usr/bin/env bash' > "$fixture/src/safe.sh"
 
 mount_rc=0
@@ -302,7 +413,7 @@ if [ "$mount_rc" -eq 0 ] &&
      "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
    grep -Fq "target: '/workspace/cache'" \
      "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
-   grep -Fq "target: '/workspace/proj'" \
+   ! grep -Fq "target: '/workspace/proj'" \
      "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
    grep -Fq "target: '/workspace/AGENTS.md'" \
      "$AGENT_LAB_SERENA_MOUNT_OVERRIDE" &&
@@ -323,9 +434,9 @@ if [ "$mount_rc" -eq 0 ] &&
         "$AGENT_LAB_SERENA_MOUNT_OVERRIDE")" -eq \
      "$(grep -Fc '          recursive: disabled' \
         "$AGENT_LAB_SERENA_MOUNT_OVERRIDE")" ]; then
-  pass "Serena mount plan masks local state and overlays every existing rail read-only"
+  pass "Serena mount plan shares proj while masking local state and protecting rails"
 else
-  fail "Serena mount plan masks local state and overlays every existing rail read-only"
+  fail "Serena mount plan shares proj while masking local state and protecting rails"
 fi
 
 mkdir -p "$fixture/src/same-device-bind"
@@ -437,8 +548,8 @@ else
 fi
 find "$fixture/secrets" -depth -delete
 
-mkdir -p "$fixture/src/private"
-printf '%s\n' 'synthetic fixture' > "$fixture/src/private/service.key"
+mkdir -p "$fixture/proj/private"
+printf '%s\n' 'synthetic fixture' > "$fixture/proj/private/service.key"
 nested_state="$work/nested-state"
 mkdir "$nested_state"
 nested_rc=0
@@ -450,7 +561,119 @@ else
   fail "Serena mount planning rejects nested credential and key paths"
 fi
 
-find "$fixture/src/private" -depth -delete
+find "$fixture/proj/private" -depth -delete
+
+ln "$fixture/.env.local" "$fixture/proj/planning-notes.md"
+secret_hardlink_state="$work/secret-hardlink-state"
+secret_hardlink_error="$work/secret-hardlink-error"
+mkdir "$secret_hardlink_state"
+secret_hardlink_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$secret_hardlink_state" >/dev/null 2>"$secret_hardlink_error" ||
+  secret_hardlink_rc=$?
+if [ "$secret_hardlink_rc" -eq 125 ] &&
+   grep -Fq 'refusing multiply linked file in shared proj' \
+     "$secret_hardlink_error"; then
+  pass "Serena rejects a proj hardlink alias to masked local state"
+else
+  fail "Serena rejects a proj hardlink alias to masked local state"
+fi
+find "$fixture/proj/planning-notes.md" -type f -delete
+
+ln "$fixture/AGENTS.md" "$fixture/proj/contributor-guide.md"
+rail_hardlink_state="$work/rail-hardlink-state"
+rail_hardlink_error="$work/rail-hardlink-error"
+mkdir "$rail_hardlink_state"
+rail_hardlink_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$rail_hardlink_state" >/dev/null 2>"$rail_hardlink_error" ||
+  rail_hardlink_rc=$?
+if [ "$rail_hardlink_rc" -eq 125 ] &&
+   grep -Fq 'refusing multiply linked file in shared proj' \
+     "$rail_hardlink_error"; then
+  pass "Serena rejects a proj hardlink alias to a protected rail"
+else
+  fail "Serena rejects a proj hardlink alias to a protected rail"
+fi
+find "$fixture/proj/contributor-guide.md" -type f -delete
+
+python3 -c 'import os, sys; os.mkfifo(sys.argv[1])' \
+  "$fixture/proj/planning-channel"
+special_proj_state="$work/special-proj-state"
+special_proj_error="$work/special-proj-error"
+mkdir "$special_proj_state"
+special_proj_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$special_proj_state" >/dev/null 2>"$special_proj_error" ||
+  special_proj_rc=$?
+if [ "$special_proj_rc" -eq 125 ] &&
+   grep -Fq 'refusing symlink or special object in shared proj' \
+     "$special_proj_error"; then
+  pass "Serena rejects host IPC objects in shared proj"
+else
+  fail "Serena rejects host IPC objects in shared proj"
+fi
+find "$fixture/proj/planning-channel" -type p -delete
+
+ln -s ../src/safe.sh "$fixture/proj/planning-link.md"
+nested_symlink_state="$work/nested-symlink-state"
+nested_symlink_error="$work/nested-symlink-error"
+mkdir "$nested_symlink_state"
+nested_symlink_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$nested_symlink_state" >/dev/null 2>"$nested_symlink_error" ||
+  nested_symlink_rc=$?
+if [ "$nested_symlink_rc" -eq 125 ] &&
+   grep -Fq 'refusing symlink or special object in shared proj' \
+     "$nested_symlink_error"; then
+  pass "Serena rejects nested symlinks in shared proj"
+else
+  fail "Serena rejects nested symlinks in shared proj"
+fi
+find "$fixture/proj/planning-link.md" -type l -delete
+
+python3 - "$fixture/proj/planning.sock" <<'PY'
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX) as listener:
+    listener.bind(sys.argv[1])
+PY
+socket_proj_state="$work/socket-proj-state"
+socket_proj_error="$work/socket-proj-error"
+mkdir "$socket_proj_state"
+socket_proj_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$socket_proj_state" >/dev/null 2>"$socket_proj_error" ||
+  socket_proj_rc=$?
+if [ "$socket_proj_rc" -eq 125 ] &&
+   grep -Fq 'refusing symlink or special object in shared proj' \
+     "$socket_proj_error"; then
+  pass "Serena rejects host Unix sockets in shared proj"
+else
+  fail "Serena rejects host Unix sockets in shared proj"
+fi
+find "$fixture/proj/planning.sock" -type s -delete
+
+find "$fixture/proj" -depth -delete
+ln -s "$fixture/src" "$fixture/proj"
+proj_symlink_state="$work/proj-symlink-state"
+proj_symlink_error="$work/proj-symlink-error"
+mkdir "$proj_symlink_state"
+proj_symlink_rc=0
+agent_lab_serena_prepare_mounts \
+  "$fixture" "$proj_symlink_state" >/dev/null 2>"$proj_symlink_error" ||
+  proj_symlink_rc=$?
+if [ "$proj_symlink_rc" -eq 125 ] &&
+   grep -Fq 'shared planning root proj is a symlink' \
+     "$proj_symlink_error"; then
+  pass "Serena requires shared proj to be a real directory"
+else
+  fail "Serena requires shared proj to be a real directory"
+fi
+find "$fixture/proj" -depth -delete
+mkdir "$fixture/proj"
+
 mkdir -p "$fixture/vendor/component"
 : > "$fixture/vendor/component/.git"
 nested_git_state="$work/nested-git-state"

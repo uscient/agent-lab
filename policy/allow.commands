@@ -32,6 +32,7 @@ git rebase
 git push
 gh pr
 gh run
+gh api
 
 # --- standard read/inspect tools ---
 cat

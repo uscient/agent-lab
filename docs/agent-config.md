@@ -1,8 +1,9 @@
 # Agent configuration — setup & maintenance
 
 How the three coding agents that **develop Agent Lab** (Claude Code, Codex, Grok) are configured to
-work autonomously inside the `AGENTS.md` boundary: develop on a branch, publish that branch, open a
-PR to `dev`, never merge it themselves, and never weaken containment.
+work autonomously inside the `AGENTS.md` boundary: develop on a writable branch, publish only that
+branch, follow its derived PR route, use the verified helper for allowed intermediate merges, leave
+every final merge into `dev` to a human, and never weaken containment.
 
 For the normal maintainer workflow and gates, start with
 [Development and verification](development.md). This page is the specialist reference for client
@@ -22,12 +23,12 @@ One operating policy, shared enforcement, and three generated thin adapters:
 |---|---|---|
 | Operating policy | `AGENTS.md` | auto-discovered by all three tools |
 | Enforcement logic | `tools/pretooluse-guard.sh` + `tools/session-bootstrap.sh` + `policy/*.patterns` | command, file, secret-read, Serena-mutation, and session hooks |
-| Native adapter rule bodies | `policy/allow.commands` + `NATIVE_DENY` in `tools/render-adapters.sh` | `tools/render-adapters.sh` → the three adapters |
+| Native adapter rule bodies | `policy/allow.commands` + static secret-path rules in `tools/render-adapters.sh` | `tools/render-adapters.sh` → the three adapters |
 
 ```text
 AGENTS.md  policy/                       # shared core (instruction + enforcement data)
 tools/pretooluse-guard.sh                # PreToolUse: command, read/write, and Serena mutations
-tools/session-bootstrap.sh               # SessionStart: protected branch -> dev-based work branch
+tools/session-bootstrap.sh               # SessionStart: dev/master/main -> work branch; flow read-only
 tools/render-adapters.sh                 # generates the adapter rule bodies
 tools/codex-permission-request.sh        # Codex PermissionRequest approver (mirrors policy)
 tools/bin/{git,gh}                        # optional argv-level PATH shims
@@ -52,16 +53,23 @@ actual session.
    ```
 3. Verify: `bash tests/guard/pretooluse-cases.sh` and `bash tests/agent/policy-verify.sh`.
 
-The guard reads `policy/*.patterns` directly, so policy edits take effect immediately for the guard;
-the generator re-emits the per-tool belt-and-suspenders rules. **Never hand-edit the generated
-regions** in `.claude/settings.json`, `.codex/rules/agent-lab.rules`, or `.grok/config.toml`.
+The guard reads `policy/*.patterns` directly, so command-policy edits take effect immediately. The
+generator emits native auto-approve rules and static secret-file denials, but deliberately does not
+copy command denials into client startup configuration. **Never hand-edit the generated regions** in
+`.claude/settings.json`, `.codex/rules/agent-lab.rules`, or `.grok/config.toml`.
+
+After upgrading from an adapter version that did cache command denials, end existing Claude, Codex,
+and Grok sessions and launch each client once from the updated checkout. A running client may retain
+the rules it loaded at startup; editing files cannot rewrite that process's memory. This is a one-time
+migration step: subsequent command-policy changes are read by the live guard from the checkout.
 
 ## The `AGENT_LAB_MAINTENANCE=1` convention (and the self-lock)
 
-The rails (`AGENTS.md`, `policy/`, the guard scripts, `tools/bin/`, the adapter dirs)
-are in `policy/protected.paths`: the guard blocks Edit/Write and shell-mutation of them so an agent
-can't quietly change its own guardrails. To **deliberately** maintain them, run the session with
-`AGENT_LAB_MAINTENANCE=1` **exported in the launching shell** (so the hook subprocess inherits it):
+`policy/protected.paths` is the complete rail inventory. It includes `AGENTS.md`, policy, guards,
+shims, adapters, workflows, the workstream and workflow-check helpers, required-gate reducers and
+manifests, and their contract tests. The guard blocks Edit/Write and shell mutation of those paths so
+an agent can't quietly change its own guardrails. To **deliberately** maintain them, run the session
+with `AGENT_LAB_MAINTENANCE=1` **exported in the launching shell** (so the hook subprocess inherits it):
 
 ```bash
 AGENT_LAB_MAINTENANCE=1 claude        # or codex / grok
@@ -74,9 +82,9 @@ rules avoid locking yourself out:
 2. **Wire the Claude adapter last** — generate `.claude/settings.json` as the final maintenance step,
    after all other files are in place.
 Note the guard's maintenance flag only relaxes the *guard*; native `deny` rules have no maintenance
-bypass. The Claude and Grok adapters therefore keep only unconditional command and secret-read
-denials in native `deny`; protected-path enforcement is left to their `Edit|Write` guard hooks
-(which honor the flag), so maintenance stays possible.
+bypass. The Claude and Grok adapters therefore keep only secret-file rules in native `deny`;
+protected-path and command enforcement is left to their live guard hooks (which honor the flag), so
+maintenance stays possible and command decisions always use the current checkout.
 
 ## Per-tool setup / trust
 
@@ -92,31 +100,57 @@ Codex runs `sandbox_mode = "workspace-write"` with network access enabled for th
 workflow. `AGENTS.md`, the guard, and protected-branch rules scope that access:
 
 ```bash
-git fetch origin
+# Ordinary branch:
+git fetch origin dev
 git rebase origin/dev
 git push -u origin HEAD
 gh pr create --base dev ...
+gh pr list --repo uscient/agent-lab
+gh run list --repo uscient/agent-lab
+gh api --method GET repos/uscient/agent-lab/branches/dev
+
+# Reserved workstream and program branches:
+./scripts/dev/workstream sync       # workstreams and slices
+./scripts/dev/workstream group-sync # Group -> derived synchronization slice
+./scripts/dev/workstream pr ...       # matching slice -> parent
+./scripts/dev/workstream group-pr ... # group -> flow, draft
+./scripts/dev/workstream final ...    # work or flow -> dev, draft
+./scripts/dev/workstream merge 123    # verified intermediate only
 ```
 
-Direct protected-branch pushes, plain force pushes, PR merge/mutation, remote mutation, GitHub
-authentication access, and Git attribution changes remain forbidden. Runtime credentials are used
-implicitly by Git/GitHub tooling; agents must never inspect or modify them.
+Ordinary branches rebase on `origin/dev`; reusable workstreams and Group slices use
+merge-preserving `workstream sync` with their exact parent. PR-only Groups use `group-sync` to
+prepare a matching synchronization slice from current `flow`. Those integration branches are never
+rebased or force-updated. Direct Group commits and pushes are denied; only verified PR integration
+may advance a Group. `dev`, `flow`, `master`, and `main` are protected, and a `flow`
+checkout stays read-only. Direct protected writes, plain force pushes, direct PR merge/mutation, remote
+mutation, GitHub authentication access, and Git attribution changes remain forbidden. The only
+agent merge exception is `scripts/dev/workstream merge` for a verified slice→work,
+group-slice→group, or accepted group→`flow` PR. Humans alone merge final PRs into `dev`.
+
+The repository guards do not configure GitHub. Humans must install the required `CI / Required
+gates` and `CodeQL` checks, current-base or merge-queue rule, latest-push approval, merge-only history,
+branch retention, and trusted rail ownership described in [Workstreams and programs](workstreams.md).
+Runtime credentials are used implicitly by Git/GitHub tooling; agents must never inspect or modify
+them.
 
 ## Forbidden flags (never use these as the autonomy mechanism)
 
 Autonomy comes from `acceptEdits` (Claude) / `on-request` + `workspace-write` (Codex) /
-`always-approve` + denies (Grok) — **never** a global approve-all that would also disarm the denials:
+`always-approve` + the trusted live hook (Grok). Do not use modes that disable repository hooks or
+containment:
 
 - Codex: `--yolo`, `--dangerously-bypass-approvals-and-sandbox`, `sandbox_mode = "danger-full-access"`, deprecated `codex exec --full-auto`, `--ignore-rules`.
-- Grok: `--yolo` **without** deny rules + hook (always pair them).
+- Grok: `--yolo` when it bypasses the project hook; use `--always-approve` with trusted hooks.
 - Claude: `permissions.defaultMode = "bypassPermissions"`.
 
 ## Add a 4th tool
 
 1. Add a thin adapter dir (e.g. `.cursor/`) that wires the tool's `PreToolUse` hook to
    `tools/pretooluse-guard.sh` and its `SessionStart` to `tools/session-bootstrap.sh <tool>`.
-2. Add an `emit_<tool>` branch to `tools/render-adapters.sh` that translates `policy/allow.commands`
-   + the deny set into the tool's native rule syntax; add the dir to `policy/protected.paths`.
+2. Add an `emit_<tool>` branch to `tools/render-adapters.sh` that translates
+   `policy/allow.commands` into native auto-approve rules and carries the static secret-file rules;
+   add the dir to `policy/protected.paths`. Do not duplicate command denials in startup-cached rules.
 3. Add the tool's rows to `tests/agent/agent-policy-checklist.md` and run the guard-fired + no-prompt
    + scoped-publish checks.
 The shared guard/policy/AGENTS.md are reused unchanged — that is the point of the architecture.
@@ -150,6 +184,10 @@ home, project, and egress policy. Instead, `scripts/serena-mcp` starts the fixed
 repo as the only content-bearing RW project bind at `/workspace`. Read-only overlays mask Git,
 local state, and protected rails, while a private temporary bind isolates `.serena/cache`. This
 preserves the control-plane/data-plane distinction while containing the development helper itself.
+The Git-ignored `proj/` planning tree deliberately remains on the shared writable project bind so
+agents in the checkout can collaborate there; it is not a secrets or authority surface. Preflight
+requires a real directory with ordinary directories and singly linked regular files. This is a startup
+snapshot; cooperating host-side writers are trusted to preserve that contract while Serena runs.
 All binds are private and non-recursive, and the launcher rejects child mounts or nested Git
 metadata before startup. Client registrations also remove `BASH_ENV` and `ENV` before invoking a
 non-login, no-profile Bash for repository-root discovery.

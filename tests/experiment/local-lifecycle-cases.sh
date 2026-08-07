@@ -2,56 +2,130 @@
 set -u -o pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd)"
+# Leaf subcases in frozen assertion-identity order. The catalog block is listed
+# by leaf rather than through an intermediate aggregate: a nested scheduler
+# hides its own long pole from this router, and only this router can place that
+# pole in a public route of its own.
 all_subcases=(
   "$repo_root/tests/install/local-install-cases.sh"
   "$repo_root/tests/experiment/local-config-cases.sh"
-  "$repo_root/tests/experiment/local-image-catalog-cases.sh"
+  "$repo_root/tests/image/catalog-cases.sh"
+  "$repo_root/tests/image/catalog-state-cases.py"
+  "$repo_root/tests/image/catalog-state-cases.py"
+  "$repo_root/tests/image/catalog-state-cases.py"
+  "$repo_root/tests/experiment/catalog-resolution-cases.sh"
+  "$repo_root/tests/image/catalog-mutation-cases.py"
   "$repo_root/tests/experiment/install-store-cases.sh"
   "$repo_root/tests/experiment/install-state-cases.py"
   "$repo_root/tests/experiment/install-integrity-cases.py"
   "$repo_root/tests/experiment/install-mutation-cases.py"
 )
 readonly all_subcases
+# Selector handed to the leaf at the matching index; an empty selector means the
+# leaf takes no argument. The catalog-state leaf is entered once per disjoint
+# slice, so a route runs its own slice and never the neighbouring slice's cases.
+all_subcase_selectors=(
+  ''
+  ''
+  ''
+  state
+  name-bound
+  durability
+  ''
+  ''
+  ''
+  ''
+  ''
+  ''
+)
+readonly all_subcase_selectors
 
 if [ "$#" -eq 0 ]; then
   route=all
 elif [ "$#" -eq 1 ]; then
   route="$1"
 else
-  printf 'Usage: %s [local|install]\n' "${BASH_SOURCE[0]}" >&2
+  printf 'Usage: %s [%s]\n' "${BASH_SOURCE[0]}" \
+    'local|catalog-state|catalog-name-bound|catalog-durability|catalog-resolution|install' >&2
   exit 2
 fi
 
+# Every public route carries a bounded share of the frozen 133 identities, and
+# the indivisible poles - catalog name bound and install state - never share a
+# route with movable work.
 case "$route" in
   all)
     selected_start=0
-    selected_count=7
+    selected_count=12
     expected_start=1
     expected_count=133
     lane_count=3
-    lane_map=(0 1 2 0 1 2 0)
+    lane_map=(1 1 1 0 0 0 2 2 2 1 2 2)
     final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
     ;;
   local)
     selected_start=0
     selected_count=3
     expected_start=1
-    expected_count=86
+    expected_count=28
     lane_count=2
     lane_map=(0 0 1)
     final_marker='EXPERIMENT LOCAL LIFECYCLE PASS'
     ;;
-  install)
+  catalog-state)
     selected_start=3
+    selected_count=1
+    expected_start=29
+    expected_count=18
+    lane_count=1
+    lane_map=(0)
+    final_marker='EXPERIMENT CATALOG STATE LIFECYCLE PASS'
+    ;;
+  catalog-name-bound)
+    # Measured: publishing the 256 logical names before the refusal costs more
+    # than every other catalog-state case combined and cannot be subdivided. It
+    # is the whole route, so no movable work competes with it for the frozen
+    # deadline.
+    selected_start=4
+    selected_count=1
+    expected_start=47
+    expected_count=1
+    lane_count=1
+    lane_map=(0)
+    final_marker='EXPERIMENT CATALOG NAME BOUND LIFECYCLE PASS'
+    ;;
+  catalog-durability)
+    selected_start=5
+    selected_count=1
+    expected_start=48
+    expected_count=15
+    lane_count=1
+    lane_map=(0)
+    final_marker='EXPERIMENT CATALOG DURABILITY LIFECYCLE PASS'
+    ;;
+  catalog-resolution)
+    selected_start=6
+    selected_count=2
+    expected_start=63
+    expected_count=24
+    lane_count=2
+    lane_map=(0 1)
+    final_marker='EXPERIMENT CATALOG RESOLUTION LIFECYCLE PASS'
+    ;;
+  install)
+    selected_start=8
     selected_count=4
     expected_start=87
     expected_count=47
-    lane_count=1
-    lane_map=(0 0 0 0)
+    # The long-pole subcase owns a lane; the three short subcases share the
+    # other lane.
+    lane_count=2
+    lane_map=(0 1 0 0)
     final_marker='EXPERIMENT INSTALL LIFECYCLE PASS'
     ;;
   *)
-    printf 'Usage: %s [local|install]\n' "${BASH_SOURCE[0]}" >&2
+    printf 'Usage: %s [%s]\n' "${BASH_SOURCE[0]}" \
+      'local|catalog-state|catalog-name-bound|catalog-durability|catalog-resolution|install' >&2
     exit 2
     ;;
 esac
@@ -61,14 +135,18 @@ readonly lane_map
 readonly final_marker
 subcases=("${all_subcases[@]:$selected_start:$selected_count}")
 readonly subcases
+subcase_selectors=("${all_subcase_selectors[@]:$selected_start:$selected_count}")
+readonly subcase_selectors
 
 infrastructure_exit() {
   printf 'SUMMARY assertions=0 expected=%s failures=0 infra=1\n' "$expected_count"
   exit 125
 }
 
-if [ "${#all_subcases[@]}" -ne 7 ] ||
+if [ "${#all_subcases[@]}" -ne 12 ] ||
+   [ "${#all_subcase_selectors[@]}" -ne 12 ] ||
    [ "${#subcases[@]}" -ne "$selected_count" ] ||
+   [ "${#subcase_selectors[@]}" -ne "$selected_count" ] ||
    [ "${#lane_map[@]}" -ne "$selected_count" ]; then
   infrastructure_exit
 fi
@@ -214,7 +292,11 @@ run_subcase() {
   local output="$work/subcase-$index.out"
   local status_file="$work/subcase-$index.status"
   local rc
+  local selector=()
 
+  if [ -n "${subcase_selectors[$index]}" ]; then
+    selector=("${subcase_selectors[$index]}")
+  fi
   if ! : > "$output"; then
     printf '125\n' > "$status_file" 2>/dev/null || true
     return 125
@@ -224,14 +306,14 @@ run_subcase() {
   else
     case "$subcase" in
       *.py)
-        if python3 -I -B "$subcase" > "$output" 2>&1; then
+        if python3 -I -B "$subcase" "${selector[@]}" > "$output" 2>&1; then
           rc=0
         else
           rc=$?
         fi
         ;;
       *)
-        if bash "$subcase" > "$output" 2>&1; then
+        if bash "$subcase" "${selector[@]}" > "$output" 2>&1; then
           rc=0
         else
           rc=$?

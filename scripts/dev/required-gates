@@ -213,6 +213,13 @@ fi
 if [ -z "${CI_NEEDS_JSON+x}" ]; then
   finish_infra "\`CI_NEEDS_JSON\` is unset."
 fi
+if [ -z "${CI_EXPECTED_HEAD+x}" ]; then
+  finish_infra "\`CI_EXPECTED_HEAD\` is unset."
+fi
+if [[ ! "$CI_EXPECTED_HEAD" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+   [[ "$CI_EXPECTED_HEAD" =~ ^0+$ ]]; then
+  finish_infra "\`CI_EXPECTED_HEAD\` is not a valid immutable commit identity."
+fi
 if ! printf '%s' "$CI_NEEDS_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
   finish_infra "\`CI_NEEDS_JSON\` is not a valid JSON object."
 fi
@@ -227,9 +234,22 @@ if [ "$actual_keys" != "$expected_keys" ]; then
   finish_infra "\`CI_NEEDS_JSON\` must contain exactly the fast, static, and docker jobs."
 fi
 
+for gate_id in "${gate_ids[@]}"; do
+  gate_head="$(
+    printf '%s' "$CI_NEEDS_JSON" |
+      jq -er --arg gate "$gate_id" \
+        '.[$gate].outputs["tested-head"] | select(type == "string")' 2>/dev/null
+  )" || gate_head=""
+  if [ "$gate_head" != "$CI_EXPECTED_HEAD" ]; then
+    finish_infra "job \`$gate_id\` did not bind evidence to the expected tested head."
+  fi
+done
+
 invalid_result=""
 blocked=0
 blocked_gates=()
+infra_blocked=0
+infra_gates=()
 fast_result=""
 for gate_id in "${gate_ids[@]}"; do
   if ! printf '%s' "$CI_NEEDS_JSON" |
@@ -248,14 +268,40 @@ for gate_id in "${gate_ids[@]}"; do
     break
   }
   gate_results+=("$result")
+  classification="$(
+    printf '%s' "$CI_NEEDS_JSON" |
+      jq -er --arg gate "$gate_id" \
+        '.[$gate].outputs.classification | select(type == "string")' 2>/dev/null
+  )" || classification=""
   if [ "$gate_id" = "fast" ]; then
     fast_result="$result"
   fi
   case "$result" in
-    success) ;;
-    failure|cancelled|skipped)
-      blocked=1
-      blocked_gates+=("\`$gate_id\` (\`$result\`)")
+    success)
+      if [ "$classification" != success ]; then
+        infra_blocked=1
+        infra_gates+=("\`$gate_id\` (success with \`${classification:-missing}\` classification)")
+      fi
+      ;;
+    failure)
+      case "$classification" in
+        assertion-failure)
+          blocked=1
+          blocked_gates+=("\`$gate_id\` (\`failure\`)")
+          ;;
+        infrastructure | unexpected)
+          infra_blocked=1
+          infra_gates+=("\`$gate_id\` (\`$classification\`)")
+          ;;
+        *)
+          infra_blocked=1
+          infra_gates+=("\`$gate_id\` (failure with \`${classification:-missing}\` classification)")
+          ;;
+      esac
+      ;;
+    cancelled | skipped)
+      infra_blocked=1
+      infra_gates+=("\`$gate_id\` (\`$result\`)")
       ;;
     *)
       invalid_result="$gate_id"
@@ -278,6 +324,17 @@ if [[ ! "$fast_diff_base" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
   if [ "$blocked" -eq 0 ] && [ "$fast_result" = "success" ]; then
     finish_infra "successful \`fast\` job did not publish a valid immutable diff base."
   fi
+fi
+
+if [ "$infra_blocked" -ne 0 ]; then
+  infra_list=""
+  for infra_gate in "${infra_gates[@]}"; do
+    if [ -n "$infra_list" ]; then
+      infra_list+=", "
+    fi
+    infra_list+="$infra_gate"
+  done
+  finish_infra "required job evidence is incomplete or uncertain: $infra_list."
 fi
 
 if [ "$blocked" -ne 0 ]; then

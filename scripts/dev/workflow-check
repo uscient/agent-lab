@@ -10,8 +10,12 @@ usage: scripts/dev/workflow-check branch [name]
        scripts/dev/workflow-check commit <subject>
        scripts/dev/workflow-check commits [base]
        scripts/dev/workflow-check pr-title <title>
-       scripts/dev/workflow-check pr-body <file>
+       scripts/dev/workflow-check pr-body <file> [base-sha head-sha [head-ref base-ref]]
+       scripts/dev/workflow-check pr-body-strict <file> [base-sha head-sha [head-ref base-ref]]
+       scripts/dev/workflow-check evidence-append <old-body> <new-body>
+       scripts/dev/workflow-check evidence-repair <old-body> <new-body>
        scripts/dev/workflow-check pr-base <base>
+       scripts/dev/workflow-check pr-route <head> <base>
        scripts/dev/workflow-check all [base]
 EOF
   return 2
@@ -91,8 +95,31 @@ check_branch() {
     return
   fi
   case "$branch_name" in
-    dev | master | main)
+    dev | flow | master | main)
       fail "branch is protected: $branch_name"
+      return
+      ;;
+  esac
+  case "$branch_name" in
+    work/*)
+      [[ "$branch_name" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || { fail "invalid reserved workstream branch: $branch_name"; return; }
+      ;;
+    group/*)
+      valid_group "${branch_name#group/}" \
+        || { fail "invalid reserved group branch: $branch_name"; return; }
+      ;;
+    slice/group/*/*)
+      [[ "$branch_name" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] &&
+        valid_group "${BASH_REMATCH[1]}" \
+        || { fail "invalid reserved group slice branch: $branch_name"; return; }
+      ;;
+    slice/*/*)
+      [[ "$branch_name" =~ ^slice/[a-z0-9][a-z0-9-]{0,47}/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || { fail "invalid reserved workstream slice branch: $branch_name"; return; }
+      ;;
+    slice/*)
+      fail "invalid reserved branch: $branch_name"
       return
       ;;
   esac
@@ -121,6 +148,10 @@ check_branch() {
   fi
 
   printf 'PASS workflow branch=%s\n' "$branch_name"
+}
+
+valid_group() {
+  [ "${#1}" -le 48 ] && [[ "$1" =~ ^[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$ ]]
 }
 
 check_current_or_named_branch() {
@@ -175,14 +206,86 @@ check_pr_title() {
   printf 'PASS workflow PR title\n'
 }
 
-check_pr_base() {
-  local base="$1"
+expected_pr_base() {
+  local head="$1" group=""
+  case "$head" in
+    flow) printf 'dev\n' ;;
+    work/*)
+      [[ "$head" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] || return 1
+      printf 'dev\n'
+      ;;
+    group/*)
+      valid_group "${head#group/}" || return 1
+      printf 'flow\n'
+      ;;
+    slice/group/*/*)
+      [[ "$head" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      group="${BASH_REMATCH[1]}"
+      valid_group "$group" || return 1
+      printf 'group/%s\n' "$group"
+      ;;
+    slice/*/*)
+      [[ "$head" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | master | main) return 1 ;;
+    *) printf 'dev\n' ;;
+  esac
+}
 
-  if [[ "$base" != dev ]]; then
-    fail "PR base must be dev"
+expected_commit_base() {
+  local head="$1" group=""
+  case "$head" in
+    flow) printf 'origin/dev\n' ;;
+    work/*)
+      [[ "$head" =~ ^work/[a-z0-9][a-z0-9-]{0,47}$ ]] || return 1
+      printf 'origin/dev\n'
+      ;;
+    group/*)
+      valid_group "${head#group/}" || return 1
+      printf 'origin/flow\n'
+      ;;
+    slice/group/*/*)
+      [[ "$head" =~ ^slice/group/([gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*)/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      group="${BASH_REMATCH[1]}"
+      valid_group "$group" || return 1
+      printf 'origin/group/%s\n' "$group"
+      ;;
+    slice/*/*)
+      [[ "$head" =~ ^slice/([a-z0-9][a-z0-9-]{0,47})/[a-z0-9][a-z0-9-]{0,47}$ ]] \
+        || return 1
+      printf 'origin/work/%s\n' "${BASH_REMATCH[1]}"
+      ;;
+    slice/* | dev | master | main) return 1 ;;
+    *) printf 'origin/dev\n' ;;
+  esac
+}
+
+check_pr_route() {
+  local head="$1" base="$2" expected=""
+
+  expected="$(expected_pr_base "$head")" || {
+    fail "PR head is not an authorized workflow branch: $head"
+    return
+  }
+  if [[ "$base" != "$expected" ]]; then
+    fail "PR base for $head must be $expected"
     return
   fi
-  printf 'PASS workflow PR base=dev\n'
+  printf 'PASS workflow PR route=%s->%s\n' "$head" "$base"
+}
+
+check_pr_base() {
+  local base="$1" head=""
+
+  if ! head="$(git branch --show-current 2>/dev/null)" || [[ -z "$head" ]]; then
+    infra "cannot inspect the head branch for the PR base"
+    return
+  fi
+  check_pr_route "$head" "$base"
 }
 
 strip_nonprose_markdown() {
@@ -263,15 +366,191 @@ extract_section() {
   ' "$1"
 }
 
+validate_evidence() {
+  local parsed_file="$1" expected_base="${2:-}" expected_head="${3:-}"
+  local expected_route_head="${4:-}" expected_route_base="${5:-}" strict="${6:-0}"
+
+  extract_section "$parsed_file" "Evidence" | awk \
+    -v expected_base="$expected_base" -v expected_head="$expected_head" \
+    -v expected_route_head="$expected_route_head" -v expected_route_base="$expected_route_base" \
+    -v strict="$strict" '
+    BEGIN {
+      count = 15
+      fields[1] = "Route"
+      fields[2] = "Base"
+      fields[3] = "Head"
+      fields[4] = "Scenarios"
+      fields[5] = "Assertions"
+      fields[6] = "RED predecessor"
+      fields[7] = "RED"
+      fields[8] = "GREEN"
+      fields[9] = "Product mutation"
+      fields[10] = "CI mutation"
+      fields[11] = "Runner"
+      fields[12] = "Duration"
+      fields[13] = "Cleanup"
+      fields[14] = "Artifacts"
+      fields[15] = "Unverified"
+    }
+    function reject(message) {
+      if (error == "") error = message
+    }
+    function reasoned_na(value, reason) {
+      if (index(value, "N/A — ") == 1) reason = substr(value, length("N/A — ") + 1)
+      else if (index(value, "N/A - ") == 1) reason = substr(value, length("N/A - ") + 1)
+      else return 0
+      return reason ~ /[[:alnum:]]/
+    }
+    function exact_result(value, code, classification) {
+      return value ~ ("(^|[[:space:]])rc=" code "([[:space:]]|$)") &&
+             value ~ ("(^|[[:space:]])classification=" classification "([[:space:]]|$)")
+    }
+    function detected_result(value, lower) {
+      lower = tolower(value)
+      if (lower ~ /(^|[^[:alnum:]])undetected([^[:alnum:]]|$)/ ||
+          lower ~ /(^|[^[:alnum:]])not[[:space:]]+detected([^[:alnum:]]|$)/) return 0
+      return lower ~ /(^|[^[:alnum:]])detected([^[:alnum:]]|$)/ &&
+             exact_result(value, "1", "assertion-failure")
+    }
+    function sha_value(value, clean) {
+      clean = value
+      if (substr(clean, 1, 1) != "`" || substr(clean, length(clean), 1) != "`") return ""
+      clean = substr(clean, 2, length(clean) - 2)
+      if (length(clean) != 40 || clean !~ /^[0-9a-f]+$/) return ""
+      return clean
+    }
+    function finish_cycle() {
+      if (!in_cycle) return
+      if (field_index != count) {
+        reject("Evidence cycle " cycle " field order expected " fields[field_index + 1])
+      }
+    }
+    function validate_field(name, value, clean) {
+      if (value == "") {
+        reject("Evidence cycle " cycle " " name " is empty")
+        return
+      }
+      if (value ~ /^N\/A([[:space:]]|$)/ && !reasoned_na(value)) {
+        reject("Evidence cycle " cycle " " name " N/A requires a reason")
+        return
+      }
+      if (tolower(value) ~ /skipped/ && tolower(value) ~ /(pass|success|green)/) {
+        reject("Evidence cycle " cycle " cannot classify skipped evidence as GREEN")
+        return
+      }
+      if (name == "Route") {
+        if (value !~ /^`[^`]+` -> `[^`]+`$/) {
+          reject("Evidence cycle " cycle " Route must be `head` -> `base`")
+        }
+        latest_route = value
+      } else if (name == "Base" || name == "Head" || name == "RED predecessor") {
+        if (name == "RED predecessor" && reasoned_na(value)) {
+          if (strict) reject("Evidence cycle " cycle " RED predecessor cannot be N/A in strict mode")
+          return
+        }
+        clean = sha_value(value)
+        if (clean == "") reject("Evidence cycle " cycle " " name " must be one exact 40-hex SHA")
+        if (name == "Base") latest_base = clean
+        if (name == "Head") latest_head = clean
+      } else if (name == "RED" && reasoned_na(value)) {
+        if (strict) reject("Evidence cycle " cycle " RED cannot be N/A in strict mode")
+      } else if (name == "RED" && !exact_result(value, "1", "assertion-failure")) {
+        reject("Evidence cycle " cycle " RED must record rc=1 classification=assertion-failure")
+      } else if (name == "GREEN" && reasoned_na(value)) {
+        if (strict) reject("Evidence cycle " cycle " GREEN cannot be N/A in strict mode")
+      } else if (name == "GREEN" && !exact_result(value, "0", "success")) {
+        reject("Evidence cycle " cycle " GREEN must record rc=0 classification=success")
+      } else if ((name == "Product mutation" || name == "CI mutation") &&
+                 reasoned_na(value)) {
+        if (strict) reject("Evidence cycle " cycle " " name " cannot be N/A in strict mode")
+      } else if ((name == "Product mutation" || name == "CI mutation") &&
+                 !detected_result(value)) {
+        reject("Evidence cycle " cycle " " name " must record detected rc=1 classification=assertion-failure")
+      }
+    }
+    /^### Cycle [1-9][0-9]*$/ {
+      finish_cycle()
+      next_cycle = $3 + 0
+      if (next_cycle != cycle + 1) {
+        reject("Evidence expected Cycle " cycle + 1 ", found Cycle " next_cycle)
+      }
+      cycle = next_cycle
+      in_cycle = 1
+      field_index = 0
+      next
+    }
+    /^### / {
+      reject("Evidence contains an unsupported heading: " $0)
+      next
+    }
+    in_cycle && /^- / {
+      line = substr($0, 3)
+      separator = index(line, ": ")
+      if (separator == 0) {
+        reject("Evidence cycle " cycle " contains a malformed field")
+        next
+      }
+      name = substr(line, 1, separator - 1)
+      value = substr(line, separator + 2)
+      field_index++
+      if (field_index > count || name != fields[field_index]) {
+        reject("Evidence cycle " cycle " field order expected " fields[field_index])
+        next
+      }
+      validate_field(name, value)
+      next
+    }
+    /[^[:space:]]/ {
+      reject("Evidence contains unsupported content outside a cycle field")
+    }
+    END {
+      finish_cycle()
+      if (cycle == 0) reject("Evidence requires Cycle 1")
+      if (expected_base != "" && latest_base != expected_base) {
+        reject("Evidence latest Base does not match expected PR base")
+      }
+      if (expected_head != "" && latest_head != expected_head) {
+        reject("Evidence latest Head does not match expected PR head")
+      }
+      if (expected_route_head != "" &&
+          latest_route != "`" expected_route_head "` -> `" expected_route_base "`") {
+        reject("Evidence latest Route does not match expected PR route")
+      }
+      if (error != "") {
+        print error
+        exit 1
+      }
+    }
+  '
+}
+
 check_pr_body() {
-  local body_file="$1" parsed_file section count
+  local strict="$1"
+  shift
+  local body_file="$1" expected_base="${2:-}" expected_head="${3:-}"
+  local expected_route_head="${4:-}" expected_route_base="${5:-}"
+  local parsed_file section count evidence_error evidence_rc=0 testing_valid=0
   local summary_line motivation_line changes_line testing_line testing_text testing_prose
-  local -a required_sections=("Summary" "Motivation / Context" "Changes" "Testing")
+  local evidence_line
+  local -a required_sections=("Summary" "Motivation / Context" "Changes" "Testing" "Evidence")
 
   if [[ ! -f "$body_file" || ! -r "$body_file" ]]; then
     infra "cannot read PR body: $body_file"
     return
   fi
+  # GitHub and some clients store PR bodies with CRLF. Section headings must match
+  # exactly ("## Summary"), so normalize before parsing.
+  body_normalized="$(mktemp)" || {
+    infra "cannot create temporary PR body normalization state"
+    return
+  }
+  if ! tr -d '\r' <"$body_file" >"$body_normalized"; then
+    find "$body_normalized" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    infra "cannot normalize PR body: $body_file"
+    return
+  fi
+  body_file="$body_normalized"
+  trap 'find "$body_normalized" -maxdepth 0 -delete >/dev/null 2>&1 || true' RETURN
   if grep -Eiq '^[[:space:]]*>[[:space:]]+\*\*.*Important policy notice\*\*[[:space:]]*$|^## Checklist \(members only\)[[:space:]]*$|^If you are not a member, please close this PR instead of submitting\.[[:space:]]*$' "$body_file"; then
     fail "PR body retains the member notice"
     return
@@ -316,9 +595,11 @@ check_pr_body() {
   motivation_line="$(section_line "$parsed_file" "Motivation / Context")"
   changes_line="$(section_line "$parsed_file" "Changes")"
   testing_line="$(section_line "$parsed_file" "Testing")"
-  if ! ((summary_line < motivation_line && motivation_line < changes_line && changes_line < testing_line)); then
+  evidence_line="$(section_line "$parsed_file" "Evidence")"
+  if ! ((summary_line < motivation_line && motivation_line < changes_line &&
+        changes_line < testing_line && testing_line < evidence_line)); then
     find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
-    fail "PR body section order must be Summary, Motivation / Context, Changes, Testing"
+    fail "PR body section order must be Summary, Motivation / Context, Changes, Testing, Evidence"
     return
   fi
 
@@ -331,46 +612,236 @@ check_pr_body() {
   done
 
   testing_text="$(extract_section "$parsed_file" "Testing")"
-  find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
   testing_prose="$(sed -E 's/`[^`]*`//g' <<<"$testing_text")"
   if grep -Eq 'Not run[[:space:]]+[-—:][[:space:]]+.*[[:alnum:]]' <<<"$testing_prose"; then
-    printf 'PASS workflow PR body\n'
-    return
-  fi
-  if grep -Eq 'Not run([[:space:]]|$)' <<<"$testing_prose"; then
+    testing_valid=1
+  elif grep -Eq 'Not run([[:space:]]|$)' <<<"$testing_prose"; then
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
     fail "PR body Testing Not run requires a reason"
     return
-  fi
-  if grep -Eq '`[^`]+`' <<<"$testing_text"; then
+  elif grep -Eq '`[^`]+`' <<<"$testing_text"; then
     if grep -Eiq '(^|[[:space:]:—-])(pass(ed)?|fail(ed)?|result[[:space:]]*:|rc[=:[:space:]]|exit[[:space:]]+[0-9]+|blocked|skipped)([[:space:].,;:()=—-]|$)' <<<"$testing_prose"; then
-      printf 'PASS workflow PR body\n'
+      testing_valid=1
+    else
+      find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+      fail "PR body Testing command requires an observed result"
       return
     fi
-    fail "PR body Testing command requires an observed result"
+  else
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    fail "PR body Testing must list an exact command or Not run — reason"
     return
   fi
 
-  fail "PR body Testing must list an exact command or Not run — reason"
+  if ((testing_valid)); then
+    if evidence_error="$(validate_evidence "$parsed_file" "$expected_base" "$expected_head" \
+      "$expected_route_head" "$expected_route_base" "$strict" 2>&1)"; then
+      evidence_rc=0
+    else
+      evidence_rc=$?
+    fi
+    find "$parsed_file" -maxdepth 0 -delete >/dev/null 2>&1 || true
+    if ((evidence_rc != 0)); then
+      fail "PR body $evidence_error"
+      return
+    fi
+    printf 'PASS workflow PR body\n'
+  fi
+}
+
+check_evidence_append() {
+  local old_body="$1" new_body="$2" state old_parsed new_parsed old_evidence new_evidence
+  local old_lines new_lines
+
+  if [[ ! -f "$old_body" || ! -r "$old_body" || ! -f "$new_body" || ! -r "$new_body" ]]; then
+    infra "cannot read PR bodies for append-only evidence validation"
+    return
+  fi
+  state="$(mktemp -d)" || {
+    infra "cannot create append-only evidence state"
+    return
+  }
+  old_parsed="$state/old.parsed"
+  new_parsed="$state/new.parsed"
+  old_evidence="$state/old.evidence"
+  new_evidence="$state/new.evidence"
+  if ! strip_nonprose_markdown "$old_body" > "$old_parsed" ||
+     ! strip_nonprose_markdown "$new_body" > "$new_parsed" ||
+     ! extract_section "$old_parsed" "Evidence" | awk '/[^[:space:]]/' > "$old_evidence" ||
+     ! extract_section "$new_parsed" "Evidence" | awk '/[^[:space:]]/' > "$new_evidence"; then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    infra "cannot compare append-only PR evidence"
+    return
+  fi
+  old_lines="$(wc -l < "$old_evidence" | tr -d '[:space:]')"
+  new_lines="$(wc -l < "$new_evidence" | tr -d '[:space:]')"
+  if ((new_lines == 0 || new_lines < old_lines)); then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    fail "PR evidence update changed or erased a prior cycle"
+    return
+  fi
+  # An old body whose exact Evidence section holds no nonblank line has no prior cycle to
+  # preserve, so one bootstrap may seed Cycle 1. The caller validates the replacement against
+  # the current base, head, and route before this check, and the byte-prefix rule below binds
+  # every later update, so a bootstrap can neither rerun nor erase recorded evidence.
+  if ((old_lines == 0)); then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    printf 'PASS workflow append-only evidence bootstrap\n'
+    return
+  fi
+  if ! awk '
+    NR == FNR { old[++count] = $0; next }
+    FNR <= count && $0 != old[FNR] { changed = 1 }
+    END { exit(changed ? 1 : 0) }
+  ' "$old_evidence" "$new_evidence"; then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    fail "PR evidence update changed or erased a prior cycle"
+    return
+  fi
+  find "$state" -depth -delete >/dev/null 2>&1 || true
+  printf 'PASS workflow append-only evidence\n'
+}
+
+# A first PR body reaches GitHub before any validation can see it, so its latest cycle can end an
+# otherwise canonical result token with comma-adjacent prose. Strict validation then rejects that
+# published cycle permanently, while the append-only prefix rule rejects every correction, so the
+# ledger cannot move in either direction. This check recognizes exactly that repair: the two bodies
+# must hold the same evidence cycle and field topology, every line up to and including the latest
+# cycle heading must be byte-identical, and one to four latest-cycle RED, GREEN, Product mutation, or
+# CI mutation lines may drop a comma and its nonempty trailing prose from behind an exact canonical
+# terminal result token. It proves nothing about the replacement itself: callers must still validate
+# the replacement strictly and require the published body to fail that same validation.
+check_evidence_repair() {
+  local old_body="$1" new_body="$2" state old_parsed new_parsed old_evidence new_evidence
+  local old_lines new_lines repair_error repair_rc=0
+
+  if [[ ! -f "$old_body" || ! -r "$old_body" || ! -f "$new_body" || ! -r "$new_body" ]]; then
+    infra "cannot read PR bodies for bounded evidence repair"
+    return
+  fi
+  state="$(mktemp -d)" || {
+    infra "cannot create bounded evidence repair state"
+    return
+  }
+  old_parsed="$state/old.parsed"
+  new_parsed="$state/new.parsed"
+  old_evidence="$state/old.evidence"
+  new_evidence="$state/new.evidence"
+  if ! strip_nonprose_markdown "$old_body" > "$old_parsed" ||
+     ! strip_nonprose_markdown "$new_body" > "$new_parsed" ||
+     ! extract_section "$old_parsed" "Evidence" | awk '/[^[:space:]]/' > "$old_evidence" ||
+     ! extract_section "$new_parsed" "Evidence" | awk '/[^[:space:]]/' > "$new_evidence"; then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    infra "cannot compare PR evidence for bounded repair"
+    return
+  fi
+  old_lines="$(wc -l < "$old_evidence" | tr -d '[:space:]')"
+  new_lines="$(wc -l < "$new_evidence" | tr -d '[:space:]')"
+  if ((old_lines == 0 || new_lines == 0 || old_lines != new_lines)); then
+    find "$state" -depth -delete >/dev/null 2>&1 || true
+    fail "PR evidence repair requires the identical published cycle and field topology"
+    return
+  fi
+  if repair_error="$(awk '
+    function reject(message) {
+      if (error == "") error = message
+    }
+    function canonical_result(name) {
+      if (name == "RED" || name == "Product mutation" || name == "CI mutation") {
+        return "rc=1 classification=assertion-failure"
+      }
+      if (name == "GREEN") return "rc=0 classification=success"
+      return ""
+    }
+    function repaired(old_line, new_line,   field, separator, name, value, token, offset, deleted) {
+      if (substr(new_line, 1, 2) != "- ") return 0
+      field = substr(new_line, 3)
+      separator = index(field, ": ")
+      if (separator == 0) return 0
+      name = substr(field, 1, separator - 1)
+      value = substr(field, separator + 2)
+      token = canonical_result(name)
+      if (token == "") return 0
+      offset = length(value) - length(token)
+      if (offset < 0 || substr(value, offset + 1) != token) return 0
+      if (offset > 0 && substr(value, offset, 1) != " ") return 0
+      if (substr(old_line, 1, length(new_line)) != new_line) return 0
+      deleted = substr(old_line, length(new_line) + 1)
+      if (substr(deleted, 1, 1) != ",") return 0
+      return substr(deleted, 2) ~ /[^[:space:]]/
+    }
+    # The caller already proved both ledgers hold the same nonzero number of nonblank lines, so the
+    # first file is never empty and the two arrays are always the same length here.
+    NR == FNR { published[++published_count] = $0; next }
+    { replacement[++replacement_count] = $0 }
+    END {
+      for (position = 1; position <= published_count; position++) {
+        if (published[position] ~ /^### Cycle [1-9][0-9]*$/) latest = position
+      }
+      if (latest == 0) reject("requires one published cycle to correct")
+      for (position = 1; position <= published_count && error == ""; position++) {
+        if (published[position] == replacement[position]) continue
+        if (position <= latest) {
+          reject("cannot change any line before the latest cycle")
+        } else if (!repaired(published[position], replacement[position])) {
+          reject("must delete only a comma and its trailing prose after an exact canonical latest-cycle result")
+        } else {
+          repairs++
+        }
+      }
+      if (error == "" && repairs == 0) {
+        reject("requires at least one corrected latest-cycle result")
+      }
+      if (error == "" && repairs > 4) {
+        reject("cannot correct more than four latest-cycle results")
+      }
+      if (error != "") {
+        print error
+        exit 1
+      }
+    }
+  ' "$old_evidence" "$new_evidence" 2>&1)"; then
+    repair_rc=0
+  else
+    repair_rc=$?
+  fi
+  find "$state" -depth -delete >/dev/null 2>&1 || true
+  if ((repair_rc != 0)); then
+    fail "PR evidence repair ${repair_error:-failed}"
+    return
+  fi
+  printf 'PASS workflow bounded evidence repair\n'
 }
 
 check_commits() {
-  local base="$1" base_oid integration_oid revisions hash author_name author_email
+  local base="$1" branch_name expected_base base_oid integration_oid revisions hash author_name author_email
   local subject message trailers ancestry_rc=0 count=0
 
   if ! command -v git >/dev/null 2>&1; then
     infra "cannot inspect commits without git"
     return
   fi
+  if ! branch_name="$(git branch --show-current 2>/dev/null)" || [[ -z "$branch_name" ]]; then
+    infra "cannot inspect current branch"
+    return
+  fi
+  expected_base="$(expected_commit_base "$branch_name")" || {
+    fail "commit range is not authorized from branch: $branch_name"
+    return
+  }
+  if [[ -z "$base" ]]; then
+    base="$expected_base"
+  fi
   if ! base_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify "${base}^{commit}" 2>/dev/null)"; then
     infra "invalid base: $base"
     return
   fi
-  if ! integration_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'origin/dev^{commit}' 2>/dev/null)"; then
-    infra "cannot resolve origin/dev"
+  if ! integration_oid="$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify "${expected_base}^{commit}" 2>/dev/null)"; then
+    infra "cannot resolve $expected_base"
     return
   fi
   if [[ "$base_oid" != "$integration_oid" ]]; then
-    fail "commit base must resolve to origin/dev: $base"
+    fail "commit base must resolve to $expected_base: $base"
     return
   fi
   if ! GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1; then
@@ -458,23 +929,39 @@ main() {
       ;;
     commits)
       (($# <= 1)) || { usage; return; }
-      check_commits "${1:-origin/dev}"
+      check_commits "${1:-}"
       ;;
     pr-title)
       (($# == 1)) || { usage; return; }
       check_pr_title "$1"
       ;;
     pr-body)
-      (($# == 1)) || { usage; return; }
-      check_pr_body "$1"
+      (($# == 1 || $# == 3 || $# == 5)) || { usage; return; }
+      check_pr_body 0 "$@"
+      ;;
+    pr-body-strict)
+      (($# == 1 || $# == 3 || $# == 5)) || { usage; return; }
+      check_pr_body 1 "$@"
+      ;;
+    evidence-append)
+      (($# == 2)) || { usage; return; }
+      check_evidence_append "$@"
+      ;;
+    evidence-repair)
+      (($# == 2)) || { usage; return; }
+      check_evidence_repair "$@"
       ;;
     pr-base)
       (($# == 1)) || { usage; return; }
       check_pr_base "$1"
       ;;
+    pr-route)
+      (($# == 2)) || { usage; return; }
+      check_pr_route "$1" "$2"
+      ;;
     all)
       (($# <= 1)) || { usage; return; }
-      check_all "${1:-origin/dev}"
+      check_all "${1:-}"
       ;;
     *)
       usage

@@ -74,6 +74,12 @@ secrets mount, credentials, proxy environment, Docker socket, or ports.
 Every bind is private and non-recursive. A metadata-only preflight fails closed on child mounts or
 nested Git metadata before an agent-controlled process starts.
 
+The ignored `proj/` tree is writable collaboration state for cooperating host-side development
+agents. Preflight requires ordinary directories and singly linked regular files in its current tree.
+Concurrent host-side writers are trusted to preserve that object contract. The check is a startup
+snapshot, not a continuous monitor; a hostile host writer racing or mutating it after inspection is
+outside the container-containment guarantee and would require brokered storage to bring into scope.
+
 The image pins Serena source and preinstalls its pinned Bash language server and ShellCheck during
 the explicit build. At runtime the managed language-server directory is an immutable image path
 linked into tmpfs state; an unexpected install attempt therefore fails rather than opening egress.
