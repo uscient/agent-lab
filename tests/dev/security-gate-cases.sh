@@ -252,6 +252,7 @@ adapter-idempotence tests/agent/render-adapters-idempotence.sh PASS generated ad
 serena-config tests/serena/config-cases.sh SUMMARY failures=0
 policy-probe tests/agent/policy-verify.sh SUMMARY pass=80 fail=0 skip=0
 containment-static tools/containment-lint.sh containment-lint: 0 fail, 0 warn
+g1-audit-regression tests/flow/g1-contract-growth/plan-authority/audit-regression.sh AUDIT REGRESSION PASS
 EOF
 actual_suites="$work/actual-fast-suites"
 awk '$1 == "suite" { $1 = ""; sub(/^ /, ""); print }' "$default_manifest" > "$actual_suites"
