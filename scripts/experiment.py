@@ -2061,6 +2061,112 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
     }
 
 
+def expected_plan_v0alpha2(manifest: object, contract_digest: str) -> dict[str, object]:
+    """Derive, in Python, the plan the pinned CUE must produce for a manifest.
+
+    This exists to disagree. cue_plan_v0alpha2 compares the projection the
+    pinned CUE actually emitted against this derivation and refuses the result
+    if they differ, so a contract edit that quietly changes what a manifest
+    means has to be made identically in two places by two different mechanisms
+    before it can pass unnoticed.
+
+    Every list is sorted here exactly as the contract sorts it. An authority
+    block appears only when the manifest declares one -- deriving an empty one
+    would be inventing authority nobody authored, and would let a plan the
+    contract left unauthorised look complete.
+    """
+    try:
+        assert isinstance(manifest, dict)
+        if set(manifest) != {"apiVersion", "kind", "metadata", "spec"}:
+            raise KeyError("top-level field drift")
+        metadata = manifest["metadata"]
+        specification = manifest["spec"]
+        assert isinstance(metadata, dict) and isinstance(specification, dict)
+        if set(metadata) != {"name"}:
+            raise KeyError("metadata field drift")
+        if not {"members"} <= set(specification) or not set(specification) <= {
+            "members",
+            "secrets",
+            "authority",
+        }:
+            raise KeyError("spec field drift")
+
+        raw_secrets = specification.get("secrets", [])
+        assert isinstance(raw_secrets, list)
+        secrets = []
+        for secret in raw_secrets:
+            if not isinstance(secret, dict) or set(secret) != {"name", "reference"}:
+                raise KeyError("secret field drift")
+            secrets.append({"name": secret["name"], "reference": secret["reference"]})
+        secrets.sort(key=lambda secret: str(secret["name"]))
+
+        raw_members = specification["members"]
+        assert isinstance(raw_members, list)
+        members = []
+        for member in raw_members:
+            if (
+                not isinstance(member, dict)
+                or not {"name", "image"} <= set(member)
+                or not set(member)
+                <= {"name", "image", "command", "resourceClass", "secretGrants"}
+            ):
+                raise KeyError("member field drift")
+            selector = member["image"]
+            if not isinstance(selector, dict) or set(selector) not in (
+                {"digestRef"},
+                {"catalogName"},
+            ):
+                raise KeyError("unresolved selector")
+            grants = member.get("secretGrants", [])
+            assert isinstance(grants, list)
+            members.append({
+                "command": member.get("command", []),
+                "name": member["name"],
+                "requestedSelector": selector,
+                "resourceClass": member.get("resourceClass", "small"),
+                "secretGrants": sorted(str(grant) for grant in grants),
+            })
+        members.sort(key=lambda member: str(member["name"]))
+
+        specification_out: dict[str, object] = {"members": members, "secrets": secrets}
+
+        if "authority" in specification:
+            authority = specification["authority"]
+            if not isinstance(authority, dict) or set(authority) != {"install"}:
+                raise KeyError("authority field drift")
+            install = authority["install"]
+            if not isinstance(install, dict) or set(install) != {
+                "principal",
+                "assurance",
+                "secrets",
+            }:
+                raise KeyError("install authority field drift")
+            bound = install["secrets"]
+            assert isinstance(bound, list)
+            specification_out["authority"] = {
+                "install": {
+                    "assurance": install["assurance"],
+                    "principal": install["principal"],
+                    "secrets": sorted(str(name) for name in bound),
+                }
+            }
+
+        name = metadata["name"]
+    except (AssertionError, KeyError, TypeError) as error:
+        raise InfrastructureError("CUE accepted an input with an unexpected shape") from error
+    return {
+        "apiVersion": "agent-lab.request/v0alpha2",
+        "contract": {
+            "digest": f"sha256:{contract_digest}",
+            "name": "agent-lab.experiment",
+            "version": "v0alpha2",
+        },
+        "kind": "RequestedExperimentPlan",
+        "metadata": {"requestedName": name},
+        "spec": specification_out,
+    }
+
+
 def image_reference_module():
     path = Path(__file__).resolve().with_name("image_reference.py")
     spec = spec_from_file_location("agent_lab_image_reference", path)
