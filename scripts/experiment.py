@@ -91,6 +91,25 @@ AUTHORIZATION_FILES = tuple(
         )
     )
 )
+CONTRACT_FILES_V0ALPHA2 = tuple(
+    sorted(
+        (
+            "contracts/experiment/v0alpha2/cue.mod/module.cue",
+            "contracts/experiment/v0alpha2/plan.cue",
+            "contracts/experiment/v0alpha2/schema.cue",
+            "tools/cue.lock",
+        )
+    )
+)
+AUTHORIZATION_FILES_V0ALPHA2 = tuple(
+    sorted(
+        (
+            "authorization/experiment/v0alpha2/operator.cedar",
+            "authorization/experiment/v0alpha2/schema.cedarschema",
+            "tools/cedar.lock",
+        )
+    )
+)
 CEDAR_HELPER = "scripts/dev/cedar-tool.py"
 AUTHORIZATION_DIGEST_DOMAIN = b"agent-lab.authorization-contract.v1\0"
 CEDAR_VALIDATION_SUCCESS = (
@@ -1852,6 +1871,82 @@ def contract_snapshot(repo_root: Path) -> tuple[str, dict[str, bytes]]:
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
     return digest.hexdigest(), files
+
+
+def contract_snapshot_v0alpha2(repo_root: Path) -> tuple[str, dict[str, bytes]]:
+    """Snapshot the successor contract and digest it.
+
+    Deliberately a separate function from contract_snapshot rather than a
+    parameterised one. The v0alpha1 path is verified and frozen; sharing a body
+    would put every future successor change one editing mistake away from
+    altering how already-installed legacy evidence digests.
+    """
+    files: dict[str, bytes] = {}
+    digest = hashlib.sha256(CONTRACT_DIGEST_DOMAIN)
+    for name in CONTRACT_FILES_V0ALPHA2:
+        data = stable_file_bytes(
+            repo_root / name,
+            MAX_CONTRACT_FILE_BYTES,
+            "contract snapshot",
+        )
+        files[name] = data
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest(), files
+
+
+def _cedar_effects(text: str) -> list[str]:
+    """Return the effect keyword of every policy in authored Cedar text.
+
+    Comments and string literals are removed first so that the word "permit"
+    inside an annotation, an id, or a comment cannot be mistaken for an effect
+    -- or used to hide one.
+    """
+    out: list[str] = []
+    cleaned: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            index += 1
+            while index < length:
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            cleaned.append(" ")
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "/":
+            while index < length and text[index] != "\n":
+                index += 1
+            continue
+        cleaned.append(char)
+        index += 1
+    for match in re.finditer(r"\b(permit|forbid)\s*\(", "".join(cleaned)):
+        out.append(match.group(1))
+    return out
+
+
+def authored_policy_is_forbid_only(text: str) -> bool:
+    """Report whether authored Cedar text only ever subtracts authority.
+
+    Authored policy is untrusted input: an operator may narrow what the
+    repository's own policy permits, never widen it. A single permit makes the
+    whole document unusable for that purpose.
+
+    Fail closed. Text with no recognisable effect at all -- empty, truncated, or
+    unparseable -- is not forbid-only, because "nothing was found" and "nothing
+    grants" are the same observation here and only one of them is safe.
+    """
+    effects = _cedar_effects(text)
+    return bool(effects) and all(effect == "forbid" for effect in effects)
 
 
 def verify_contract_snapshot(repo_root: Path, expected: dict[str, bytes]) -> None:
