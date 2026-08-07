@@ -9,23 +9,21 @@ Repo: `https://github.com/uscient/agent-lab` · authoritative branch: `dev`
 ## Prime directives
 
 - **Use the branch-derived route.** `dev`, `flow`, `master`, and `main` are protected. Ordinary and
-  `work/*` branches PR to `dev`. A `group/<group>` branch starts at `origin/flow`,
-  receives changes only through matching group-slice PRs, and PRs to `flow`;
-  `<group>` is at most 48 chars and matches
-  `[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*`. Legacy
-  `slice/<work>/<slice>` and `slice/group/<group>/<slice>` target only their
-  matching parent.
+  `work/*` branches PR to `dev` — the route for all new work. The `group/<group>`→`flow` program
+  topology is **dormant**: still guard-enforced, but do not open new Group work. A Group branch
+  receives changes only through matching group-slice PRs; `<group>` is at most 48 chars matching
+  `[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*`; `slice/<work>/<slice>` and `slice/group/<group>/<slice>`
+  target only their matching parent.
 - **Integrate through PRs; retain history.** Local merge/rebase is allowed on ordinary work branches.
   `scripts/dev/workstream merge` is the sole agent merge into a reserved parent: verified
   slice→work, group-slice→group, or accepted group→`flow`. It requires current-base successful checks
   and a merge commit. Humans alone merge final PRs into `dev`. Never push, commit, Git-merge, or
   rebase a protected branch.
 - **Sync without erasing accepted merges.** Use `scripts/dev/workstream sync` on workstreams and
-  slices. Because Group branches are PR-only, use `scripts/dev/workstream group-sync` from the exact
-  Group branch to prepare a derived `slice/group/<group>/sync-flow-<sha>` merge, then integrate that
-  slice through its PR. Program groups and group slices may never be rebased or force-updated;
-  legacy slices may rebase only on their matching parent. Replay evidence after every sync. Never
-  squash accepted history or delete integration branches/PR evidence.
+  slices; `group-sync` prepares the PR-only Group merge while that topology stays dormant. Never
+  rebase or force-update program groups or group slices; legacy slices rebase only on their matching
+  parent. Replay evidence after every sync. Never squash accepted history or delete integration
+  branches/PR evidence.
 - **Don't edit the rails** (`AGENTS.md`, `policy/`, guards, protected workflow/helper/check paths, or
   tool configuration) unless explicitly doing maintenance (`AGENT_LAB_MAINTENANCE=1`).
 - **Never inspect or change GitHub authentication, credentials, tokens, account settings, or Git
@@ -74,14 +72,14 @@ containment (`SECURITY.md`, `THREAT_MODEL.md`).
 ## Authority
 
 - `AGENTS.md` is the sole operating-policy source for agents developing this repository.
-- GitHub governs integration. Humans freeze `dev`, create/protect `flow` at the exact closure commit
-  containing R0, and hold it until CI/CodeQL and protection pass. They own `dev` merges, releases,
-  settings, auth, policy.
+- GitHub governs integration. Humans own `dev` merges, releases, settings, auth, and policy, and
+  create/protect `flow` only at the exact closure commit containing R0 — still CI-enforced, though
+  the program topology it serves is dormant.
 - Agents may publish their current branch, open only its derived PR route, and perform only the
   verified intermediate merges above. Explicit rail maintenance requires `AGENT_LAB_MAINTENANCE=1`.
 
-Done = the scoped verified slice/group integration is complete, or the final PR to `dev` is
-open, plus a short handoff. Humans merge every final PR into `dev`.
+Done = the scoped verified change is merged, or its PR to `dev` is open, plus a short handoff.
+Humans merge every final PR into `dev`.
 
 ---
-_Updated 2026-08-04_
+_Updated 2026-08-07_
