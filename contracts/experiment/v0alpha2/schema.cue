@@ -45,10 +45,14 @@ import (
 	secretGrants:  *[] | (list.MaxItems(32) & list.UniqueItems() & [...#Grant])
 })
 
+// Required fields, not supplied ones. A bare `assurance: "declared"` is a
+// value CUE fills in when the author omits it, which would put authority into
+// the projection that nobody wrote -- the exact thing `authority?` being
+// optional is meant to prevent one level up.
 #InstallAuthority: close({
-	principal: #Name
-	assurance: "declared"
-	secrets:   list.MaxItems(32) & list.UniqueItems() & [...#Grant]
+	principal!: #Name
+	assurance!: "declared"
+	secrets!:   list.MaxItems(32) & list.UniqueItems() & [...#Grant]
 })
 
 #Authority: close({
