@@ -38,7 +38,9 @@ contractDigest: string & =~"^sha256:[0-9a-f]{64}$" @tag(contractDigest)
 				install: close({
 					principal: manifest.spec.authority.install.principal
 					assurance: manifest.spec.authority.install.assurance
-					secrets:   list.Sort(manifest.spec.authority.install.secrets, list.Ascending)
+					secrets: [for name in list.Sort(manifest.spec.authority.install.secrets, list.Ascending) {
+						name & or([for secret in manifest.spec.secrets {secret.name}])
+					}]
 				})
 			})
 		}
@@ -52,7 +54,12 @@ contractDigest: string & =~"^sha256:[0-9a-f]{64}$" @tag(contractDigest)
 			requestedSelector: member.image
 			command:           member.command
 			resourceClass:     member.resourceClass
-			secretGrants:      list.Sort(member.secretGrants, list.Ascending)
+			// Unified against the declared set here, in the projected value.
+			// The same rule lived in a hidden field before, and `cue export -e
+			// #Plan` never referenced it, so it was never evaluated.
+			secretGrants: [for grant in list.Sort(member.secretGrants, list.Ascending) {
+				grant & or([for secret in manifest.spec.secrets {secret.name}])
+			}]
 		}]
 	})
 })
