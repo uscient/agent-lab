@@ -35,13 +35,13 @@ replacement for `dev`. The exact route is derived from the branch:
 | ordinary branch | `origin/dev` | `dev` | human |
 | `work/<work>` | merge `origin/dev` with `sync` | `dev` | human |
 | `slice/<work>/<slice>` | `origin/work/<work>` | `work/<work>` | verified helper |
-| `group/<group>` | merge `origin/flow` with `sync` | `flow` | verified helper after approval |
+| `group/<group>` | PR-only `group-sync` slice from `origin/flow` | `flow` | verified helper |
 | `slice/group/<group>/<slice>` | merge `origin/group/<group>` with `sync` | `group/<group>` | verified helper |
 | protected `flow` | none | `dev` | human |
 
 `<group>` matches `[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*`; `group` in the group-slice form is
 literal. `dev`, `flow`, `master`, and `main` are protected. Do not commit, push, Git-merge, or rebase
-them directly. An agent may inspect `flow`, use the verified helper to merge an approved group PR
+them directly. An agent may inspect `flow`, use the verified helper to merge an accepted Group PR
 remotely, and open the final draft `flow` → `dev` PR; only a human merges that final PR.
 
 For each writable branch:
@@ -49,12 +49,13 @@ For each writable branch:
 1. Start at its current permitted base and make focused changes.
 2. Run applicable behavior, security, and mutation evidence.
 3. Fetch and incorporate only the exact base in the table. Use `scripts/dev/workstream sync` for a
-   reserved workstream, group, or slice branch.
+   reserved workstream or slice branch. For a Group, use `group-sync` and integrate its derived
+   synchronization slice by PR because Group branches are PR-only.
 4. Replay invalidated evidence after a rebase, dependency merge, workflow change, or manifest change.
 5. Push only the same-named branch. Use `--force-with-lease` only after an allowed non-program
-   rebase; program groups and group slices are merge-preserving and never force-updated.
+   rebase; program Groups and Group slices are merge-preserving and never force-updated.
 6. Open only the derived PR route. Agents integrate only verified slice→work, group-slice→group, and
-   approved group→`flow` PRs through `scripts/dev/workstream merge`.
+   accepted group→`flow` PRs through `scripts/dev/workstream merge`.
 7. Preserve merge commits, branches, PR records, and evidence through final review. Humans merge every
    ordinary, workstream, or `flow` final PR into `dev`.
 
@@ -106,6 +107,7 @@ Run the local convention checks from the repository root:
 ./scripts/dev/workflow-check pr-route group/g0-operator-surface flow
 ./scripts/dev/workflow-check pr-body .cache/dev/pr-body.md BASE_SHA HEAD_SHA HEAD_REF BASE_REF
 ./scripts/dev/workflow-check evidence-append .cache/dev/old-body.md .cache/dev/pr-body.md
+./scripts/dev/workflow-check evidence-repair .cache/dev/old-body.md .cache/dev/pr-body.md
 ./scripts/dev/workflow-check all
 ```
 
@@ -113,7 +115,15 @@ Run the local convention checks from the repository root:
 branch. `pr-body` validates the latest evidence cycle against the supplied current PR base, head, and
 route; CI supplies those identities from the event, and the intermediate merge helper rechecks them
 before integration. `evidence-append` proves every prior nonblank evidence line remains an exact
-prefix. If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
+prefix. `evidence-repair` recognizes only the bounded correction of a published invalid latest
+cycle: identical cycle and field topology, byte-identical lines through the latest cycle heading,
+and one to four `RED`, `GREEN`, `Product mutation`, or `CI mutation` lines that drop a comma and its
+nonempty trailing prose from behind an exact canonical terminal result token. It proves nothing
+about the replacement, so `scripts/dev/workstream evidence` pairs it with strict validation of the
+replacement and uses it only while the published body still fails that same validation. The required
+workflow applies that identical pairing to the `pull_request` `edited` event against the event base,
+head, and route, so a repair edit completes its own exact-head hosted campaign in that one run.
+If supplied, an explicit base must resolve to that same derived ref; callers cannot narrow
 the range to hide introduced commits. `all` checks only the branch and every introduced non-merge
 commit. Run the applicable `pr-*` commands separately; `pr-base` derives the expected base from the
 current branch, while `pr-route` can check an explicit head/base pair. The fast gate exercises this

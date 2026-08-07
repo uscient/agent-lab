@@ -22,6 +22,7 @@ fake_bin="$work/bin"
 mkdir -p "$fake_bin"
 gh_log="$work/gh.log"
 merged_marker="$work/merged"
+ready_marker="$work/ready"
 cat > "$fake_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -34,9 +35,15 @@ case "$1 $2" in
     elif [ -n "${WORKSTREAM_UPDATED_BODY:-}" ] && [ -f "$WORKSTREAM_UPDATED_BODY" ]; then
       /usr/bin/jq -c --rawfile body "$WORKSTREAM_UPDATED_BODY" '.body = $body' \
         <<<"$WORKSTREAM_PR_JSON"
+    elif [ -n "${WORKSTREAM_READY_MARKER:-}" ] && [ -f "$WORKSTREAM_READY_MARKER" ]; then
+      /usr/bin/jq -c '.isDraft = false' <<<"$WORKSTREAM_PR_JSON"
     else
       printf '%s\n' "$WORKSTREAM_PR_JSON"
     fi
+    ;;
+  "pr ready")
+    [ -n "${WORKSTREAM_READY_MARKER:-}" ] || exit 97
+    : > "$WORKSTREAM_READY_MARKER"
     ;;
   "pr merge") exit 96 ;;
   "pr edit")
@@ -137,7 +144,7 @@ git -C "$route_fixture" add scripts/dev/workstream scripts/dev/workflow-check
 git -C "$route_fixture" -c user.name=test -c user.email=test@example.invalid \
   commit -qm fixture
 fixture_oid="$(git -C "$route_fixture" rev-parse HEAD)"
-printf 'scripts/dev/workstream-*\n' > "$route_fixture/.git/info/exclude"
+printf 'scripts/dev/workstream-*\nscripts/dev/workflow-check-*\n' > "$route_fixture/.git/info/exclude"
 git -C "$route_fixture" update-ref refs/heads/slice/demo/format "$fixture_oid"
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/slice/demo/format
 : > "$gh_log"
@@ -165,6 +172,7 @@ if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
 else
   fail "group slice PR routing derives the matching group base"
 fi
+git -C "$route_fixture" update-ref refs/heads/group/g0-operator-surface "$fixture_oid"
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/group/g0-operator-surface
 : > "$gh_log"
 if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
@@ -174,6 +182,48 @@ if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
   pass "group PR routing is fixed to flow and remains draft"
 else
   fail "group PR routing is fixed to flow and remains draft"
+fi
+group_ready_json="$(printf '%s' "$valid_json" | jq -c \
+  '.baseRefName="flow" | .headRefName="group/g0-operator-surface" | .isDraft=true')"
+find "$ready_marker" -maxdepth 0 -delete >/dev/null 2>&1 || true
+: > "$gh_log"
+if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
+  WORKSTREAM_PR_JSON="$group_ready_json" WORKSTREAM_READY_MARKER="$ready_marker" \
+  WORKSTREAM_MERGED_MARKER="$merged_marker" \
+  "$route_fixture/scripts/dev/workstream" ready 17 >/dev/null \
+  && grep -Fxq 'pr ready 17 --repo github.com/uscient/agent-lab' "$gh_log"; then
+  pass "verified helper makes only the exact current Group PR ready"
+else
+  fail "verified helper makes only the exact current Group PR ready"
+fi
+group_slice_ready_json="$(printf '%s' "$valid_json" | jq -c '
+  .baseRefName="group/g0-operator-surface" |
+  .headRefName="slice/group/g0-operator-surface/format" | .isDraft=true')"
+git -C "$route_fixture" update-ref \
+  refs/heads/slice/group/g0-operator-surface/format "$fixture_oid"
+git -C "$route_fixture" symbolic-ref HEAD refs/heads/slice/group/g0-operator-surface/format
+find "$ready_marker" -maxdepth 0 -delete >/dev/null 2>&1 || true
+: > "$gh_log"
+if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
+  WORKSTREAM_PR_JSON="$group_slice_ready_json" WORKSTREAM_READY_MARKER="$ready_marker" \
+  WORKSTREAM_MERGED_MARKER="$merged_marker" \
+  "$route_fixture/scripts/dev/workstream" ready 17 >/dev/null \
+  && grep -Fxq 'pr ready 17 --repo github.com/uscient/agent-lab' "$gh_log"; then
+  pass "verified helper makes only the exact matching Group-slice PR ready"
+else
+  fail "verified helper makes only the exact matching Group-slice PR ready"
+fi
+git -C "$route_fixture" symbolic-ref HEAD refs/heads/work/demo
+: > "$gh_log"
+if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
+  WORKSTREAM_PR_JSON="$group_ready_json" WORKSTREAM_READY_MARKER="$ready_marker" \
+  WORKSTREAM_MERGED_MARKER="$merged_marker" \
+  "$route_fixture/scripts/dev/workstream" ready 17 >/dev/null 2>&1; then
+  fail "ready helper rejects non-Group branches"
+elif ! grep -q '^pr ready ' "$gh_log"; then
+  pass "ready helper rejects non-Group branches"
+else
+  fail "ready helper rejects non-Group branches"
 fi
 git -C "$route_fixture" symbolic-ref HEAD \
   refs/heads/group/g0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -233,6 +283,10 @@ cp "$repo_root/scripts/dev/workflow-check" "$sync_fixture/scripts/dev/workflow-c
 chmod +x "$sync_fixture/scripts/dev/workstream"
 chmod +x "$sync_fixture/scripts/dev/workflow-check"
 git -C "$sync_fixture" init -q || infra "cannot create sync fixture"
+git -C "$sync_fixture" config user.name fixture \
+  || infra "cannot set disposable sync fixture name"
+git -C "$sync_fixture" config user.email fixture@example.invalid \
+  || infra "cannot set disposable sync fixture email"
 git -C "$sync_fixture" add scripts/dev/workstream scripts/dev/workflow-check
 git -C "$sync_fixture" -c user.name=test -c user.email=test@example.invalid \
   commit -qm base || infra "cannot commit sync fixture"
@@ -254,16 +308,135 @@ git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
 accepted_oid="$(git -C "$sync_producer" rev-parse HEAD)"
 git -C "$sync_producer" push -q origin group/g0-operator-surface \
   || infra "cannot publish accepted merge fixture"
+git -C "$sync_producer" switch -q -c flow --track origin/flow \
+  || infra "cannot prepare moving flow fixture"
+git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
+  commit --allow-empty -qm flow || infra "cannot advance flow fixture"
+flow_oid="$(git -C "$sync_producer" rev-parse HEAD)"
+git -C "$sync_producer" push -q origin flow || infra "cannot publish moving flow fixture"
+stale_group_oid="$(git -C "$sync_fixture" rev-parse HEAD)"
+: > "$sync_trace"
 if GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
-  "$sync_fixture/scripts/dev/workstream" sync >/dev/null 2>&1 \
-  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$accepted_oid" ] \
-  && grep -Fq 'merge --ff-only origin/group/g0-operator-surface' "$sync_trace" \
-  && grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace" \
-  && ! grep -Fq 'rebase origin/flow' "$sync_trace"; then
-  pass "sync recovers accepted remote merges before preserving parent ancestry"
+  "$sync_fixture/scripts/dev/workstream" sync >/dev/null 2>&1; then
+  fail "Group sync cannot update a PR-only Group branch directly"
+elif [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$stale_group_oid" ] &&
+     ! grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace"; then
+  pass "Group sync cannot update a PR-only Group branch directly"
 else
-  fail "sync recovers accepted remote merges before preserving parent ancestry"
+  fail "Group sync cannot update a PR-only Group branch directly"
 fi
+: > "$sync_trace"
+sync_branch="slice/group/g0-operator-surface/sync-flow-${flow_oid:0:12}"
+if GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
+  "$sync_fixture/scripts/dev/workstream" group-sync >/dev/null 2>&1 \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = "$sync_branch" ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD^1)" = "$accepted_oid" ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD^2)" = "$flow_oid" ] \
+  && [ "$(git --git-dir="$sync_origin" rev-parse refs/heads/group/g0-operator-surface)" = "$accepted_oid" ] \
+  && ! git --git-dir="$sync_origin" show-ref --verify --quiet "refs/heads/$sync_branch"; then
+  pass "PR-only Group sync preserves accepted merges and both moving-parent histories"
+else
+  fail "PR-only Group sync preserves accepted merges and both moving-parent histories"
+fi
+
+sync_stdout="$work/group-sync.out"
+sync_stderr="$work/group-sync.err"
+group_sync_refuses() {
+  local expected="$1" rc=0
+  : > "$sync_trace"
+  GIT_TRACE="$sync_trace" PATH="$hostile_bin:$fake_bin:/usr/bin:/bin" \
+    "$sync_fixture/scripts/dev/workstream" group-sync \
+    > "$sync_stdout" 2> "$sync_stderr" || rc=$?
+  [ "$rc" -eq 1 ] && grep -Fq "REFUSE workstream: $expected" "$sync_stderr"
+}
+local_branch_absent() {
+  ! git -C "$sync_fixture" show-ref --verify --quiet "refs/heads/$1"
+}
+advance_flow_fixture() {
+  git -C "$sync_producer" switch -q flow || infra "cannot return to the flow fixture"
+  git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
+    commit --allow-empty -qm "$1" || infra "cannot advance flow fixture"
+  git -C "$sync_producer" push -q origin flow || infra "cannot publish flow fixture"
+  git -C "$sync_producer" rev-parse HEAD
+}
+# Each refusal below owns a distinct flow head and starts from a restored Group
+# checkout so one broken refusal cannot cascade into the others.
+restore_group_checkout() {
+  git -C "$sync_fixture" checkout -q --force group/g0-operator-surface \
+    || infra "cannot return to the group fixture"
+}
+
+# The synchronization slice is not a Group branch, so it may not re-enter group-sync.
+if group_sync_refuses 'group-sync requires a group/<id>-<slug> branch' \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = "$sync_branch" ]; then
+  pass "Group sync preparation refuses any branch that is not the exact Group"
+else
+  fail "Group sync preparation refuses any branch that is not the exact Group"
+fi
+restore_group_checkout
+
+flow2_oid="$(advance_flow_fixture flow-contained)"
+git -C "$sync_producer" switch -q group/g0-operator-surface \
+  || infra "cannot switch the producer to the group fixture"
+git -C "$sync_producer" -c user.name=test -c user.email=test@example.invalid \
+  merge --no-ff -qm 'Merge synchronized flow' flow \
+  || infra "cannot contain flow in the group fixture"
+contained_oid="$(git -C "$sync_producer" rev-parse HEAD)"
+git -C "$sync_producer" push -q origin group/g0-operator-surface \
+  || infra "cannot publish the contained group fixture"
+contained_branch="slice/group/g0-operator-surface/sync-flow-${flow2_oid:0:12}"
+if group_sync_refuses 'group/g0-operator-surface already contains current origin/flow' \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ] \
+  && local_branch_absent "$contained_branch" \
+  && ! grep -Fq 'merge --no-ff --no-edit origin/flow' "$sync_trace"; then
+  pass "Group sync refuses an already-contained flow instead of forging an empty merge"
+else
+  fail "Group sync refuses an already-contained flow instead of forging an empty merge"
+fi
+
+restore_group_checkout
+flow3_oid="$(advance_flow_fixture flow-precondition)"
+dirty_branch="slice/group/g0-operator-surface/sync-flow-${flow3_oid:0:12}"
+printf '\n# dirty\n' >> "$sync_fixture/scripts/dev/workflow-check"
+if group_sync_refuses 'the tracked checkout is not clean' \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ] \
+  && local_branch_absent "$dirty_branch"; then
+  pass "Group sync preparation requires a clean Group checkout"
+else
+  fail "Group sync preparation requires a clean Group checkout"
+fi
+
+restore_group_checkout
+flow4_oid="$(advance_flow_fixture flow-local-collision)"
+collision_branch="slice/group/g0-operator-surface/sync-flow-${flow4_oid:0:12}"
+git -C "$sync_fixture" branch "$collision_branch" flow \
+  || infra "cannot seed the local synchronization collision"
+collision_oid="$(git -C "$sync_fixture" rev-parse "$collision_branch")"
+if group_sync_refuses "local synchronization branch already exists: $collision_branch" \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse "$collision_branch")" = "$collision_oid" ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ]; then
+  pass "Group sync refuses a colliding local synchronization branch without rewriting it"
+else
+  fail "Group sync refuses a colliding local synchronization branch without rewriting it"
+fi
+
+restore_group_checkout
+flow5_oid="$(advance_flow_fixture flow-remote-collision)"
+remote_collision_branch="slice/group/g0-operator-surface/sync-flow-${flow5_oid:0:12}"
+git -C "$sync_producer" push -q origin "flow:refs/heads/$remote_collision_branch" \
+  || infra "cannot seed the remote synchronization collision"
+if group_sync_refuses "remote synchronization branch already exists: $remote_collision_branch" \
+  && [ "$(git -C "$sync_fixture" branch --show-current)" = group/g0-operator-surface ] \
+  && [ "$(git -C "$sync_fixture" rev-parse HEAD)" = "$contained_oid" ] \
+  && local_branch_absent "$remote_collision_branch"; then
+  pass "Group sync refuses a colliding published synchronization branch"
+else
+  fail "Group sync refuses a colliding published synchronization branch"
+fi
+
 git -C "$route_fixture" symbolic-ref HEAD refs/heads/flow
 : > "$gh_log"
 if PATH="$fake_bin:/usr/bin:/bin" WORKSTREAM_GH_LOG="$gh_log" \
@@ -340,6 +513,204 @@ if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$append_mutant"; printf 
   pass "append-only evidence sensitivity mutation turns RED"
 else
   fail "append-only evidence sensitivity mutation turns RED"
+fi
+
+# An agent-created PR body can reach GitHub without any Evidence section, so the helper must
+# be able to seed Cycle 1 exactly once without ever relaxing the strict current-evidence gate.
+bootstrap_old_body="$work/bootstrap-old-body.md"
+awk '$0 == "## Evidence" { exit } { print }' "$valid_body" > "$bootstrap_old_body"
+bootstrap_json="$(jq -c --rawfile body "$bootstrap_old_body" '.body = $body' <<<"$valid_json")"
+if run_evidence "$bootstrap_json" "$valid_body" \
+  && cmp -s "$valid_body" "$updated_body_marker" \
+  && grep -Fxq "pr edit 17 --repo github.com/uscient/agent-lab --body-file $valid_body" "$gh_log"; then
+  pass "bounded evidence update bootstraps a first cycle over an empty ledger"
+else
+  fail "bounded evidence update bootstraps a first cycle over an empty ledger"
+fi
+
+stale_bootstrap_body="$work/stale-bootstrap-body.md"
+sed 's/0123456789abcdef0123456789abcdef01234567/3333333333333333333333333333333333333333/' \
+  "$valid_body" > "$stale_bootstrap_body"
+if run_evidence "$bootstrap_json" "$stale_bootstrap_body"; then
+  fail "evidence bootstrap still requires strict current evidence"
+elif ! grep -q '^pr edit ' "$gh_log"; then
+  pass "evidence bootstrap still requires strict current evidence"
+else
+  fail "evidence bootstrap still requires strict current evidence"
+fi
+
+strict_mutant="$route_fixture/scripts/dev/workstream-strict-mutant"
+sed 's#PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$body_file" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null#true#' \
+  "$route_fixture/scripts/dev/workstream" > "$strict_mutant"
+chmod +x "$strict_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$strict_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$bootstrap_json" "$stale_bootstrap_body" "$strict_mutant"; then
+  pass "strict current-evidence sensitivity mutation turns RED"
+else
+  fail "strict current-evidence sensitivity mutation turns RED"
+fi
+
+# An opened PR body reaches GitHub before any validation, so its published Cycle 1 can end a
+# canonical result with comma-adjacent prose. Strict validation then rejects that published cycle
+# and append-only rejects every correction, so exactly that class needs one bounded repair.
+published_suffix_body="$work/published-suffix-body.md"
+sed -e '/^- RED:/s/$/, including WORKSTREAM-EVIDENCE-CURRENT/' \
+  -e '/^- GREEN:/s/$/, 39\/39 assertions/' "$valid_body" > "$published_suffix_body"
+published_suffix_json="$(jq -c --rawfile body "$published_suffix_body" '.body = $body' \
+  <<<"$valid_json")"
+if run_evidence "$published_suffix_json" "$valid_body" \
+  && cmp -s "$valid_body" "$updated_body_marker" \
+  && grep -Fxq "pr edit 17 --repo github.com/uscient/agent-lab --body-file $valid_body" "$gh_log" \
+  && [ "$(grep -c '^pr edit ' "$gh_log")" -eq 1 ] \
+  && grep -Fq 'PASS workstream repaired the invalid published evidence cycle for PR 17' \
+    "$work/stdout"; then
+  pass "bounded repair corrects two comma-suffixed results in the published latest cycle"
+else
+  fail "bounded repair corrects two comma-suffixed results in the published latest cycle"
+fi
+# A correction inside the bound is not an append-only violation, so the captured append attempt
+# must stay unreported on the accepted route and must still be replayed on every refused one.
+if ! grep -Fq 'FAIL workflow PR evidence update changed or erased a prior cycle' \
+  "$work/stderr"; then
+  pass "an accepted bounded repair never reports a misleading append-only failure"
+else
+  fail "an accepted bounded repair never reports a misleading append-only failure"
+fi
+
+capture_mutant="$route_fixture/scripts/dev/workstream-capture-mutant"
+sed 's#evidence-append "$old_body" "$body_file" >/dev/null 2>"$append_log"#evidence-append "$old_body" "$body_file"#' \
+  "$route_fixture/scripts/dev/workstream" > "$capture_mutant"
+chmod +x "$capture_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$capture_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$published_suffix_json" "$valid_body" "$capture_mutant" \
+  && grep -Fq 'FAIL workflow PR evidence update changed or erased a prior cycle' \
+    "$work/stderr"; then
+  pass "append-attempt capture sensitivity mutation turns RED"
+else
+  fail "append-attempt capture sensitivity mutation turns RED"
+fi
+
+# A published body that already passes the same strict validation keeps the append-only path, even
+# when the replacement has the exact shape of a bounded repair.
+strict_suffix_body="$work/strict-suffix-body.md"
+sed '/^- GREEN:/s/$/, rc=0 classification=success/' "$valid_body" > "$strict_suffix_body"
+strict_suffix_json="$(jq -c --rawfile body "$strict_suffix_body" '.body = $body' <<<"$valid_json")"
+if run_evidence "$strict_suffix_json" "$valid_body"; then
+  fail "already-strict published evidence stays on the append-only path"
+elif ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'changed or erased prior cycles' "$work/stderr" \
+  && grep -Fq 'FAIL workflow PR evidence update changed or erased a prior cycle' \
+    "$work/stderr"; then
+  pass "already-strict published evidence stays on the append-only path"
+else
+  fail "already-strict published evidence stays on the append-only path"
+fi
+
+forged_repair_body="$work/forged-repair-body.md"
+sed 's/WORKSTREAM-EVIDENCE-CURRENT/WORKSTREAM-EVIDENCE-FORGED/' \
+  "$valid_body" > "$forged_repair_body"
+if run_evidence "$published_suffix_json" "$forged_repair_body"; then
+  fail "bounded repair refuses a non-result field rewrite"
+elif ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'is not a bounded repair of its invalid published cycle' "$work/stderr"; then
+  pass "bounded repair refuses a non-result field rewrite"
+else
+  fail "bounded repair refuses a non-result field rewrite"
+fi
+
+earlier_suffix_body="$work/earlier-suffix-body.md"
+{
+  cat "$published_suffix_body"
+  sed -n '/^### Cycle 1$/,$p' "$valid_body" | sed 's/^### Cycle 1$/### Cycle 2/'
+} > "$earlier_suffix_body"
+earlier_suffix_json="$(jq -c --rawfile body "$earlier_suffix_body" '.body = $body' \
+  <<<"$valid_json")"
+if run_evidence "$earlier_suffix_json" "$appended_body"; then
+  fail "bounded repair refuses an earlier published cycle"
+elif ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'is not a bounded repair of its invalid published cycle' "$work/stderr"; then
+  pass "bounded repair refuses an earlier published cycle"
+else
+  fail "bounded repair refuses an earlier published cycle"
+fi
+
+repair_mutant="$route_fixture/scripts/dev/workstream-repair-mutant"
+sed 's#PATH=/usr/bin:/bin "$real_bash" "$workflow_check" evidence-repair "$old_body" "$body_file" >/dev/null 2>"$repair_log"#true#' \
+  "$route_fixture/scripts/dev/workstream" > "$repair_mutant"
+chmod +x "$repair_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$repair_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$published_suffix_json" "$forged_repair_body" "$repair_mutant"; then
+  pass "bounded repair sensitivity mutation turns RED"
+else
+  fail "bounded repair sensitivity mutation turns RED"
+fi
+
+published_strict_mutant="$route_fixture/scripts/dev/workstream-published-strict-mutant"
+sed 's#PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$old_body" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null 2>&1#false#' \
+  "$route_fixture/scripts/dev/workstream" > "$published_strict_mutant"
+chmod +x "$published_strict_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$published_strict_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_evidence "$strict_suffix_json" "$valid_body" "$published_strict_mutant"; then
+  pass "published-invalid precondition sensitivity mutation turns RED"
+else
+  fail "published-invalid precondition sensitivity mutation turns RED"
+fi
+
+append_infra_check="$route_fixture/scripts/dev/workflow-check-append-infra"
+cat > "$append_infra_check" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = evidence-append ]; then
+  printf 'INFRA workflow synthetic append infrastructure failure\n' >&2
+  exit 125
+fi
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+exec "$script_dir/workflow-check" "$@"
+EOF
+chmod +x "$append_infra_check"
+append_infra_workstream="$route_fixture/scripts/dev/workstream-append-infra"
+sed 's#workflow_check="$repo_root/scripts/dev/workflow-check"#workflow_check="$repo_root/scripts/dev/workflow-check-append-infra"#' \
+  "$route_fixture/scripts/dev/workstream" > "$append_infra_workstream"
+chmod +x "$append_infra_workstream"
+append_infra_rc=0
+run_evidence "$published_suffix_json" "$valid_body" "$append_infra_workstream" \
+  || append_infra_rc=$?
+if [ "$append_infra_rc" -eq 125 ] \
+  && ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'INFRA workflow synthetic append infrastructure failure' "$work/stderr" \
+  && grep -Fq 'INFRA workstream: cannot validate append-only evidence for PR 17' "$work/stderr"; then
+  pass "append infrastructure cannot enter the bounded repair fallback"
+else
+  fail "append infrastructure cannot enter the bounded repair fallback"
+fi
+
+repair_infra_check="$route_fixture/scripts/dev/workflow-check-repair-infra"
+cat > "$repair_infra_check" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = evidence-repair ]; then
+  printf 'INFRA workflow synthetic repair infrastructure failure\n' >&2
+  exit 125
+fi
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+exec "$script_dir/workflow-check" "$@"
+EOF
+chmod +x "$repair_infra_check"
+repair_infra_workstream="$route_fixture/scripts/dev/workstream-repair-infra"
+sed 's#workflow_check="$repo_root/scripts/dev/workflow-check"#workflow_check="$repo_root/scripts/dev/workflow-check-repair-infra"#' \
+  "$route_fixture/scripts/dev/workstream" > "$repair_infra_workstream"
+chmod +x "$repair_infra_workstream"
+repair_infra_rc=0
+run_evidence "$published_suffix_json" "$valid_body" "$repair_infra_workstream" \
+  || repair_infra_rc=$?
+if [ "$repair_infra_rc" -eq 125 ] \
+  && ! grep -q '^pr edit ' "$gh_log" \
+  && grep -Fq 'INFRA workflow synthetic repair infrastructure failure' "$work/stderr" \
+  && grep -Fq 'INFRA workstream: cannot verify the bounded evidence repair for PR 17' "$work/stderr" \
+  && ! grep -Fq 'REFUSE workstream:' "$work/stderr"; then
+  pass "bounded-repair infrastructure remains infrastructure"
+else
+  fail "bounded-repair infrastructure remains infrastructure"
 fi
 
 if run_merge "$valid_json" \
@@ -419,6 +790,20 @@ if run_merge "$group_json"; then
 else
   fail "approved current-base group slice integrates through the helper"
 fi
+unreviewed_group_json="$(printf '%s' "$group_json" | jq -c '.reviewDecision="REVIEW_REQUIRED"')"
+if run_merge "$unreviewed_group_json"; then
+  pass "current-base Group-slice PR integrates without intermediate human approval"
+else
+  fail "current-base Group-slice PR integrates without intermediate human approval"
+fi
+changes_requested_group_json="$(printf '%s' "$group_json" | jq -c '.reviewDecision="CHANGES_REQUESTED"')"
+if run_merge "$changes_requested_group_json"; then
+  fail "changes-requested Group-slice PR remains blocked"
+elif ! grep -q '^api repos/uscient/agent-lab/pulls/17/merge ' "$gh_log"; then
+  pass "changes-requested Group-slice PR remains blocked"
+else
+  fail "changes-requested Group-slice PR remains blocked"
+fi
 
 wrong_route_json="$(printf '%s' "$valid_json" | jq -c \
   '.baseRefName="group/g0-operator-surface" |
@@ -439,6 +824,49 @@ if run_merge "$flow_json"; then
   pass "approved current-base group PR integrates into flow through the helper"
 else
   fail "approved current-base group PR integrates into flow through the helper"
+fi
+replayed_flow_json="$(printf '%s' "$flow_json" | jq -c '
+  .statusCheckRollup |= (. as $checks |
+    [($checks[0] + {
+      status:"COMPLETED", conclusion:"FAILURE",
+      startedAt:"2026-08-05T04:00:00Z", completedAt:"2026-08-05T04:01:00Z",
+      detailsUrl:"https://github.test/actions/runs/100/jobs/1001"
+    })] +
+    ($checks | to_entries | map(.value + {
+      startedAt:"2026-08-05T05:00:00Z", completedAt:"2026-08-05T05:01:00Z",
+      detailsUrl:("https://github.test/actions/runs/200/jobs/" + ((.key + 2001) | tostring))
+    })))')"
+if run_merge "$replayed_flow_json"; then
+  pass "latest successful replay supersedes an older failed check on the same head"
+else
+  fail "latest successful replay supersedes an older failed check on the same head"
+fi
+latest_pending_flow_json="$(printf '%s' "$replayed_flow_json" | jq -c '
+  .statusCheckRollup += [(last(.statusCheckRollup[] | select(.name == "Fast"))) + {
+    status:"IN_PROGRESS", conclusion:"", startedAt:"2026-08-05T06:00:00Z",
+    completedAt:"0001-01-01T00:00:00Z",
+    detailsUrl:"https://github.test/actions/runs/300/jobs/3001"
+  }]')"
+if run_merge "$latest_pending_flow_json"; then
+  fail "latest pending replay blocks integration despite older success"
+elif ! grep -q '^api repos/uscient/agent-lab/pulls/17/merge ' "$gh_log"; then
+  pass "latest pending replay blocks integration despite older success"
+else
+  fail "latest pending replay blocks integration despite older success"
+fi
+unreviewed_flow_json="$(printf '%s' "$flow_json" | jq -c '.reviewDecision="REVIEW_REQUIRED"')"
+if run_merge "$unreviewed_flow_json"; then
+  pass "current-base Group PR integrates without intermediate human approval"
+else
+  fail "current-base Group PR integrates without intermediate human approval"
+fi
+changes_requested_flow_json="$(printf '%s' "$flow_json" | jq -c '.reviewDecision="CHANGES_REQUESTED"')"
+if run_merge "$changes_requested_flow_json"; then
+  fail "changes-requested Group PR remains blocked"
+elif ! grep -q '^api repos/uscient/agent-lab/pulls/17/merge ' "$gh_log"; then
+  pass "changes-requested Group PR remains blocked"
+else
+  fail "changes-requested Group PR remains blocked"
 fi
 
 missing_base_codeql='{"check_runs":[{"name":"Required gates","app":{"slug":"github-actions"},"status":"completed","conclusion":"success"},{"name":"CodeQL","app":{"slug":"github-code-scanning"},"status":"completed","conclusion":"success"}]}'
@@ -496,7 +924,7 @@ else
 fi
 
 mutant="$route_fixture/scripts/dev/workstream-mutant"
-sed 's/(all(\.statusCheckRollup\[\]; \.status == "COMPLETED" and \.conclusion == "SUCCESS"))/(true)/' \
+sed 's/(all(\$latest_checks\[\]; \.status == "COMPLETED" and \.conclusion == "SUCCESS"))/(true)/' \
   "$route_fixture/scripts/dev/workstream" > "$mutant"
 chmod +x "$mutant"
 if [ "$(cmp -s "$command_path" "$mutant"; printf '%s' "$?")" -ne 0 ] \
@@ -504,6 +932,17 @@ if [ "$(cmp -s "$command_path" "$mutant"; printf '%s' "$?")" -ne 0 ] \
   pass "all-checks sensitivity mutation turns RED"
 else
   fail "all-checks sensitivity mutation turns RED"
+fi
+
+oldest_replay_mutant="$route_fixture/scripts/dev/workstream-oldest-replay-mutant"
+sed 's/]) | last)/]) | first)/' \
+  "$route_fixture/scripts/dev/workstream" > "$oldest_replay_mutant"
+chmod +x "$oldest_replay_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$oldest_replay_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && ! run_merge "$replayed_flow_json" "$oldest_replay_mutant"; then
+  pass "oldest-replay sensitivity mutation turns RED"
+else
+  fail "oldest-replay sensitivity mutation turns RED"
 fi
 
 evidence_mutant="$route_fixture/scripts/dev/workstream-evidence-mutant"
@@ -515,6 +954,28 @@ if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$evidence_mutant"; print
   pass "evidence-validation sensitivity mutation turns RED"
 else
   fail "evidence-validation sensitivity mutation turns RED"
+fi
+
+review_mutant="$route_fixture/scripts/dev/workstream-review-mutant"
+sed 's/\.reviewDecision == "REVIEW_REQUIRED"/.reviewDecision == "CHANGES_REQUESTED"/' \
+  "$route_fixture/scripts/dev/workstream" > "$review_mutant"
+chmod +x "$review_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$review_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && run_merge "$changes_requested_flow_json" "$review_mutant"; then
+  pass "changes-requested Group sensitivity mutation turns RED"
+else
+  fail "changes-requested Group sensitivity mutation turns RED"
+fi
+
+group_slice_review_mutant="$route_fixture/scripts/dev/workstream-group-slice-review-mutant"
+sed 's/((\.baseRefName == "flow") or/((.baseRefName == "flow") and/' \
+  "$route_fixture/scripts/dev/workstream" > "$group_slice_review_mutant"
+chmod +x "$group_slice_review_mutant"
+if [ "$(cmp -s "$route_fixture/scripts/dev/workstream" "$group_slice_review_mutant"; printf '%s' "$?")" -ne 0 ] \
+  && ! run_merge "$unreviewed_group_json" "$group_slice_review_mutant"; then
+  pass "Group-slice approval sensitivity mutation turns RED"
+else
+  fail "Group-slice approval sensitivity mutation turns RED"
 fi
 
 squash_mutant="$route_fixture/scripts/dev/workstream-squash-mutant"

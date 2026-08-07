@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+helper="$script_dir/hosted-ci-watch.py"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'INFRA hosted-ci-watch requires python3\n' >&2
+  exit 125
+fi
+if [ ! -f "$helper" ] || [ ! -r "$helper" ]; then
+  printf 'INFRA hosted-ci-watch Python helper is unavailable: %s\n' "$helper" >&2
+  exit 125
+fi
+
+exec python3 -I -B "$helper" "$@"

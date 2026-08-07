@@ -44,7 +44,9 @@ job_block() {
 require_job_text() {
   local job="$1" text="$2" name="$3" block
   block="$(job_block "$ci" "$job")"
-  if [ -n "$block" ] && printf '%s\n' "$block" | grep -Fq -- "$text"; then
+  # Avoid `producer | grep -q` under pipefail: an early match may SIGPIPE the
+  # producer and turn a true assertion into a scheduler-dependent failure.
+  if [ -n "$block" ] && grep -Fq -- "$text" <<<"$block"; then
     pass "$name"
   else
     fail "$name"
@@ -193,12 +195,94 @@ require_job_text fast 'payload.get("changes", {}).get("body", {}).get("from")' \
   "fast job reads the prior body for append-only edits"
 require_job_text fast './scripts/dev/workflow-check evidence-append "$old_body" "$body"' \
   "fast job prevents prior evidence from being erased"
+require_job_text fast 'evidence_repair_applies()' \
+  "fast job names one bounded repair route for a published invalid cycle"
+require_job_text fast '[ "$evidence_mode" = pr-body-strict ] || return 1' \
+  "bounded repair is unreachable outside strict evidence applicability"
+require_job_text fast './scripts/dev/workflow-check pr-body-strict "$body"' \
+  "bounded repair strictly validates the replacement against this event"
+require_job_text fast './scripts/dev/workflow-check pr-body-strict "$old_body"' \
+  "bounded repair rechecks the published body against the same event"
+require_job_text fast 'case "$published_rc" in' \
+  "bounded repair requires an assertion-class published failure"
+require_job_text fast '*) return "$replacement_rc" ;;' \
+  "replacement infrastructure failures remain infrastructure failures"
+require_job_text fast '*) return "$published_rc" ;;' \
+  "published-body infrastructure failures remain infrastructure failures"
+require_job_text fast './scripts/dev/workflow-check evidence-repair "$old_body" "$body"' \
+  "bounded repair proves the correction stays inside the helper bound"
+require_job_text fast '> "$append_log" 2>&1 || append_rc=$?' \
+  "fast job captures the append attempt instead of failing on it"
+require_job_text fast 'case "$append_rc" in' \
+  "only an assertion-class append failure can enter the bounded repair route"
+require_job_text fast 'cat "$append_log" >&2' \
+  "an unrepaired append attempt still reports its real diagnostic"
+require_job_text fast 'exit "$append_rc"' \
+  "an unrepaired append failure keeps its real result classification"
+require_job_text fast '*) exit "$repair_rc" ;;' \
+  "repair validation infrastructure failures keep their real result classification"
+if job_block "$ci" fast | awk '
+  $0 ~ /- name: Validate pull request evidence/ { step = NR }
+  step && $0 ~ /^[[:space:]]*evidence_mode=pr-body$/ && !mode { mode = NR }
+  step && $0 ~ /evidence_repair_applies\(\)/ { gate = NR }
+  step && $0 ~ /\[ "\$evidence_mode" = pr-body-strict \] \|\| return 1/ { applicable = NR }
+  step && $0 ~ /workflow-check pr-body-strict "\$body"/ { replacement = NR }
+  step && $0 ~ /workflow-check pr-body-strict "\$old_body"/ { published = NR }
+  step && $0 ~ /case "\$published_rc" in/ { assertion = NR }
+  step && $0 ~ /workflow-check evidence-repair "\$old_body" "\$body"/ { repair = NR }
+  step && $0 ~ /workflow-check evidence-append "\$old_body" "\$body"/ { attempt = NR }
+  step && $0 ~ /case "\$append_rc" in/ { append_class = NR }
+  step && $0 ~ /evidence_repair_applies \|\| repair_rc=\$\?/ { consulted = NR }
+  step && $0 ~ /workflow-check "\$evidence_mode" "\$body"/ { final = NR }
+  END {
+    exit !(step > 0 && mode > step && gate > mode && applicable > gate &&
+           replacement > applicable && published > replacement &&
+           assertion > published && repair > assertion &&
+           attempt > repair && append_class > attempt &&
+           consulted > append_class && final > consulted)
+  }
+'; then
+  pass "fast job orders applicability, replacement, published, and repair before the ruling check"
+else
+  fail "fast job orders applicability, replacement, published, and repair before the ruling check"
+fi
 require_job_text fast 'valid_group()' \
   "fast job bounds the reserved group namespace"
 require_job_text fast '[ "$PR_HEAD_REF" = "group/$group_name" ] && valid_group "$group_name"' \
   "fast job enforces group to flow topology"
 require_job_text fast '[[ "$PR_HEAD_REF" =~ ^slice/group/$group_name/$component$ ]]' \
   "fast job enforces matching group-slice topology"
+require_text "$agents" 'receives changes only through matching group-slice PRs' \
+  "agent policy makes Group branches PR-only integration parents"
+require_text "$workstreams_doc" 'at least two independently GREEN vertical slices' \
+  "program guide requires multiple vertical slices after G0"
+require_text "$workstreams_doc" \
+  'A process-only synchronization or gate-registration slice does not' \
+  "program guide excludes process-only slices from the vertical-slice minimum"
+require_text "$workstreams_doc" \
+  'ignored packet state is never shared between checkouts' \
+  "program guide isolates each active slice's workflow packet"
+require_text "$workstreams_doc" './scripts/dev/workstream group-sync' \
+  "program guide routes moving Flow through a Group synchronization slice"
+require_text "$development_doc" 'PR-only `group-sync` slice from `origin/flow`' \
+  "development guide matches the PR-only Group synchronization route"
+require_text "$workstreams_doc" \
+  'The required workflow applies the same' \
+  "program guide records hosted parity for the bounded evidence repair"
+require_text "$workstreams_doc" 'completes its own exact-head hosted campaign' \
+  "program guide states the repair edit passes its own exact-head campaign"
+require_text "$development_doc" 'completes its own exact-head hosted campaign in that one run' \
+  "development guide states the repair edit passes its own exact-head campaign"
+if ! grep -Fq 'fails that run' "$workstreams_doc" &&
+   ! grep -Fq 'becomes green on the next run' "$workstreams_doc"; then
+  pass "program guide no longer sends a repair edit to a later pushed run"
+else
+  fail "program guide no longer sends a repair edit to a later pushed run"
+fi
+require_text "$workstreams_doc" 'Claude Opus 5 at `max`' \
+  "program guide pins the corrected Claude effort"
+require_text "$workstreams_doc" 'Never launch a status worker' \
+  "program guide requires direct unattended worker observation"
 if [ -x "$ci_fast" ] &&
    awk '
      /scripts\/dev\/cue-tool provision/ { cue=NR }
@@ -209,6 +293,19 @@ if [ -x "$ci_fast" ] &&
   pass "canonical Fast replay provisions pinned CUE and Cedar before the gate"
 else
   fail "canonical Fast replay provisions pinned CUE and Cedar before the gate"
+fi
+require_job_text fast 'sudo apt-get install -y -qq bubblewrap shellcheck' \
+  "Fast runner provisions bubblewrap before the security gate"
+if job_block "$ci" fast | awk '
+  /- name: Verify Fast gate bubblewrap isolation/ { step=NR }
+  /if ! bwrap_probe/ { initial=NR }
+  /sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0/ { enable=NR }
+  /^[[:space:]]*bwrap_probe[[:space:]]*$/ { verify=NR }
+  END { exit !(step > 0 && initial > step && enable > initial && verify > enable) }
+'; then
+  pass "Fast runner proves bubblewrap isolation after a bounded Ubuntu user-namespace correction"
+else
+  fail "Fast runner proves bubblewrap isolation after a bounded Ubuntu user-namespace correction"
 fi
 
 require_job_text static '    name: Static' "static job has a stable display name"
@@ -316,6 +413,220 @@ else
   fail "every worker preserves assertion and infrastructure result classes"
 fi
 
+# The edited pull_request event is the only run that sees both the published and the replacement
+# ledger, so the hosted bounded repair is proved against the workflow's own step body rather than
+# its prose. Replay the exact "Validate pull request evidence" script against synthetic events.
+# Nothing below contacts GitHub, Docker, or the network.
+replay_dir="$(mktemp -d)"
+trap 'find "$replay_dir" -depth -delete >/dev/null 2>&1 || true' EXIT
+evidence_step="$replay_dir/evidence-step.sh"
+# Blank lines are held back until real content follows them, so the extraction reproduces the YAML
+# block scalar exactly instead of trailing the blank line that ends it.
+awk '
+  $0 == "      - name: Validate pull request evidence" { step = 1; next }
+  step && $0 == "        run: |" { body = 1; next }
+  body && $0 ~ /^[[:space:]]*$/ { pending++; next }
+  body && $0 !~ /^          / { exit }
+  body {
+    for (; pending > 0; pending--) print ""
+    print substr($0, 11)
+  }
+' "$ci" > "$evidence_step"
+if [ -s "$evidence_step" ] && bash -n "$evidence_step" 2>/dev/null; then
+  pass "the pull request evidence step body extracts as a runnable script"
+else
+  fail "the pull request evidence step body extracts as a runnable script"
+fi
+
+cat > "$replay_dir/write-event.py" <<'PY'
+import json
+import pathlib
+import sys
+
+target, body_file, old_body_file = sys.argv[1], sys.argv[2], sys.argv[3]
+payload = {"pull_request": {"body": pathlib.Path(body_file).read_text(encoding="utf-8")}}
+if old_body_file:
+    payload["changes"] = {"body": {"from": pathlib.Path(old_body_file).read_text(encoding="utf-8")}}
+pathlib.Path(target).write_text(json.dumps(payload), encoding="utf-8")
+PY
+
+cat > "$replay_dir/body.template" <<'EOF'
+## Summary
+
+Accept one bounded published-evidence repair on the edited event.
+
+## Motivation / Context
+
+A pull request body is published before any required check can reject its first cycle.
+
+## Changes
+
+- accept the bounded repair inside the edited run;
+- keep byte-exact append-only as the default route.
+
+## Testing
+
+- `bash tests/dev/ci-workflow-cases.sh` — pass.
+
+## Evidence
+
+### Cycle 1
+
+- Route: `@HEAD_REF@` -> `@BASE_REF@`
+- Base: `@BASE_SHA@`
+- Head: `@HEAD_SHA@`
+- Scenarios: `CI-EVIDENCE-REPAIR`
+- Assertions: `CI-EVIDENCE-REPAIR-RC`
+- RED predecessor: @PREDECESSOR@
+- RED: `bash tests/dev/ci-workflow-cases.sh` — rc=1 classification=assertion-failure
+- GREEN: `bash tests/dev/ci-workflow-cases.sh` — rc=0 classification=success
+- Product mutation: `waive-repair-applicability` — detected rc=1 classification=assertion-failure
+- CI mutation: `bypass-repair-evidence-rule` — detected rc=1 classification=assertion-failure
+- Runner: `ubuntu-latest`
+- Duration: `6s`
+- Cleanup: `replay state removed`
+- Artifacts: `none retained`
+- Unverified: `none`
+EOF
+
+write_replay_body() {
+  local target="$1" head_ref="$2" base_ref="$3" base_sha="$4" head_sha="$5" predecessor="$6"
+  sed -e "s|@HEAD_REF@|$head_ref|g" -e "s|@BASE_REF@|$base_ref|g" \
+    -e "s|@BASE_SHA@|$base_sha|g" -e "s|@HEAD_SHA@|$head_sha|g" \
+    -e "s|@PREDECESSOR@|$predecessor|g" "$replay_dir/body.template" > "$target"
+}
+
+run_evidence_step() {
+  local body_file="$1" old_body_file="$2" head_ref="$3" base_ref="$4" \
+    base_sha="$5" head_sha="$6" rc=0
+  : > "$replay_dir/output"
+  python3 "$replay_dir/write-event.py" "$replay_dir/event.json" "$body_file" \
+    "$old_body_file" || return 125
+  # TMPDIR is redirected so every temporary file the replayed step and its checks allocate stays
+  # inside this suite's own cleaned state.
+  (
+    cd "$repo_root" &&
+      TMPDIR="$replay_dir" PR_BASE_SHA="$base_sha" PR_HEAD_SHA="$head_sha" \
+      PR_BASE_REF="$base_ref" PR_HEAD_REF="$head_ref" \
+      GITHUB_EVENT_PATH="$replay_dir/event.json" \
+      bash -e "$evidence_step"
+  ) > "$replay_dir/output" 2>&1 || rc=$?
+  return "$rc"
+}
+
+# Each expectation is required text, or forbidden text when prefixed with "!".
+expect_evidence_step() {
+  local name="$1" expected_rc="$2" body_file="$3" old_body_file="$4" \
+    head_ref="$5" base_ref="$6" base_sha="$7" head_sha="$8" rc=0 expectation
+  shift 8
+  run_evidence_step "$body_file" "$old_body_file" "$head_ref" "$base_ref" \
+    "$base_sha" "$head_sha" || rc=$?
+  if [ "$rc" -ne "$expected_rc" ]; then
+    fail "$name (rc=$rc)"
+    return
+  fi
+  for expectation in "$@"; do
+    case "$expectation" in
+      '!'*)
+        if grep -Fq -- "${expectation#!}" "$replay_dir/output"; then
+          fail "$name"
+          return
+        fi
+        ;;
+      *)
+        if ! grep -Fq -- "$expectation" "$replay_dir/output"; then
+          fail "$name"
+          return
+        fi
+        ;;
+    esac
+  done
+  pass "$name"
+}
+
+replay_base_sha="4444444444444444444444444444444444444444"
+replay_head_sha="5555555555555555555555555555555555555555"
+replay_predecessor='`3333333333333333333333333333333333333333`'
+replay_na_predecessor='N/A — this replay route has no recorded predecessor'
+strict_head_ref="slice/group/g0-operator-surface/evidence"
+strict_base_ref="group/g0-operator-surface"
+repair_pass='PASS workflow bounded evidence repair of the published cycle'
+append_pass='PASS workflow append-only evidence'
+append_fail='FAIL workflow PR evidence update changed or erased a prior cycle'
+body_pass='PASS workflow PR body'
+
+strict_valid_body="$replay_dir/strict-valid.md"
+write_replay_body "$strict_valid_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" "$replay_predecessor"
+# The published first cycle ends its canonical RED and GREEN results with comma-adjacent prose.
+strict_published_body="$replay_dir/strict-published.md"
+sed -e '/^- RED:/s/$/, including the CI-EVIDENCE-REPAIR predecessor/' \
+  -e '/^- GREEN:/s/$/, 22\/22 assertions/' "$strict_valid_body" > "$strict_published_body"
+# A published cycle that already passes the same strict validation has nothing to repair.
+strict_redundant_body="$replay_dir/strict-redundant.md"
+sed '/^- GREEN:/s/$/, rc=0 classification=success/' "$strict_valid_body" > "$strict_redundant_body"
+# A correction that also rewrites a non-result field is outside the bounded repair.
+strict_widened_body="$replay_dir/strict-widened.md"
+sed 's/^- Scenarios: .*/- Scenarios: `CI-EVIDENCE-REPAIR-WIDENED`/' \
+  "$strict_valid_body" > "$strict_widened_body"
+strict_appended_body="$replay_dir/strict-appended.md"
+{
+  cat "$strict_valid_body"
+  sed -n '/^### Cycle 1$/,$p' "$strict_valid_body" | sed 's/^### Cycle 1$/### Cycle 2/'
+} > "$strict_appended_body"
+# A reasoned N/A predecessor passes pr-body and fails pr-body-strict, so a replacement carrying it
+# is the exact replacement the strict precondition has to reject.
+weak_body="$replay_dir/strict-weak-replacement.md"
+write_replay_body "$weak_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" "$replay_na_predecessor"
+weak_published_body="$replay_dir/strict-weak-published.md"
+sed -e '/^- RED:/s/$/, prose/' -e '/^- GREEN:/s/$/, prose/' "$weak_body" > "$weak_published_body"
+
+expect_evidence_step \
+  "an edited event repairs its published invalid cycle inside that same run" \
+  0 "$strict_valid_body" "$strict_published_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" \
+  "$repair_pass" "$body_pass" "!$append_fail"
+expect_evidence_step \
+  "an ordinary appended cycle keeps the byte-exact append-only default" \
+  0 "$strict_appended_body" "$strict_valid_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" \
+  "$append_pass" "$body_pass" "!$repair_pass"
+expect_evidence_step \
+  "a published cycle that still passes strict validation cannot be repaired" \
+  1 "$strict_valid_body" "$strict_redundant_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" \
+  "$append_fail" "!$repair_pass"
+expect_evidence_step \
+  "a replacement failing the same strict validation cannot be repaired" \
+  1 "$weak_body" "$weak_published_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" \
+  "$append_fail" "!$repair_pass"
+expect_evidence_step \
+  "a correction wider than the bounded repair keeps its append-only failure" \
+  1 "$strict_widened_body" "$strict_published_body" "$strict_head_ref" "$strict_base_ref" \
+  "$replay_base_sha" "$replay_head_sha" \
+  "$append_fail" "!$repair_pass"
+
+# A non-strict pull request never reaches the repair route. Comparing the current repository head
+# against itself keeps the changed-path classification empty and the applicability deterministic.
+replay_repo_sha="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
+nonstrict_valid_body="$replay_dir/nonstrict-valid.md"
+write_replay_body "$nonstrict_valid_body" xor/workflow dev \
+  "$replay_repo_sha" "$replay_repo_sha" "$replay_predecessor"
+nonstrict_published_body="$replay_dir/nonstrict-published.md"
+sed -e '/^- RED:/s/$/, prose/' -e '/^- GREEN:/s/$/, prose/' \
+  "$nonstrict_valid_body" > "$nonstrict_published_body"
+if [[ "$replay_repo_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  expect_evidence_step \
+    "a non-strict pull request cannot reach the bounded repair route" \
+    1 "$nonstrict_valid_body" "$nonstrict_published_body" xor/workflow dev \
+    "$replay_repo_sha" "$replay_repo_sha" \
+    "$append_fail" "!$repair_pass"
+else
+  fail "a non-strict pull request cannot reach the bounded repair route"
+fi
+
 if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
   run_ci_mutant() {
     local name="$1" expression="$2" target="${3:-ci}"
@@ -344,13 +655,17 @@ if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
   }
 
   work_dir="$(mktemp -d)"
-  trap 'find "$work_dir" -depth -delete >/dev/null 2>&1 || true' EXIT
+  trap 'find "$replay_dir" "$work_dir" -depth -delete >/dev/null 2>&1 || true' EXIT
   run_ci_mutant omit-flow-trigger \
     "s/branches: \[dev, flow, master, main\]/branches: [dev, master, main]/"
   run_ci_mutant omit-group-trigger \
     "s/, 'group\/\*\*'//"
   run_ci_mutant allow-continue-on-error \
     '/id: fast-gate/a\        continue-on-error: true'
+  run_ci_mutant omit-bubblewrap-provision \
+    's/bubblewrap shellcheck/shellcheck/'
+  run_ci_mutant omit-bubblewrap-userns-correction \
+    '/kernel.apparmor_restrict_unprivileged_userns=0/d'
   run_ci_mutant drop-required-worker \
     's/needs: \[fast, static, docker\]/needs: [fast, static]/'
   run_ci_mutant erase-result-classification \
@@ -369,6 +684,20 @@ if [ "${CI_WORKFLOW_MUTATION_PROBE:-0}" != 1 ]; then
     's/flow | group\/\* | work\/\*) evidence_mode=pr-body-strict/flow | group\/* | work\/*) evidence_mode=pr-body/'
   run_ci_mutant erase-append-only-evidence \
     's#./scripts/dev/workflow-check evidence-append "$old_body" "$body"#true#'
+  run_ci_mutant waive-append-assertion-precondition \
+    's#case "$append_rc" in#append_rc=1; case "$append_rc" in#'
+  run_ci_mutant waive-repair-applicability \
+    's#\[ "$evidence_mode" = pr-body-strict \] || return 1#true#'
+  run_ci_mutant weaken-repair-replacement \
+    's#workflow-check pr-body-strict "$body" \\#workflow-check pr-body "$body" \\#'
+  run_ci_mutant bypass-repair-published-precondition \
+    's#case "$published_rc" in#published_rc=1; case "$published_rc" in#'
+  run_ci_mutant bypass-repair-evidence-rule \
+    's#./scripts/dev/workflow-check evidence-repair "$old_body" "$body" >/dev/null 2>&1#true#'
+  run_ci_mutant erase-append-diagnostic \
+    's#cat "$append_log" >&2#true#'
+  run_ci_mutant erase-append-classification \
+    's#exit "$append_rc"#exit 0#'
   run_ci_mutant bypass-reducer \
     's#run: ./scripts/dev/required-gates#run: true#'
   run_ci_mutant codeql-omit-flow \

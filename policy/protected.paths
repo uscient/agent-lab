@@ -31,6 +31,8 @@ tools/serena-entrypoint.sh
 scripts/dev/workstream
 scripts/dev/workflow-check
 scripts/dev/ci-fast
+scripts/dev/hosted-ci-watch
+scripts/dev/hosted-ci-watch.py
 scripts/dev/required-gates
 scripts/dev/security-gate
 scripts/dev/security-gate.py
@@ -47,8 +49,12 @@ tests/dev/workstream-cases.sh
 tests/dev/workflow-check-cases.sh
 tests/dev/ci-workflow-cases.sh
 tests/dev/required-gates-cases.sh
+tests/dev/hosted-ci-watch-cases.sh
+tests/dev/hosted-ci-watch-cases.py
 tests/dev/security-gate-cases.sh
 tests/dev/docker-harness-cases.sh
+tests/docker/security-fixture.sh
+tests/docker/fixtures/
 tests/dev/guard-diff-cases.sh
 tests/guard/
 tests/agent/policy-verify.sh

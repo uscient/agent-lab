@@ -11,9 +11,11 @@ Usage:
   scripts/dev/workstream start SLUG
   scripts/dev/workstream group NAME
   scripts/dev/workstream slice NAME
+  scripts/dev/workstream group-sync
   scripts/dev/workstream sync
   scripts/dev/workstream pr [gh-pr-create options]
   scripts/dev/workstream evidence PR_NUMBER BODY_FILE
+  scripts/dev/workstream ready PR_NUMBER
   scripts/dev/workstream merge PR_NUMBER
   scripts/dev/workstream group-pr [gh-pr-create options]
   scripts/dev/workstream final [gh-pr-create options]
@@ -166,6 +168,62 @@ case "$command_name" in
       || refuse "$branch diverged from its integration ref; refusing to rewrite accepted history"
     "$real_git" -C "$repo_root" switch -c "$slice_branch" "origin/$base"
     ;;
+  group-sync)
+    [ "$#" -eq 0 ] || usage
+    require_clean
+    branch="$(current_branch)"
+    case "$branch" in
+      group/*)
+        group="${branch#group/}"
+        valid_group "$group" || refuse "invalid current group branch"
+        ;;
+      *) refuse "group-sync requires a group/<id>-<slug> branch" ;;
+    esac
+    "$real_git" -C "$repo_root" fetch origin "$branch" flow
+    "$real_git" -C "$repo_root" merge --ff-only "origin/$branch" \
+      || refuse "$branch diverged from its integration ref; refusing to rewrite accepted history"
+    group_sha="$($real_git -C "$repo_root" rev-parse HEAD)" \
+      || die "cannot resolve the current Group head"
+    flow_sha="$($real_git -C "$repo_root" rev-parse --verify origin/flow)" \
+      || die "origin/flow is unavailable"
+    ancestor_rc=0
+    "$real_git" -C "$repo_root" merge-base --is-ancestor "$flow_sha" "$group_sha" \
+      || ancestor_rc=$?
+    case "$ancestor_rc" in
+      0) refuse "$branch already contains current origin/flow" ;;
+      1) ;;
+      *) die "cannot compare $branch with current origin/flow" ;;
+    esac
+    sync_branch="slice/group/$group/sync-flow-${flow_sha:0:12}"
+    if "$real_git" -C "$repo_root" show-ref --verify --quiet "refs/heads/$sync_branch"; then
+      refuse "local synchronization branch already exists: $sync_branch"
+    fi
+    remote_rc=0
+    "$real_git" -C "$repo_root" ls-remote --exit-code --heads origin \
+      "refs/heads/$sync_branch" >/dev/null 2>&1 || remote_rc=$?
+    case "$remote_rc" in
+      0) refuse "remote synchronization branch already exists: $sync_branch" ;;
+      2) ;;
+      *) die "cannot check remote synchronization branch: $sync_branch" ;;
+    esac
+    "$real_git" -C "$repo_root" switch -c "$sync_branch" "$group_sha"
+    if ! "$real_git" -C "$repo_root" merge --no-ff --no-edit "origin/flow"; then
+      refuse "flow synchronization has conflicts; resolve only on $sync_branch and preserve both parents"
+    fi
+    sync_sha="$($real_git -C "$repo_root" rev-parse HEAD)" \
+      || die "cannot resolve the synchronization merge"
+    read -r commit_parent first_parent second_parent extra_parent < <(
+      "$real_git" -C "$repo_root" rev-list --parents -n 1 "$sync_sha"
+    )
+    if [ "$commit_parent" != "$sync_sha" ] ||
+       [ "$first_parent" != "$group_sha" ] ||
+       [ "$second_parent" != "$flow_sha" ] ||
+       [ -n "${extra_parent:-}" ]; then
+      refuse "synchronization did not create the exact retained-history Group/flow merge"
+    fi
+    printf 'PASS workstream prepared PR-only Group sync %s at %s\n' \
+      "$sync_branch" "$sync_sha"
+    ;;
   sync)
     [ "$#" -eq 0 ] || usage
     require_clean
@@ -178,10 +236,7 @@ case "$command_name" in
         sync_mode="merge"
         ;;
       group/*)
-        group="${branch#group/}"
-        valid_group "$group" || refuse "invalid current group branch"
-        base="flow"
-        sync_mode="merge"
+        refuse "Group branches are PR-only; run group-sync to prepare a derived synchronization slice"
         ;;
       slice/group/*/*)
         remainder="${branch#slice/group/}"
@@ -201,7 +256,7 @@ case "$command_name" in
         base="work/$slug"
         sync_mode="rebase"
         ;;
-      *) refuse "sync requires a workstream, group, or matching slice branch" ;;
+      *) refuse "sync requires a workstream or matching slice branch" ;;
     esac
     if [[ "$branch" == group/* || "$branch" == work/* ]]; then
       "$real_git" -C "$repo_root" fetch origin "$branch" "$base"
@@ -298,8 +353,56 @@ case "$command_name" in
     if ! PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$body_file" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null; then
       refuse "replacement evidence for PR $pr_number is missing, malformed, or stale"
     fi
-    if ! PATH=/usr/bin:/bin "$real_bash" "$workflow_check" evidence-append "$old_body" "$body_file" >/dev/null; then
-      refuse "replacement evidence for PR $pr_number changed or erased prior cycles"
+    evidence_route=append
+    append_log="$workstream_state/append-attempt"
+    append_rc=0
+    PATH=/usr/bin:/bin "$real_bash" "$workflow_check" evidence-append "$old_body" "$body_file" >/dev/null 2>"$append_log" \
+      || append_rc=$?
+    case "$append_rc" in
+      0 | 1) ;;
+      *)
+        cat "$append_log" >&2 || true
+        die "cannot validate append-only evidence for PR $pr_number"
+        ;;
+    esac
+    if [ "$append_rc" -eq 1 ]; then
+      # A body published before any validation can hold an invalid latest cycle: strict validation
+      # rejects it forever and append-only rejects every correction, so the ledger cannot move. The
+      # one bounded recovery below applies only while the published body still fails the exact
+      # strict validation this replacement already passed, and only to a replacement that deletes a
+      # comma and its trailing prose from at most four latest-cycle results. A correction inside
+      # that bound is not an append-only violation, so the captured append diagnostic is replayed
+      # only on the paths that refuse the replacement.
+      published_rc=0
+      PATH=/usr/bin:/bin "$real_bash" "$workflow_check" pr-body-strict "$old_body" "$base_sha" "$head_sha" "$branch" "$base" >/dev/null 2>&1 \
+        || published_rc=$?
+      case "$published_rc" in
+        0)
+          cat "$append_log" >&2 || true
+          refuse "replacement evidence for PR $pr_number changed or erased prior cycles"
+          ;;
+        1) ;;
+        *)
+          cat "$append_log" >&2 || true
+          die "cannot validate the published evidence for PR $pr_number"
+          ;;
+      esac
+      repair_log="$workstream_state/repair-attempt"
+      repair_rc=0
+      PATH=/usr/bin:/bin "$real_bash" "$workflow_check" evidence-repair "$old_body" "$body_file" >/dev/null 2>"$repair_log" \
+        || repair_rc=$?
+      case "$repair_rc" in
+        0) evidence_route=repair ;;
+        1)
+          cat "$append_log" >&2 || true
+          cat "$repair_log" >&2 || true
+          refuse "replacement evidence for PR $pr_number is not a bounded repair of its invalid published cycle"
+          ;;
+        *)
+          cat "$repair_log" >&2 || true
+          die "cannot verify the bounded evidence repair for PR $pr_number"
+          ;;
+      esac
     fi
     "$real_gh" pr edit "$pr_number" --repo "$repository_target" --body-file "$body_file" >/dev/null \
       || die "cannot update evidence for PR $pr_number"
@@ -318,8 +421,83 @@ case "$command_name" in
       die "PR $pr_number changed while its evidence update was being confirmed"
     fi
     end_workstream_state
-    printf 'PASS workstream updated append-only evidence for PR %s at head %s\n' \
-      "$pr_number" "$head_sha"
+    case "$evidence_route" in
+      repair)
+        printf 'PASS workstream repaired the invalid published evidence cycle for PR %s at head %s\n' \
+          "$pr_number" "$head_sha"
+        ;;
+      *)
+        printf 'PASS workstream updated append-only evidence for PR %s at head %s\n' \
+          "$pr_number" "$head_sha"
+        ;;
+    esac
+    ;;
+  ready)
+    [ "$#" -eq 1 ] || usage
+    pr_number="$1"
+    [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || refuse "PR number must be a positive integer"
+    branch="$(current_branch)"
+    expected_base=""
+    case "$branch" in
+      group/*)
+        valid_group "${branch#group/}" || refuse "invalid current group branch"
+        expected_base="flow"
+        ;;
+      slice/group/*/*)
+        if [[ "$branch" =~ ^slice/group/([^/]+)/([^/]+)$ ]]; then
+          group_id="${BASH_REMATCH[1]}"
+          slice_id="${BASH_REMATCH[2]}"
+        else
+          refuse "invalid current group-slice branch"
+        fi
+        valid_group "$group_id" || refuse "invalid current group-slice parent"
+        valid_component "$slice_id" || refuse "invalid current group-slice name"
+        expected_base="group/$group_id"
+        ;;
+      *) refuse "ready requires a Group or matching Group-slice branch" ;;
+    esac
+    require_clean
+    metadata="$("$real_gh" pr view "$pr_number" --repo "$repository_target" \
+      --json number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository)" \
+      || die "cannot read PR $pr_number"
+    if ! printf '%s' "$metadata" | "$real_jq" -e \
+      --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" \
+      --arg expected_base "$expected_base" '
+      (.number == $number) and
+      (.state == "OPEN") and
+      (.isDraft == true) and
+      (.baseRefName == $expected_base) and
+      (.headRefName == $branch) and
+      (.isCrossRepository == false) and
+      (.headRepository.nameWithOwner == $repository) and
+      (.baseRefOid | test("^[0-9a-f]{40}$")) and
+      (.headRefOid | test("^[0-9a-f]{40}$"))
+    ' >/dev/null; then
+      refuse "PR $pr_number is not the exact draft program PR for the current branch"
+    fi
+    base_sha="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefOid)"
+    head_sha="$(printf '%s' "$metadata" | "$real_jq" -r .headRefOid)"
+    "$real_gh" pr ready "$pr_number" --repo "$repository_target" \
+      || refuse "GitHub did not make PR $pr_number ready"
+    confirmed="$("$real_gh" pr view "$pr_number" --repo "$repository_target" \
+      --json number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,isCrossRepository,headRepository)" \
+      || die "cannot confirm PR $pr_number readiness"
+    if ! printf '%s' "$confirmed" | "$real_jq" -e \
+      --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" \
+      --arg base "$base_sha" --arg head "$head_sha" --arg expected_base "$expected_base" '
+      (.number == $number) and
+      (.state == "OPEN") and
+      (.isDraft == false) and
+      (.baseRefName == $expected_base) and
+      (.baseRefOid == $base) and
+      (.headRefName == $branch) and
+      (.headRefOid == $head) and
+      (.isCrossRepository == false) and
+      (.headRepository.nameWithOwner == $repository)
+    ' >/dev/null; then
+      refuse "PR $pr_number identity changed while becoming ready"
+    fi
+    printf 'PASS workstream made program PR %s ready at head %s\n' "$pr_number" "$head_sha"
     ;;
   merge)
     [ "$#" -eq 1 ] || usage
@@ -339,6 +517,10 @@ case "$command_name" in
       || die "cannot read PR $pr_number"
     if ! printf '%s' "$metadata" | "$real_jq" -e \
       --argjson number "$pr_number" --arg branch "$branch" --arg repository "$repository" '
+      (.statusCheckRollup |
+        group_by([(.workflowName // ""), .name]) |
+        map(sort_by([(.startedAt // ""), (.completedAt // ""), (.detailsUrl // "")]) | last)
+      ) as $latest_checks |
       (.number == $number) and
       (.state == "OPEN") and
       (.isDraft == false) and
@@ -359,19 +541,28 @@ case "$command_name" in
       (.baseRefOid | test("^[0-9a-f]{40}$")) and
       (.headRefOid | test("^[0-9a-f]{40}$")) and
       (.mergeStateStatus == "CLEAN") and
-      (.reviewDecision == "APPROVED") and
+      ((((.baseRefName == "flow") or
+         (.baseRefName | test("^group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$"))) and
+        ((.reviewDecision == null) or (.reviewDecision == "") or
+         (.reviewDecision == "REVIEW_REQUIRED") or (.reviewDecision == "APPROVED"))) or
+       (((.baseRefName != "flow") and
+         (.baseRefName | test("^group/[gb][0-9]+[a-z]?-[a-z0-9][a-z0-9-]*$") | not)) and
+        (.reviewDecision == "APPROVED"))) and
       ((.statusCheckRollup | length) > 0) and
-      ((.statusCheckRollup | map([(.workflowName // ""), .name]) | unique | length) ==
+      ((.statusCheckRollup |
+        map([(.workflowName // ""), .name, (.startedAt // ""),
+             (.completedAt // ""), (.detailsUrl // "")]) | unique | length) ==
        (.statusCheckRollup | length)) and
-      (([.statusCheckRollup[] | select(.name == "Required gates" and
+      (($latest_checks | length) > 0) and
+      (([$latest_checks[] | select(.name == "Required gates" and
         .workflowName == "CI" and
         .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
-      (([.statusCheckRollup[] | select(.name == "CodeQL" and
+      (([$latest_checks[] | select(.name == "CodeQL" and
         .workflowName == "CodeQL" and
         .status == "COMPLETED" and .conclusion == "SUCCESS")] | length) == 1) and
-      (all(.statusCheckRollup[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
+      (all($latest_checks[]; .status == "COMPLETED" and .conclusion == "SUCCESS"))
     ' >/dev/null; then
-      refuse "PR $pr_number is not an approved current-base intermediate PR with every check successful"
+      refuse "PR $pr_number is not a current-base intermediate PR with every check successful"
     fi
     base_sha="$(printf '%s' "$metadata" | "$real_jq" -r .baseRefOid)"
     head_sha="$(printf '%s' "$metadata" | "$real_jq" -r .headRefOid)"
