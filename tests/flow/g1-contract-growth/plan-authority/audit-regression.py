@@ -9,8 +9,11 @@ plan projection never referenced.
 
 Run from the repository root. Exit 0 when every input is cleanly refused.
 """
-import importlib.util,sys,json
-sp=importlib.util.spec_from_file_location('ex','scripts/experiment.py')
+import importlib.util,sys,json,pathlib
+# Resolve the product from this file, not the caller's working directory, so the
+# suite behaves the same under the security gate as it does by hand.
+ROOT = pathlib.Path(__file__).resolve().parents[4]
+sp=importlib.util.spec_from_file_location('ex', ROOT/'scripts/experiment.py')
 m=importlib.util.module_from_spec(sp); sys.modules['ex']=m; sp.loader.exec_module(m)
 IMG={"digestRef":"registry.example/team/hub@sha256:"+"a"*64}
 def man(s): return {"apiVersion":"agent-lab/v0alpha2","kind":"Experiment","metadata":{"name":"plan-authority"},"spec":s}
@@ -27,5 +30,7 @@ for n,mf in cases:
     except m.InvalidManifest: r="refused"
     except m.InfrastructureError: r="DISAGREEMENT"; bad+=1
     print(f"{n}: {r}")
-print("FAIL" if bad else "PASS", "audit-regression", bad, "of", len(cases), "not cleanly refused")
-sys.exit(1 if bad else 0)
+if bad:
+    print(f"FAIL audit-regression {bad} of {len(cases)} not cleanly refused")
+    sys.exit(1)
+print("AUDIT REGRESSION PASS")
