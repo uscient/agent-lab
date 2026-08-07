@@ -169,9 +169,23 @@ def classify_plan_execution(plan: object) -> str:
         # who may install it.
         return EXECUTION_AUTHORITY_INCOMPLETE
     install = authority.get("install")
-    if not isinstance(install, dict):
+    # The whole authority block must be present and well formed. A block missing
+    # its principal or its assurance declares nothing usable, and treating a
+    # partial one as complete would let a plan reach eligible without anybody
+    # having said who may install it.
+    if not isinstance(install, dict) or set(install) != {
+        "principal",
+        "assurance",
+        "secrets",
+    }:
         return EXECUTION_AUTHORITY_INCOMPLETE
-    bound = install.get("secrets")
+    principal = install["principal"]
+    assurance = install["assurance"]
+    if not isinstance(principal, str) or not principal:
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    if assurance != "declared":
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    bound = install["secrets"]
     if not isinstance(bound, list) or not all(isinstance(name, str) for name in bound):
         return EXECUTION_AUTHORITY_INCOMPLETE
 
