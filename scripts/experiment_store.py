@@ -31,6 +31,15 @@ INSTALL_API = "agent-lab.experiment-install/v0alpha1"
 PROVENANCE_API = "agent-lab.experiment-provenance/v0alpha1"
 INTENT_API = "agent-lab.experiment-install-intent/v0alpha1"
 LOCK_SCHEMA = "agent-lab.experiments-lock/v0alpha1"
+PLAN_API_V0ALPHA2 = "agent-lab.request/v0alpha2"
+# How a projected plan stands with respect to execution. Three distinct values,
+# because the difference between "this cannot execute" and "this could execute
+# once someone declares the authority for it" is the whole point: collapsing
+# them would make an unauthorised install indistinguishable from an impossible
+# one.
+EXECUTION_ELIGIBLE = "execution-eligible"
+EXECUTION_AUTHORITY_INCOMPLETE = "execution-authority-incomplete"
+EXECUTION_NON_EXECUTABLE = "execution-non-executable"
 OPERATION_WRAPPER = "experiment-install"
 CLEANUP_WRAPPER = "experiment-install-cleanup"
 OWNERSHIP_MARKER = "owner"
@@ -116,6 +125,73 @@ class VerifiedInstall(NamedTuple):
 class ScannedWrapper(NamedTuple):
     intent: dict[str, object] | None
     has_payload: bool
+
+
+def classify_plan_execution(plan: object) -> str:
+    """Report how a projected plan stands with respect to execution.
+
+    Read-only and total: the argument is never modified, and no input produces
+    an exception. Anything unrecognisable classifies non-executable, because a
+    plan this function cannot understand is not a plan it may let run.
+
+    A v0alpha1 plan is always non-executable -- that contract has no vocabulary
+    for declaring install authority, so nothing authored under it can carry any.
+    A v0alpha2 plan is eligible only when every secret any member is granted is
+    also bound by the declared install authority. A grant the authority does not
+    cover is exactly the case that must not reach an installer.
+    """
+    if not isinstance(plan, dict) or plan.get("apiVersion") != PLAN_API_V0ALPHA2:
+        return EXECUTION_NON_EXECUTABLE
+
+    spec = plan.get("spec")
+    if not isinstance(spec, dict):
+        return EXECUTION_NON_EXECUTABLE
+
+    members = spec.get("members")
+    if not isinstance(members, list):
+        return EXECUTION_NON_EXECUTABLE
+
+    granted: set[str] = set()
+    for member in members:
+        if not isinstance(member, dict):
+            return EXECUTION_NON_EXECUTABLE
+        grants = member.get("secretGrants", [])
+        if not isinstance(grants, list):
+            return EXECUTION_NON_EXECUTABLE
+        for grant in grants:
+            if not isinstance(grant, str):
+                return EXECUTION_NON_EXECUTABLE
+            granted.add(grant)
+
+    authority = spec.get("authority")
+    if not isinstance(authority, dict):
+        # No authority was declared. The plan is well formed; nobody has said
+        # who may install it.
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    install = authority.get("install")
+    # The whole authority block must be present and well formed. A block missing
+    # its principal or its assurance declares nothing usable, and treating a
+    # partial one as complete would let a plan reach eligible without anybody
+    # having said who may install it.
+    if not isinstance(install, dict) or set(install) != {
+        "principal",
+        "assurance",
+        "secrets",
+    }:
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    principal = install["principal"]
+    assurance = install["assurance"]
+    if not isinstance(principal, str) or not principal:
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    if assurance != "declared":
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    bound = install["secrets"]
+    if not isinstance(bound, list) or not all(isinstance(name, str) for name in bound):
+        return EXECUTION_AUTHORITY_INCOMPLETE
+
+    if granted - set(bound):
+        return EXECUTION_AUTHORITY_INCOMPLETE
+    return EXECUTION_ELIGIBLE
 
 
 def canonical(value: object) -> bytes:

@@ -6,8 +6,9 @@ subcases=(
   "$repo_root/tests/experiment/directory-intake-cases.sh"
   "$repo_root/tests/experiment/aggregate-harness-cases.sh"
   "$repo_root/tests/experiment/catalog-aggregate-harness-cases.sh"
+  "$repo_root/tests/flow/g1-contract-growth/cases.sh"
 )
-expected_count=46
+expected_count=55
 work=""
 
 cleanup_work() {
@@ -37,7 +38,10 @@ printf '%s\n' \
   AGG-021 AGG-022 AGG-023 AGG-024 \
   AGG-025 AGG-026 AGG-027 AGG-028 AGG-029 AGG-030 \
   AGG-014 AGG-015 AGG-016 AGG-017 \
-  AGG-018 AGG-019 AGG-020 > "$expected"
+  AGG-018 AGG-019 AGG-020 \
+  WF-PLAN-LEGACY-INSPECTABLE SEC-PLAN-EXECUTABLE REC-PLAN-AUTHORITY-DENIAL \
+  SEC-PLAN-INLINE-SECRET SEC-PLAN-SECRET-QUIET WF-PLAN-SECRET-REFERENCE \
+  SEC-PLAN-SECRET-GRANT WF-PLAN-GRANT-NEIGHBOR SEC-PLAN-GRANT-UNKNOWN > "$expected"
 : > "$observed"
 
 infrastructure=0

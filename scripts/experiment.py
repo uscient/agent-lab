@@ -91,6 +91,25 @@ AUTHORIZATION_FILES = tuple(
         )
     )
 )
+CONTRACT_FILES_V0ALPHA2 = tuple(
+    sorted(
+        (
+            "contracts/experiment/v0alpha2/cue.mod/module.cue",
+            "contracts/experiment/v0alpha2/plan.cue",
+            "contracts/experiment/v0alpha2/schema.cue",
+            "tools/cue.lock",
+        )
+    )
+)
+AUTHORIZATION_FILES_V0ALPHA2 = tuple(
+    sorted(
+        (
+            "authorization/experiment/v0alpha2/operator.cedar",
+            "authorization/experiment/v0alpha2/schema.cedarschema",
+            "tools/cedar.lock",
+        )
+    )
+)
 CEDAR_HELPER = "scripts/dev/cedar-tool.py"
 AUTHORIZATION_DIGEST_DOMAIN = b"agent-lab.authorization-contract.v1\0"
 CEDAR_VALIDATION_SUCCESS = (
@@ -100,9 +119,27 @@ CEDAR_VALIDATION_SUCCESS = (
 CEDAR_ALLOW = b"\nALLOW\n"
 CEDAR_DENY = b"\nDENY\n"
 LEGACY_PRINCIPAL_ID = "legacy-local-operator"
+DECLARED_PRINCIPAL_ID = "declared-lab-operator"
 INSTALL_ACTION_ID = "experiment.install"
 PROBE_MANIFEST = {
     "apiVersion": "agent-lab/v0alpha1",
+    "kind": "Experiment",
+    "metadata": {"name": "contract-probe"},
+    "spec": {
+        "members": [
+            {
+                "name": "probe",
+                "image": {
+                    "digestRef": "probe@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                },
+            }
+        ]
+    },
+}
+
+
+PROBE_MANIFEST_V0ALPHA2 = {
+    "apiVersion": "agent-lab/v0alpha2",
     "kind": "Experiment",
     "metadata": {"name": "contract-probe"},
     "spec": {
@@ -140,6 +177,23 @@ class PlanBinding(NamedTuple):
     member_count: int
     resource_classes: tuple[str, ...]
     source_digest: str
+
+
+class PlanBindingV0Alpha2(NamedTuple):
+    """Facts derived only from one canonical v0alpha2 CUE plan."""
+
+    plan_digest: str
+    contract_digest: str
+    contract_version: str
+    requested_name: str
+    member_count: int
+    resource_classes: tuple[str, ...]
+    source_digest: str
+    authority_declared: bool
+    authority_principal: str
+    authority_assurance: str
+    granted_secrets: tuple[str, ...]
+    bound_secrets: tuple[str, ...]
 
 
 class SourceSnapshot(NamedTuple):
@@ -1854,6 +1908,82 @@ def contract_snapshot(repo_root: Path) -> tuple[str, dict[str, bytes]]:
     return digest.hexdigest(), files
 
 
+def contract_snapshot_v0alpha2(repo_root: Path) -> tuple[str, dict[str, bytes]]:
+    """Snapshot the successor contract and digest it.
+
+    Deliberately a separate function from contract_snapshot rather than a
+    parameterised one. The v0alpha1 path is verified and frozen; sharing a body
+    would put every future successor change one editing mistake away from
+    altering how already-installed legacy evidence digests.
+    """
+    files: dict[str, bytes] = {}
+    digest = hashlib.sha256(CONTRACT_DIGEST_DOMAIN)
+    for name in CONTRACT_FILES_V0ALPHA2:
+        data = stable_file_bytes(
+            repo_root / name,
+            MAX_CONTRACT_FILE_BYTES,
+            "contract snapshot",
+        )
+        files[name] = data
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest(), files
+
+
+def _cedar_effects(text: str) -> list[str]:
+    """Return the effect keyword of every policy in authored Cedar text.
+
+    Comments and string literals are removed first so that the word "permit"
+    inside an annotation, an id, or a comment cannot be mistaken for an effect
+    -- or used to hide one.
+    """
+    out: list[str] = []
+    cleaned: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            index += 1
+            while index < length:
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            cleaned.append(" ")
+            continue
+        if char == "/" and index + 1 < length and text[index + 1] == "/":
+            while index < length and text[index] != "\n":
+                index += 1
+            continue
+        cleaned.append(char)
+        index += 1
+    for match in re.finditer(r"\b(permit|forbid)\s*\(", "".join(cleaned)):
+        out.append(match.group(1))
+    return out
+
+
+def authored_policy_is_forbid_only(text: str) -> bool:
+    """Report whether authored Cedar text only ever subtracts authority.
+
+    Authored policy is untrusted input: an operator may narrow what the
+    repository's own policy permits, never widen it. A single permit makes the
+    whole document unusable for that purpose.
+
+    Fail closed. Text with no recognisable effect at all -- empty, truncated, or
+    unparseable -- is not forbid-only, because "nothing was found" and "nothing
+    grants" are the same observation here and only one of them is safe.
+    """
+    effects = _cedar_effects(text)
+    return bool(effects) and all(effect == "forbid" for effect in effects)
+
+
 def verify_contract_snapshot(repo_root: Path, expected: dict[str, bytes]) -> None:
     _, current = contract_snapshot(repo_root)
     if current != expected:
@@ -1909,8 +2039,10 @@ def materialize_authorization_root(
     snapshot: dict[str, bytes],
     request: dict[str, object],
     entities: list[dict[str, object]],
+    *,
+    authorization_files: tuple[str, ...] = AUTHORIZATION_FILES,
 ) -> None:
-    expected_names = set((*AUTHORIZATION_FILES, CEDAR_HELPER))
+    expected_names = set((*authorization_files, CEDAR_HELPER))
     if set(snapshot) != expected_names:
         raise InfrastructureError("authorization snapshot has an unexpected shape")
     for name, data in snapshot.items():
@@ -1963,6 +2095,176 @@ def expected_plan(manifest: object, contract_digest: str) -> dict[str, object]:
         "kind": "RequestedExperimentPlan",
         "metadata": {"requestedName": name},
         "spec": {"members": members},
+    }
+
+
+NAME_GRAMMAR = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+SECRET_REFERENCE_GRAMMAR = re.compile(
+    r"^agent-lab\.secret/[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+
+
+def _reject(reason: str) -> NoReturn:
+    raise InvalidManifest(f"does not satisfy agent-lab/v0alpha2: {reason}")
+
+
+def expected_plan_v0alpha2(manifest: object, contract_digest: str) -> dict[str, object]:
+    """Validate a manifest independently of CUE and derive the plan it means.
+
+    This is a second, complete implementation of the contract rather than a
+    shape-reader. cue_plan_v0alpha2 compares the pinned CUE projection against
+    it and refuses any disagreement, so a rule has to be changed identically in
+    CUE and in Python, by two different mechanisms, before it can quietly stop
+    being enforced.
+
+    Authored-input faults raise InvalidManifest -- they are the caller's
+    problem, and reporting them as infrastructure uncertainty would turn a
+    refusal into a shrug.
+    """
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec",
+    }:
+        _reject("top-level fields")
+    if manifest["apiVersion"] != "agent-lab/v0alpha2" or manifest["kind"] != "Experiment":
+        _reject("identity")
+
+    metadata = manifest["metadata"]
+    specification = manifest["spec"]
+    if not isinstance(metadata, dict) or set(metadata) != {"name"}:
+        _reject("metadata fields")
+    name = metadata["name"]
+    if not isinstance(name, str) or not NAME_GRAMMAR.match(name):
+        _reject("metadata name")
+    if not isinstance(specification, dict):
+        _reject("spec")
+    if "members" not in specification or not set(specification) <= {
+        "members",
+        "secrets",
+        "authority",
+    }:
+        _reject("spec fields")
+
+    raw_secrets = specification.get("secrets", [])
+    if not isinstance(raw_secrets, list) or len(raw_secrets) > 32:
+        _reject("secrets")
+    secrets: list[dict[str, object]] = []
+    declared: list[str] = []
+    for secret in raw_secrets:
+        if not isinstance(secret, dict) or set(secret) != {"name", "reference"}:
+            _reject("secret fields")
+        secret_name = secret["name"]
+        reference = secret["reference"]
+        if not isinstance(secret_name, str) or not NAME_GRAMMAR.match(secret_name):
+            _reject("secret name")
+        if not isinstance(reference, str) or not SECRET_REFERENCE_GRAMMAR.match(reference):
+            _reject("secret reference")
+        declared.append(secret_name)
+        secrets.append({"name": secret_name, "reference": reference})
+    if len(set(declared)) != len(declared):
+        _reject("duplicate secret name")
+    secrets.sort(key=lambda secret: str(secret["name"]))
+    declared_set = set(declared)
+
+    raw_members = specification["members"]
+    if not isinstance(raw_members, list) or not 1 <= len(raw_members) <= 16:
+        _reject("members")
+    members: list[dict[str, object]] = []
+    member_names: list[str] = []
+    for member in raw_members:
+        if (
+            not isinstance(member, dict)
+            or not {"name", "image"} <= set(member)
+            or not set(member)
+            <= {"name", "image", "command", "resourceClass", "secretGrants"}
+        ):
+            _reject("member fields")
+        member_name = member["name"]
+        if not isinstance(member_name, str) or not NAME_GRAMMAR.match(member_name):
+            _reject("member name")
+        member_names.append(member_name)
+        selector = member["image"]
+        if not isinstance(selector, dict) or set(selector) not in (
+            {"digestRef"},
+            {"catalogName"},
+        ):
+            _reject("member image")
+        command = member.get("command", [])
+        if not isinstance(command, list) or not all(
+            isinstance(argument, str) for argument in command
+        ):
+            _reject("member command")
+        resource_class = member.get("resourceClass", "small")
+        if resource_class not in ("small", "standard"):
+            _reject("member resource class")
+        grants = member.get("secretGrants", [])
+        if not isinstance(grants, list) or len(grants) > 32:
+            _reject("member grants")
+        for grant in grants:
+            if not isinstance(grant, str) or not NAME_GRAMMAR.match(grant):
+                _reject("member grant")
+            if grant not in declared_set:
+                _reject("undeclared grant")
+        if len(set(grants)) != len(grants):
+            _reject("duplicate grant")
+        members.append({
+            "command": command,
+            "name": member_name,
+            "requestedSelector": selector,
+            "resourceClass": resource_class,
+            "secretGrants": sorted(grants),
+        })
+    if len(set(member_names)) != len(member_names):
+        _reject("duplicate member name")
+    members.sort(key=lambda member: str(member["name"]))
+
+    specification_out: dict[str, object] = {"members": members, "secrets": secrets}
+
+    if "authority" in specification:
+        authority = specification["authority"]
+        if not isinstance(authority, dict) or set(authority) != {"install"}:
+            _reject("authority fields")
+        install = authority["install"]
+        if not isinstance(install, dict) or set(install) != {
+            "principal",
+            "assurance",
+            "secrets",
+        }:
+            _reject("install authority fields")
+        principal = install["principal"]
+        assurance = install["assurance"]
+        bound = install["secrets"]
+        if not isinstance(principal, str) or not NAME_GRAMMAR.match(principal):
+            _reject("install authority principal")
+        if assurance != "declared":
+            _reject("install authority assurance")
+        if not isinstance(bound, list) or len(bound) > 32:
+            _reject("install authority secrets")
+        for bound_name in bound:
+            if not isinstance(bound_name, str) or bound_name not in declared_set:
+                _reject("install authority secret")
+        if len(set(bound)) != len(bound):
+            _reject("duplicate install authority secret")
+        specification_out["authority"] = {
+            "install": {
+                "assurance": assurance,
+                "principal": principal,
+                "secrets": sorted(bound),
+            }
+        }
+
+    return {
+        "apiVersion": "agent-lab.request/v0alpha2",
+        "contract": {
+            "digest": f"sha256:{contract_digest}",
+            "name": "agent-lab.experiment",
+            "version": "v0alpha2",
+        },
+        "kind": "RequestedExperimentPlan",
+        "metadata": {"requestedName": name},
+        "spec": specification_out,
     }
 
 
@@ -2275,6 +2577,97 @@ def cue_plan_with_evidence(manifest: object) -> PlanResolution:
 
 def cue_plan(manifest: object) -> object:
     return cue_plan_with_evidence(manifest).plan
+
+
+def cue_plan_v0alpha2(manifest: object) -> dict[str, object]:
+    """Project a manifest through the pinned successor contract.
+
+    The projection runs against a private copy of the contract, not the working
+    tree, and the snapshot is re-verified after every invocation so a contract
+    edited mid-run cannot produce a plan attributed to the contract that was
+    read. A probe manifest is projected first: if the trusted contract cannot
+    reproduce a known answer, nothing this run says about the caller's manifest
+    is worth anything.
+
+    The result is compared against expected_plan_v0alpha2 and refused when they
+    differ. A rejection by CUE is InvalidManifest -- the caller's problem. Any
+    other disagreement is InfrastructureError, because it means the two
+    implementations of the contract no longer agree and neither can be trusted.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    contract_root = repo_root / "contracts" / "experiment" / "v0alpha2"
+    cue_helper = repo_root / "scripts" / "dev" / "cue-tool.py"
+    required = (
+        cue_helper,
+        contract_root / "schema.cue",
+        contract_root / "plan.cue",
+        contract_root / "cue.mod" / "module.cue",
+    )
+    if any(not path.is_file() or path.is_symlink() for path in required):
+        raise InfrastructureError("contract files are missing or unsafe")
+
+    contract_digest, snapshot = contract_snapshot_v0alpha2(repo_root)
+    helper_snapshot = stable_file_bytes(cue_helper, MAX_HELPER_BYTES, "CUE tool helper")
+
+    def verify_snapshot() -> None:
+        _, current = contract_snapshot_v0alpha2(repo_root)
+        if current != snapshot:
+            raise InfrastructureError("contract snapshot changed during validation")
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-lab-contract-", dir="/tmp"
+        ) as directory:
+            validation_root = Path(directory)
+            materialize_validation_root(validation_root, snapshot, helper_snapshot)
+            private_contract_root = validation_root / contract_root.relative_to(repo_root)
+
+            probe = invoke_cue(
+                PROBE_MANIFEST_V0ALPHA2,
+                contract_digest,
+                validation_root,
+                repo_root,
+                private_contract_root,
+            )
+            verify_snapshot()
+            if probe.returncode != 0:
+                raise InfrastructureError("trusted CUE contract health check failed")
+            probe_plan = parse_cue_plan(probe)
+            if probe_plan != expected_plan_v0alpha2(
+                PROBE_MANIFEST_V0ALPHA2, contract_digest
+            ):
+                raise InfrastructureError(
+                    "trusted CUE contract health output is inconsistent"
+                )
+
+            completed = invoke_cue(
+                manifest,
+                contract_digest,
+                validation_root,
+                repo_root,
+                private_contract_root,
+            )
+            verify_snapshot()
+            if completed.returncode == 1:
+                raise InvalidManifest("does not satisfy agent-lab/v0alpha2")
+            if completed.returncode != 0:
+                raise InfrastructureError("pinned CUE validation failed")
+            plan = parse_cue_plan(completed)
+            try:
+                derived = expected_plan_v0alpha2(manifest, contract_digest)
+            except InvalidManifest as error:
+                # CUE accepted what the independent implementation refuses. The
+                # two no longer agree, so neither can be trusted for this input.
+                raise InfrastructureError(
+                    "pinned CUE accepted a manifest the expected plan refuses"
+                ) from error
+            if plan != derived:
+                raise InfrastructureError(
+                    "pinned CUE projection disagrees with the expected plan"
+                )
+            return plan
+    except OSError as error:
+        raise InfrastructureError("private contract snapshot could not be managed") from error
 
 
 def is_sha256(value: object) -> bool:
@@ -2602,16 +2995,26 @@ def evaluate_cedar(
     request: dict[str, object],
     entities: list[dict[str, object]],
     repo_root: Path,
+    *,
+    authorization_files: tuple[str, ...] = AUTHORIZATION_FILES,
+    schema_relative: str = "authorization/experiment/v0alpha1/schema.cedarschema",
+    policies_relative: str = "authorization/experiment/v0alpha1/operator.cedar",
 ) -> str:
     try:
         with tempfile.TemporaryDirectory(
             prefix="agent-lab-authorization-", dir="/tmp"
         ) as directory:
             root = Path(directory)
-            materialize_authorization_root(root, snapshot, request, entities)
+            materialize_authorization_root(
+                root,
+                snapshot,
+                request,
+                entities,
+                authorization_files=authorization_files,
+            )
             helper = root / CEDAR_HELPER
-            schema = root / "authorization/experiment/v0alpha1/schema.cedarschema"
-            policies = root / "authorization/experiment/v0alpha1/operator.cedar"
+            schema = root / schema_relative
+            policies = root / policies_relative
             request_path = root / "authorization-request.json"
             entities_path = root / "authorization-entities.json"
 
@@ -2679,6 +3082,253 @@ def authorize_plan(plan: object, source_digest: str) -> tuple[dict[str, object],
             "assurance": "none",
             "authenticated": False,
             "id": LEGACY_PRINCIPAL_ID,
+            "source": "fixed-local-cli",
+            "type": "AgentLab::Principal",
+        },
+        "resource": {
+            "id": binding.plan_digest,
+            "requestedName": binding.requested_name,
+            "type": "AgentLab::RequestedExperimentPlan",
+        },
+        "verdict": verdict,
+    }
+    return decision, 0 if verdict == "permit" else 1
+
+
+def authorization_snapshot_v0alpha2(repo_root: Path) -> tuple[str, dict[str, bytes]]:
+    files = {
+        name: stable_file_bytes(
+            repo_root / name,
+            MAX_AUTHORIZATION_FILE_BYTES,
+            "authorization snapshot",
+        )
+        for name in (*AUTHORIZATION_FILES_V0ALPHA2, CEDAR_HELPER)
+    }
+    digest = framed_digest(
+        AUTHORIZATION_DIGEST_DOMAIN, AUTHORIZATION_FILES_V0ALPHA2, files
+    )
+    return digest, files
+
+
+def plan_binding_v0alpha2(plan: object, source_digest: str) -> PlanBindingV0Alpha2:
+    """Derive the only facts the v0alpha2 policy is allowed to see.
+
+    The secret facts are derived here, from the plan, rather than trusted from
+    anywhere else: grantedSecrets is the union of what the members were actually
+    granted, and boundSecrets is what the declared install authority actually
+    covers. The policy compares those two sets, so if this derivation were
+    generous the policy could not be strict.
+    """
+    try:
+        if not isinstance(plan, dict) or set(plan) != {
+            "apiVersion",
+            "contract",
+            "kind",
+            "metadata",
+            "spec",
+        }:
+            raise ValueError("plan envelope")
+        if (
+            plan["apiVersion"] != "agent-lab.request/v0alpha2"
+            or plan["kind"] != "RequestedExperimentPlan"
+        ):
+            raise ValueError("plan identity")
+
+        contract = plan["contract"]
+        metadata = plan["metadata"]
+        specification = plan["spec"]
+        if not isinstance(contract, dict) or set(contract) != {
+            "digest",
+            "name",
+            "version",
+        }:
+            raise ValueError("contract binding")
+        if (
+            contract["name"] != "agent-lab.experiment"
+            or contract["version"] != "v0alpha2"
+            or not is_sha256(contract["digest"])
+        ):
+            raise ValueError("contract identity")
+        if not isinstance(metadata, dict) or set(metadata) != {"requestedName"}:
+            raise ValueError("requested metadata")
+        requested_name = metadata["requestedName"]
+        if not isinstance(requested_name, str):
+            raise ValueError("requested name")
+        if not isinstance(specification, dict) or not {"members", "secrets"} <= set(
+            specification
+        ) or not set(specification) <= {"members", "secrets", "authority"}:
+            raise ValueError("plan specification")
+
+        members = specification["members"]
+        if not isinstance(members, list) or not members:
+            raise ValueError("plan members")
+        resource_classes: set[str] = set()
+        granted: set[str] = set()
+        for member in members:
+            if not isinstance(member, dict) or not {
+                "command",
+                "name",
+                "requestedSelector",
+                "resourceClass",
+                "secretGrants",
+            } <= set(member):
+                raise ValueError("plan member")
+            resource_class = member["resourceClass"]
+            if not isinstance(resource_class, str):
+                raise ValueError("resource class")
+            resource_classes.add(resource_class)
+            grants = member["secretGrants"]
+            if not isinstance(grants, list) or not all(
+                isinstance(grant, str) for grant in grants
+            ):
+                raise ValueError("member grants")
+            granted.update(grants)
+
+        declared_names: set[str] = set()
+        for secret in specification["secrets"]:
+            if not isinstance(secret, dict) or set(secret) != {"name", "reference"}:
+                raise ValueError("declared secret")
+            declared_names.add(str(secret["name"]))
+        if not granted <= declared_names:
+            raise ValueError("granted secret is not declared")
+
+        authority_declared = "authority" in specification
+        authority_principal = ""
+        authority_assurance = ""
+        bound: set[str] = set()
+        if authority_declared:
+            authority = specification["authority"]
+            if not isinstance(authority, dict) or set(authority) != {"install"}:
+                raise ValueError("authority binding")
+            install = authority["install"]
+            if not isinstance(install, dict) or set(install) != {
+                "assurance",
+                "principal",
+                "secrets",
+            }:
+                raise ValueError("install authority binding")
+            authority_principal = install["principal"]
+            authority_assurance = install["assurance"]
+            if not isinstance(authority_principal, str) or not isinstance(
+                authority_assurance, str
+            ):
+                raise ValueError("install authority identity")
+            bound_list = install["secrets"]
+            if not isinstance(bound_list, list) or not all(
+                isinstance(name, str) for name in bound_list
+            ):
+                raise ValueError("install authority secrets")
+            bound.update(bound_list)
+            if not bound <= declared_names:
+                raise ValueError("bound secret is not declared")
+
+        contract_digest = contract["digest"]
+        contract_version = contract["version"]
+        assert isinstance(contract_digest, str) and isinstance(contract_version, str)
+    except (AssertionError, KeyError, TypeError, ValueError) as error:
+        raise InfrastructureError("CUE plan cannot be bound to authorization") from error
+
+    return PlanBindingV0Alpha2(
+        plan_digest=plan_digest(plan),
+        contract_digest=contract_digest,
+        contract_version=contract_version,
+        requested_name=requested_name,
+        member_count=len(members),
+        resource_classes=tuple(sorted(resource_classes)),
+        source_digest=source_digest,
+        authority_declared=authority_declared,
+        authority_principal=authority_principal,
+        authority_assurance=authority_assurance,
+        granted_secrets=tuple(sorted(granted)),
+        bound_secrets=tuple(sorted(bound)),
+    )
+
+
+def cedar_documents_v0alpha2(
+    binding: PlanBindingV0Alpha2,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    principal_uid = {"type": "AgentLab::Principal", "id": DECLARED_PRINCIPAL_ID}
+    resource_uid = {
+        "type": "AgentLab::RequestedExperimentPlan",
+        "id": binding.plan_digest,
+    }
+    entities: list[dict[str, object]] = [
+        {
+            "uid": principal_uid,
+            "attrs": {
+                "authenticated": False,
+                "assurance": "declared",
+                "source": "fixed-local-cli",
+            },
+            "parents": [],
+        },
+        {
+            "uid": resource_uid,
+            "attrs": {
+                "planDigest": binding.plan_digest,
+                "sourceDigest": binding.source_digest,
+                "contractDigest": binding.contract_digest,
+                "contractVersion": binding.contract_version,
+                "requestedName": binding.requested_name,
+                "memberCount": binding.member_count,
+                "resourceClasses": list(binding.resource_classes),
+                "authorityDeclared": binding.authority_declared,
+                "authorityPrincipal": binding.authority_principal,
+                "authorityAssurance": binding.authority_assurance,
+                "grantedSecrets": list(binding.granted_secrets),
+                "boundSecrets": list(binding.bound_secrets),
+            },
+            "parents": [],
+        },
+    ]
+    request: dict[str, object] = {
+        "principal": f'AgentLab::Principal::"{DECLARED_PRINCIPAL_ID}"',
+        "action": f'AgentLab::Action::"{INSTALL_ACTION_ID}"',
+        "resource": f'AgentLab::RequestedExperimentPlan::"{binding.plan_digest}"',
+        "context": {
+            "bindingVersion": "v0alpha2",
+            "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
+            "contractDigest": binding.contract_digest,
+        },
+    }
+    return request, entities
+
+
+def authorize_plan_v0alpha2(
+    plan: object, source_digest: str
+) -> tuple[dict[str, object], int]:
+    repo_root = Path(__file__).resolve().parent.parent
+    binding = plan_binding_v0alpha2(plan, source_digest)
+    request, entities = cedar_documents_v0alpha2(binding)
+    authorization_digest, snapshot = authorization_snapshot_v0alpha2(repo_root)
+    verdict = evaluate_cedar(
+        snapshot,
+        request,
+        entities,
+        repo_root,
+        authorization_files=AUTHORIZATION_FILES_V0ALPHA2,
+        schema_relative="authorization/experiment/v0alpha2/schema.cedarschema",
+        policies_relative="authorization/experiment/v0alpha2/operator.cedar",
+    )
+    _, current = authorization_snapshot_v0alpha2(repo_root)
+    if current != snapshot:
+        raise InfrastructureError("authorization snapshot changed during evaluation")
+
+    decision: dict[str, object] = {
+        "action": INSTALL_ACTION_ID,
+        "apiVersion": "agent-lab.authorization/v0alpha2",
+        "binding": {
+            "authorizationDigest": authorization_digest,
+            "contractDigest": binding.contract_digest,
+            "planDigest": binding.plan_digest,
+            "sourceDigest": binding.source_digest,
+        },
+        "kind": "ExperimentAuthorizationDecision",
+        "principal": {
+            "assurance": "declared",
+            "authenticated": False,
+            "id": DECLARED_PRINCIPAL_ID,
             "source": "fixed-local-cli",
             "type": "AgentLab::Principal",
         },

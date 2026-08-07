@@ -1,0 +1,38 @@
+namespace AgentLab {
+    entity Principal = {
+        authenticated: Bool,
+        assurance: String,
+        source: String,
+    };
+
+    // The successor resource carries what the authored document declared about
+    // secrets, so a policy can decide on the binding rather than on a name.
+    // grantedSecrets is the union of every per-member grant; boundSecrets is
+    // what the declared install authority covers. A plan whose grants are not a
+    // subset of its bindings is the case this contract exists to refuse.
+    entity RequestedExperimentPlan = {
+        planDigest: String,
+        sourceDigest: String,
+        contractDigest: String,
+        contractVersion: String,
+        requestedName: String,
+        memberCount: Long,
+        resourceClasses: Set<String>,
+        authorityDeclared: Bool,
+        authorityPrincipal: String,
+        authorityAssurance: String,
+        grantedSecrets: Set<String>,
+        boundSecrets: Set<String>,
+    };
+
+    action "experiment.install" appliesTo {
+        principal: [Principal],
+        resource: [RequestedExperimentPlan],
+        context: {
+            bindingVersion: String,
+            planDigest: String,
+            sourceDigest: String,
+            contractDigest: String,
+        },
+    };
+}
